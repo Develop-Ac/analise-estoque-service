@@ -31,14 +31,15 @@ ARQUIVO_ESTADO = BASE_DIR / "fifo_service_state.json"
 ARQUIVO_ANTERIOR = BASE_DIR / "historico_analise_anterior.pkl"
 
 # Configurações de E-mail (PREENCHER AQUI)
-EMAIL_SMTP_SERVER = "email-ssl.com.br"
-EMAIL_SMTP_PORT = 587
-EMAIL_SENDER = "develop@acessorios.com.br"        # Substitua pelo seu e-mail
-EMAIL_PASSWORD = "Acacesso@20"         # Substitua pela senha de app (não a senha normal)
-EMAIL_RECEIVER = "fiscal@acessorios.com.br" # Substitua pelo e-mail de destino
+# Configurações de E-mail
+EMAIL_SMTP_SERVER = os.getenv("EMAIL_SMTP_SERVER", "email-ssl.com.br")
+EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", 587))
+EMAIL_SENDER = os.getenv("EMAIL_SENDER", "seu_email@exemplo.com")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "sua_senha")
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", "email_destino@exemplo.com")
 
 # Configurações PostgreSQL
-POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://intranet:Ac%402025acesso@panel-teste.acacessorios.local:5555/intranet")
+POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://usuario:senha@host:5432/database")
 TABELA_FIFO = "com_fifo_completo"
 
 # ==========================================
@@ -46,11 +47,11 @@ TABELA_FIFO = "com_fifo_completo"
 # ==========================================
 
 def get_connection():
-    server = os.getenv('SQL_HOST', '192.168.1.146')
+    server = os.getenv('SQL_HOST', '127.0.0.1')
     port = os.getenv('SQL_PORT', '1433')
     database = os.getenv('SQL_DATABASE', 'master')
-    user = os.getenv('SQL_USER', 'USER_CONSULTA')
-    password = os.getenv('SQL_PASSWORD', 'Ac@2025acesso')
+    user = os.getenv('SQL_USER', 'sa')
+    password = os.getenv('SQL_PASSWORD', 'senha_secreta')
     
     conn_str = (
         "DRIVER={FreeTDS};"

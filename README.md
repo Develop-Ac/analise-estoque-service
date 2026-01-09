@@ -32,20 +32,20 @@ O serviço é configurado via variáveis de ambiente. Defina estas variáveis no
 |Data|---|---|
 | `INTERVALO_DIAS` | Intervalo entre execuções do job (em dias) | `7` |
 | `POSTGRES_URL` | String de conexão SQLAlchemy para o PostgreSQL | (Obrigatório) |
-| `SQL_HOST` | Host do SQL Server (ERP) | `192.168.1.146` |
+| `SQL_HOST` | Host do SQL Server (ERP) | `127.0.0.1` |
 | `SQL_PORT` | Porta do SQL Server | `1433` |
 | `SQL_DATABASE` | Database do SQL Server | `master` |
-| `SQL_USER` | Usuário do SQL Server | `USER_CONSULTA` |
-| `SQL_PASSWORD` | Senha do SQL Server | `Ac@2025acesso` |
+| `SQL_USER` | Usuário do SQL Server | `sa` |
+| `SQL_PASSWORD` | Senha do SQL Server | `senha_secreta` |
 | `PYTHONUNBUFFERED`| Define como `1` para logs em tempo real no Docker | `1` |
 
 ### Exemplo de `.env` ou Environment Variables:
 ```ini
 INTERVALO_DIAS=7
 POSTGRES_URL=postgresql://user:pass@host:5432/db
-SQL_HOST=192.168.1.146
+SQL_HOST=127.0.0.1
 SQL_USER=sa
-SQL_PASSWORD=secret
+SQL_PASSWORD=senha_secreta
 ```
 
 ## 📦 Como Rodar
