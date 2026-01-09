@@ -271,9 +271,14 @@ def carregar_dados_do_banco():
     print("\nLendo dados do banco via ODBC...")
 
     df_saidas      = pd.read_sql(sql_saidas_geral,  conn)
-    df_ent           = pd.read_sql(sql_entradas,      conn)
-    df_dev           = pd.read_sql(sql_devolucoes,    conn)
+    df_ent         = pd.read_sql(sql_entradas,      conn)
+    df_dev         = pd.read_sql(sql_devolucoes,    conn)
     df_saldo_produto = pd.read_sql(sql_saldo_produto, conn)
+
+    print(f"  - Saídas carregadas: {len(df_saidas)} registros")
+    print(f"  - Entradas carregadas: {len(df_ent)} registros")
+    print(f"  - Devoluções carregadas: {len(df_dev)} registros")
+    print(f"  - Produtos (Saldo) carregados: {len(df_saldo_produto)} registros")
 
     # Normalizar nomes das colunas de saldo_produto
     df_saldo_produto = df_saldo_produto.rename(columns={
@@ -1369,7 +1374,6 @@ def salvar_metricas_postgres(df_metricas):
         'fornecedor2', 'fornecedor3', 'pct_acum_valor', 'curva_abc',
         'categoria_estocagem', 'estoque_min_base', 'estoque_max_base',
         'fator_ajuste_tendencia', 'estoque_min_ajustado', 'estoque_max_ajustado',
-        'estoque_min_sugerido', 'estoque_max_sugerido', 'tipo_planejamento',
         'estoque_min_sugerido', 'estoque_max_sugerido', 'tipo_planejamento',
         'alerta_tendencia_alta', 'descricao_calculo_estoque', 'teve_alteracao_analise'
     ]
