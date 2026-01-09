@@ -164,99 +164,108 @@ def carregar_dados_do_banco():
     # >>>>>>>>>>>>> SQLs <<<<<<<<<<<<
 
     # MUDANÇA: Buscando todas as saídas desde 2005, sem consolidação pré-2020
+    # MUDANÇA: Usando OPENQUERY para performance e acesso ao Linked Server
     sql_saidas_geral = """
-    SELECT
-        LE.pro_codigo,
-        LE.nfe,
-        LE.nfs,
-        LE.lancto,
-        LE.preco_custo,
-        LE.total_liquido,
-        LE.data,
-        LE.origem,
-        LE.quantidade
-    FROM [CONSULTA]...lanctos_estoque LE
-    WHERE LE.data    >= '2005-01-01'
-      AND LE.empresa = 3
-      AND LE.origem IN ('NFS','EVF', 'EFD')   
-      AND NOT EXISTS (
-            SELECT 1
-            FROM [CONSULTA]...lanctos_estoque C
-            WHERE C.empresa = LE.empresa
-              AND C.nfs     = LE.nfs
-              AND C.origem  = 'CNS'
-              AND C.data    >= '2005-01-01'
-        )
-    ORDER BY
-        LE.pro_codigo ASC,
-        LE.data ASC,
-        LE.lancto ASC;
+    SELECT * FROM OPENQUERY(CONSULTA, '
+        SELECT
+            LE.pro_codigo,
+            LE.nfe,
+            LE.nfs,
+            LE.lancto,
+            LE.preco_custo,
+            LE.total_liquido,
+            LE.data,
+            LE.origem,
+            LE.quantidade
+        FROM lanctos_estoque LE
+        WHERE LE.data    >= ''2005-01-01''
+          AND LE.empresa = 3
+          AND LE.origem IN (''NFS'',''EVF'', ''EFD'')   
+          AND NOT EXISTS (
+                SELECT 1
+                FROM lanctos_estoque C
+                WHERE C.empresa = LE.empresa
+                  AND C.nfs     = LE.nfs
+                  AND C.origem  = ''CNS''
+                  AND C.data    >= ''2005-01-01''
+            )
+        ORDER BY
+            LE.pro_codigo ASC,
+            LE.data ASC,
+            LE.lancto ASC
+    ')
     """
 
     sql_entradas = """
-    SELECT
-        LE.pro_codigo,
-        LE.nfe,
-        LE.nfs,
-        LE.lancto,
-        LE.preco_custo,
-        LE.total_liquido,
-        LE.data,
-        LE.origem,
-        LE.quantidade,
-        ROW_NUMBER() OVER (
-            PARTITION BY LE.pro_codigo
-            ORDER BY LE.data ASC, LE.lancto ASC
-        ) AS indice,
-        SUM(LE.quantidade) OVER (
-            PARTITION BY LE.pro_codigo
-            ORDER BY LE.data ASC, LE.lancto ASC
-            ROWS UNBOUNDED PRECEDING
-        ) AS qtd_acumulada
-    FROM [CONSULTA]...lanctos_estoque LE
-    WHERE LE.data >= '2005-01-01'
-      AND LE.origem IN ('NFE','CNE','LIA','CAD','CDE')
-      AND LE.empresa = 3
-    ORDER BY
-        LE.pro_codigo ASC,
-        LE.data ASC,
-        LE.lancto ASC;
+    SELECT * FROM OPENQUERY(CONSULTA, '
+        SELECT
+            LE.pro_codigo,
+            LE.nfe,
+            LE.nfs,
+            LE.lancto,
+            LE.preco_custo,
+            LE.total_liquido,
+            LE.data,
+            LE.origem,
+            LE.quantidade,
+            ROW_NUMBER() OVER (
+                PARTITION BY LE.pro_codigo
+                ORDER BY LE.data ASC, LE.lancto ASC
+            ) AS indice,
+            SUM(LE.quantidade) OVER (
+                PARTITION BY LE.pro_codigo
+                ORDER BY LE.data ASC, LE.lancto ASC
+                ROWS UNBOUNDED PRECEDING
+            ) AS qtd_acumulada
+        FROM lanctos_estoque LE
+        WHERE LE.data >= ''2005-01-01''
+          AND LE.origem IN (''NFE'',''CNE'',''LIA'',''CAD'',''CDE'')
+          AND LE.empresa = 3
+        ORDER BY
+            LE.pro_codigo ASC,
+            LE.data ASC,
+            LE.lancto ASC
+    ')
     """
 
     sql_devolucoes = """
-    SELECT
-        nfsi.nfs, 
-        nfsi.pro_codigo,
-        nfsi.qtde_devolvida
-    FROM [CONSULTA]...nfs_itens nfsi
-    WHERE nfsi.qtde_devolvida > 0
-      AND nfsi.empresa = 3
+    SELECT * FROM OPENQUERY(CONSULTA, '
+        SELECT
+            nfsi.nfs, 
+            nfsi.pro_codigo,
+            nfsi.qtde_devolvida
+        FROM nfs_itens nfsi
+        WHERE nfsi.qtde_devolvida > 0
+          AND nfsi.empresa = 3
+    ')
     """
 
     sql_saldo_produto = """
-    SELECT 
-        pro.pro_codigo,
-        pro.pro_descricao,
-        pro.subgrp_codigo,
-        pro.estoque_disponivel,
-        mar.mar_descricao,
-        f1.for_nome AS fornecedor1,
-        f2.for_nome AS fornecedor2,
-        f3.for_nome AS fornecedor3
-    FROM [CONSULTA]...produtos pro
-    LEFT JOIN [CONSULTA]...marcas mar
-        ON mar.empresa    = pro.empresa
-       AND mar.mar_codigo = pro.mar_codigo
-    LEFT JOIN [CONSULTA]...fornecedores f1
-        ON f1.empresa     = pro.empresa
-       AND f1.for_codigo  = pro.for_codigo      -- fornecedor principal
-    LEFT JOIN [CONSULTA]...fornecedores f2
-        ON f2.empresa     = pro.empresa
-       AND f2.for_codigo  = pro.for_codigo2     -- fornecedor 2
-    LEFT JOIN [CONSULTA]...fornecedores f3
-        ON f3.empresa     = pro.empresa
-       AND f3.for_codigo  = pro.for_codigo3     -- fornecedor 3
-    WHERE pro.empresa = 3;
+    SELECT * FROM OPENQUERY(CONSULTA, '
+        SELECT 
+            pro.pro_codigo,
+            pro.pro_descricao,
+            pro.subgrp_codigo,
+            pro.estoque_disponivel,
+            mar.mar_descricao,
+            f1.for_nome AS fornecedor1,
+            f2.for_nome AS fornecedor2,
+            f3.for_nome AS fornecedor3
+        FROM produtos pro
+        LEFT JOIN marcas mar
+            ON mar.empresa    = pro.empresa
+           AND mar.mar_codigo = pro.mar_codigo
+        LEFT JOIN fornecedores f1
+            ON f1.empresa     = pro.empresa
+           AND f1.for_codigo  = pro.for_codigo      -- fornecedor principal
+        LEFT JOIN fornecedores f2
+            ON f2.empresa     = pro.empresa
+           AND f2.for_codigo  = pro.for_codigo2     -- fornecedor 2
+        LEFT JOIN fornecedores f3
+            ON f3.empresa     = pro.empresa
+           AND f3.for_codigo  = pro.for_codigo3     -- fornecedor 3
+        WHERE pro.empresa = 3
+    ')
     """
 
     print("\nLendo dados do banco via ODBC...")
