@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  analise-estoque-worker:
+    build: .
+    environment:
+      - INTERVALO_DIAS=7
+      - POSTGRES_URL=postgresql://intranet:Ac%402025acesso@panel-teste.acacessorios.local:5555/intranet
+      - SQL_HOST=192.168.1.146
+      - SQL_PORT=1433
+      - SQL_DATABASE=master
+      - SQL_USER=USER_CONSULTA
+      - SQL_PASSWORD=Ac@2025acesso
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
