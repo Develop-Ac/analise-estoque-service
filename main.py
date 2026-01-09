@@ -47,8 +47,13 @@ TABELA_FIFO = "com_fifo_completo"
 # ==========================================
 
 def get_connection():
+    # Configurar warning do pandas para silenciar o aviso de DBAPI2 vs SQLAlchemy
+    warnings.filterwarnings("ignore", category=UserWarning, module="pandas")
+
     server = os.getenv('SQL_HOST', '127.0.0.1')
     port = os.getenv('SQL_PORT', '1433')
+    # O padrão 'master' geralmente não contém as tabelas de negócio.
+    # O usuário DEVE configurar SQL_DATABASE com o nome correto (ex: Tretor_...)
     database = os.getenv('SQL_DATABASE', 'master')
     user = os.getenv('SQL_USER', 'sa')
     password = os.getenv('SQL_PASSWORD', 'senha_secreta')
@@ -170,13 +175,13 @@ def carregar_dados_do_banco():
         LE.data,
         LE.origem,
         LE.quantidade
-    FROM lanctos_estoque LE
+    FROM [CONSULTA]...lanctos_estoque LE
     WHERE LE.data    >= '2005-01-01'
       AND LE.empresa = 3
       AND LE.origem IN ('NFS','EVF', 'EFD')   
       AND NOT EXISTS (
             SELECT 1
-            FROM lanctos_estoque C
+            FROM [CONSULTA]...lanctos_estoque C
             WHERE C.empresa = LE.empresa
               AND C.nfs     = LE.nfs
               AND C.origem  = 'CNS'
@@ -208,7 +213,7 @@ def carregar_dados_do_banco():
             ORDER BY LE.data ASC, LE.lancto ASC
             ROWS UNBOUNDED PRECEDING
         ) AS qtd_acumulada
-    FROM lanctos_estoque LE
+    FROM [CONSULTA]...lanctos_estoque LE
     WHERE LE.data >= '2005-01-01'
       AND LE.origem IN ('NFE','CNE','LIA','CAD','CDE')
       AND LE.empresa = 3
@@ -223,7 +228,7 @@ def carregar_dados_do_banco():
         nfsi.nfs, 
         nfsi.pro_codigo,
         nfsi.qtde_devolvida
-    FROM nfs_itens nfsi
+    FROM [CONSULTA]...nfs_itens nfsi
     WHERE nfsi.qtde_devolvida > 0
       AND nfsi.empresa = 3
     """
@@ -238,17 +243,17 @@ def carregar_dados_do_banco():
         f1.for_nome AS fornecedor1,
         f2.for_nome AS fornecedor2,
         f3.for_nome AS fornecedor3
-    FROM produtos pro
-    LEFT JOIN marcas mar
+    FROM [CONSULTA]...produtos pro
+    LEFT JOIN [CONSULTA]...marcas mar
         ON mar.empresa    = pro.empresa
        AND mar.mar_codigo = pro.mar_codigo
-    LEFT JOIN fornecedores f1
+    LEFT JOIN [CONSULTA]...fornecedores f1
         ON f1.empresa     = pro.empresa
        AND f1.for_codigo  = pro.for_codigo      -- fornecedor principal
-    LEFT JOIN fornecedores f2
+    LEFT JOIN [CONSULTA]...fornecedores f2
         ON f2.empresa     = pro.empresa
        AND f2.for_codigo  = pro.for_codigo2     -- fornecedor 2
-    LEFT JOIN fornecedores f3
+    LEFT JOIN [CONSULTA]...fornecedores f3
         ON f3.empresa     = pro.empresa
        AND f3.for_codigo  = pro.for_codigo3     -- fornecedor 3
     WHERE pro.empresa = 3;
