@@ -53,14 +53,17 @@ def get_connection():
     user = os.getenv('SQL_USER', 'sa')
     password = os.getenv('SQL_PASSWORD', 'senha_secreta')
     
+    tds_version = os.getenv('TDS_VERSION', '7.4')
+    
+    # É importante envolver senha em chaves {} se houver caracteres especiais
     conn_str = (
         "DRIVER={FreeTDS};"
         f"SERVER={server};"
         f"PORT={port};"
         f"DATABASE={database};"
-        f"UID={user};"
-        f"PWD={password};"
-        "TDS_Version=8.0;"
+        f"UID={{{user}}};"
+        f"PWD={{{password}}};"
+        f"TDS_Version={tds_version};"
     )
     return pyodbc.connect(conn_str)
 
