@@ -40,6 +40,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
 
 # Copiar código da aplicação
 COPY main.py .
+COPY api.py .
 
 # Criar diretório de dados/cache se necessario
 RUN mkdir -p /app/data
