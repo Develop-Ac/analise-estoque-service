@@ -29,9 +29,9 @@ RUN apt-get update && apt-get install -y \
 
 # Configurar Driver FreeTDS
 RUN echo "[FreeTDS]\n\
-Description = FreeTDS Driver\n\
-Driver = /usr/lib/x86_64-linux-gnu/odbc/libtdsodbc.so\n\
-Setup = /usr/lib/x86_64-linux-gnu/odbc/libtdsS.so" >> /etc/odbcinst.ini
+    Description = FreeTDS Driver\n\
+    Driver = /usr/lib/x86_64-linux-gnu/odbc/libtdsodbc.so\n\
+    Setup = /usr/lib/x86_64-linux-gnu/odbc/libtdsS.so" >> /etc/odbcinst.ini
 
 # Copiar e instalar dependências Python
 COPY requirements.txt .
@@ -48,5 +48,8 @@ RUN mkdir -p /app/data
 ENV INTERVALO_DIAS=7
 ENV PYTHONUNBUFFERED=1
 
+# Expor a porta da API
+EXPOSE 8000
+
 # Comando de execução
-CMD ["python", "main.py"]
+CMD ["python", "-m", "uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000"]

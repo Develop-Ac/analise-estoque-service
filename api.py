@@ -241,6 +241,7 @@ def background_scheduler():
 
 @app.on_event("startup")
 def startup_event():
+    print("API Analise Estoque iniciada na porta 8000")
     # Inicia a thread de background
     thread = threading.Thread(target=background_scheduler, daemon=True)
     thread.start()
