@@ -71,11 +71,20 @@ def get_realtime_stocks(pro_codes):
     # Supondo coluna PRO_CODIGO e ESTOQUE_DISPONIVEL (conforme visto no main.py)
     # main.py usa: SELECT ... pro.estoque_disponivel FROM produtos pro ...
     
-    # Importante: OPENQUERY requer string estática, mas podemos montar string dinâmica no Python
-    # desde que escapemos as aspas simples internas.
-    # A query interna SQL Server precisa de aspas simples duplicadas '' para string literal dentro da string do OPENQUERY
+    # Preparing the IN clause for SQL Server OPENQUERY
+    # We need to escape single quotes by doubling them '' because we are inside an OPENQUERY string
     
-    inner_query = f"SELECT pro_codigo, estoque_disponivel FROM produtos WHERE pro_codigo IN (''{codes_str.replace(',', "','")}'') AND empresa = 3"
+    # 1. Start with safe codes (already stripped of single quotes)
+    # 2. Join them with "','" to create the list for the IN clause: COD1','COD2
+    # 3. For OPENQUERY, we need to double the single quotes: COD1'',''COD2
+    
+    # Let's rebuild properly:
+    # We want final customized SQL: ... IN (''COD1'', ''COD2'') ...
+    
+    formatted_codes_list = [f"''{c}''" for c in safe_codes]
+    in_clause_inner = ", ".join(formatted_codes_list)
+
+    inner_query = f"SELECT pro_codigo, estoque_disponivel FROM produtos WHERE pro_codigo IN ({in_clause_inner}) AND empresa = 3"
     
     # Query final
     query = f"SELECT * FROM OPENQUERY(CONSULTA, '{inner_query}')"
