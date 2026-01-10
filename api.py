@@ -1,4 +1,5 @@
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
 from pydantic import BaseModel
@@ -139,6 +140,107 @@ def listar_analise(
     finally:
         conn.close()
 
+@app.get("/", response_class=HTMLResponse)
+def root():
+    state = load_state()
+    last_run = state.get("last_run", "Nunca executado")
+    
+    html_content = f"""
+    <html>
+        <head>
+            <title>Analise Estoque Service</title>
+            <style>
+                body {{ font-family: Arial, sans-serif; padding: 40px; text-align: center; }}
+                .status {{ padding: 20px; background-color: #dff0d8; color: #3c763d; border-radius: 5px; margin: 20px 0; }}
+                .info {{ color: #666; }}
+            </style>
+        </head>
+        <body>
+            <h1>Analise Estoque Service</h1>
+            <div class="status">
+                <h2>✓ Serviço Operante</h2>
+                <p>Status: Online e Aguardando Requisições</p>
+            </div>
+            <div class="info">
+                <p><strong>Última Análise:</strong> {last_run}</p>
+                <p><strong>Próxima Verificação Automática:</strong> A cada 7 dias</p>
+            </div>
+            <p><a href="/docs">Ver Documentação da API</a></p>
+        </body>
+    </html>
+    """
+    return HTMLResponse(content=html_content)
+
 @app.get("/health")
 def health_check():
     return {"status": "ok"}
+
+# ==========================================
+# BACKGROUND TASK
+# ==========================================
+import threading
+import time
+import datetime
+import json
+from pathlib import Path
+from main import run_job  # Importa a função de job do main.py
+
+BACKGROUND_Running = False
+ARQUIVO_ESTADO = Path("fifo_service_state.json")
+INTERVALO_DIAS = int(os.getenv('INTERVALO_DIAS', 7))
+
+def load_state():
+    if not ARQUIVO_ESTADO.exists():
+        return {}
+    try:
+        with open(ARQUIVO_ESTADO, "r") as f:
+            return json.load(f)
+    except:
+        return {}
+
+def save_state(state):
+    with open(ARQUIVO_ESTADO, "w") as f:
+        json.dump(state, f)
+
+def background_scheduler():
+    global BACKGROUND_Running
+    print("Iniciando scheduler de background...")
+    
+    while True:
+        try:
+            state = load_state()
+            last_run_str = state.get("last_run")
+            should_run = False
+            
+            if not last_run_str:
+                print("Primeira execução detectada. Rodando job...")
+                should_run = True
+            else:
+                last_run = datetime.datetime.fromisoformat(last_run_str)
+                dias_passados = (datetime.datetime.now() - last_run).days
+                
+                if dias_passados >= INTERVALO_DIAS:
+                    print(f"Intervalo de {INTERVALO_DIAS} dias atingido. Rodando job...")
+                    should_run = True
+                else:
+                    print(f"Skipping analysis. Última execução: {last_run_str}. ({dias_passados} dias atrás)")
+            
+            if should_run:
+                BACKGROUND_Running = True
+                run_job()
+                state["last_run"] = datetime.datetime.now().isoformat()
+                save_state(state)
+                BACKGROUND_Running = False
+                
+        except Exception as e:
+            print(f"Erro no background scheduler: {e}")
+            BACKGROUND_Running = False
+            
+        # Verifica a cada 1 hora
+        time.sleep(3600) 
+
+@app.on_event("startup")
+def startup_event():
+    # Inicia a thread de background
+    thread = threading.Thread(target=background_scheduler, daemon=True)
+    thread.start()
