@@ -208,10 +208,10 @@ def listar_analise(
                 status_conditions.append("(estoque_disponivel < estoque_min_sugerido)")
             
             if "excesso" in status_list or "excess" in status_list:
-                status_conditions.append("(estoque_disponivel > (estoque_max_sugerido * 1.5))")
+                status_conditions.append("(estoque_disponivel > estoque_max_sugerido)")
                 
             if "normal" in status_list:
-                status_conditions.append("(estoque_disponivel >= estoque_min_sugerido AND estoque_disponivel <= (estoque_max_sugerido * 1.5))")
+                status_conditions.append("(estoque_disponivel >= estoque_min_sugerido AND estoque_disponivel <= estoque_max_sugerido)")
             
             if status_conditions:
                 filters.append(f"({' OR '.join(status_conditions)})")
