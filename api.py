@@ -414,6 +414,26 @@ def background_scheduler():
 @app.on_event("startup")
 def startup_event():
     print("API Analise Estoque iniciada na porta 8000")
+    
+    # -----------------------------------------------------------
+    # MIGRATION: Ensure 'dados_alteracao_json' column exists
+    # -----------------------------------------------------------
+    try:
+        conn = get_db_connection()
+        # Check if column exists
+        check_sql = text("SELECT column_name FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='dados_alteracao_json'")
+        exists = conn.execute(check_sql).scalar()
+        
+        if not exists:
+            print("MIGRATION: Adding 'dados_alteracao_json' column to 'com_fifo_completo'...")
+            conn.execute(text("ALTER TABLE com_fifo_completo ADD COLUMN dados_alteracao_json TEXT"))
+            conn.commit()
+            print("MIGRATION: Column added successfully.")
+        
+        conn.close()
+    except Exception as e:
+        print(f"WARNING: Database migration failed: {e}")
+
     # Inicia a thread de background
     thread = threading.Thread(target=background_scheduler, daemon=True)
     thread.start()
