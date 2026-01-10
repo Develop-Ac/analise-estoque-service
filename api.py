@@ -73,7 +73,12 @@ def listar_analise(
     only_changes: bool = False,
     critical: bool = False
 ):
-    conn = get_db_connection()
+    try:
+        conn = get_db_connection()
+    except Exception as e:
+        print(f"ERRO DE CONEXAO BANCO: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro ao conectar no banco de dados: {str(e)}")
+
     try:
         offset = (page - 1) * limit
         
@@ -98,7 +103,19 @@ def listar_analise(
         
         # Query Total
         count_sql = text(f"SELECT COUNT(*) FROM com_fifo_completo WHERE {where_clause}")
-        total = conn.execute(count_sql, params).scalar()
+        try:
+            total = conn.execute(count_sql, params).scalar()
+        except Exception as e:
+             # Tabela pode nao existir ainda
+             print(f"ERRO QUERY: {e}")
+             # Retorna vazio se a tabela nao existe (primeira inicializacao)
+             return {
+                "data": [],
+                "total": 0,
+                "page": page,
+                "limit": limit,
+                "total_pages": 0
+            }
         
         # Query Dados
         data_sql = text(f"""
@@ -136,7 +153,9 @@ def listar_analise(
             "limit": limit,
             "total_pages": total_pages
         }
-        
+    except Exception as e:
+        print(f"ERRO GERAL API: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro interno: {str(e)}")
     finally:
         conn.close()
 
