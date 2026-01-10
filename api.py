@@ -178,12 +178,14 @@ def health_check():
 # ==========================================
 # BACKGROUND TASK
 # ==========================================
+# ==========================================
+# BACKGROUND TASK
+# ==========================================
 import threading
 import time
 import datetime
 import json
 from pathlib import Path
-from main import run_job  # Importa a função de job do main.py
 
 BACKGROUND_Running = False
 ARQUIVO_ESTADO = Path("fifo_service_state.json")
@@ -206,6 +208,16 @@ def background_scheduler():
     global BACKGROUND_Running
     print("Iniciando scheduler de background...")
     
+    # Lazy import para evitar falha de startup da API se houver erro de dependencia no main.py
+    try:
+        from main import run_job
+    except ImportError as e:
+        print(f"ERRO CRITICO: Nao foi possivel importar main.py. O job nao rodara. Erro: {e}")
+        return
+    except Exception as e:
+        print(f"ERRO CRITICO: Erro ao carregar main.py: {e}")
+        return
+
     while True:
         try:
             state = load_state()
