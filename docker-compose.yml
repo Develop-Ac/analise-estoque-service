@@ -14,3 +14,19 @@ services:
     restart: unless-stopped
     volumes:
       - ./data:/app/data
+
+  analise-estoque-api:
+    build: .
+    command: python -m uvicorn api:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    environment:
+      - POSTGRES_URL=${POSTGRES_URL}
+      - SQL_HOST=${SQL_HOST:-127.0.0.1}
+      - SQL_PORT=${SQL_PORT:-1433}
+      - SQL_DATABASE=${SQL_DATABASE:-master}
+      - SQL_USER=${SQL_USER:-sa}
+      - SQL_PASSWORD=${SQL_PASSWORD:-senha_secreta}
+    restart: unless-stopped
+    volumes:
+      - ./data:/app/data
