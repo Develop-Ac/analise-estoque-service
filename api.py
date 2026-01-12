@@ -475,7 +475,7 @@ from pathlib import Path
 BACKGROUND_Running = False
 # CORREÇÃO: Usar caminho absoluto relativo ao arquivo para consistência
 BASE_DIR = Path(__file__).resolve().parent
-ARQUIVO_ESTADO = BASE_DIR / "fifo_service_state.json"
+ARQUIVO_ESTADO = BASE_DIR / "data" / "fifo_service_state.json"
 INTERVALO_DIAS = int(os.getenv('INTERVALO_DIAS', 7))
 
 def load_state():
