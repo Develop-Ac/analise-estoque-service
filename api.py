@@ -140,6 +140,7 @@ class AnaliseItem(BaseModel):
     dias_ruptura: Optional[float]
     fator_tendencia: Optional[float]
     tendencia_label: Optional[str]
+    alerta_tendencia_alta: Optional[str] # Sim/Não
     dados_alteracao_json: Optional[str] # JSON string
 
 class PaginatedResponse(BaseModel):
@@ -251,7 +252,7 @@ def listar_analise(
                 curva_abc, categoria_estocagem, estoque_min_sugerido, estoque_max_sugerido,
                 tipo_planejamento, teve_alteracao_analise, 
                 CAST(data_processamento AS TEXT) as data_processamento,
-                dias_ruptura, fator_tendencia, tendencia_label,
+                dias_ruptura, fator_tendencia, tendencia_label, alerta_tendencia_alta,
                 CAST(dados_alteracao_json AS TEXT) as dados_alteracao_json
             FROM com_fifo_completo 
             WHERE {where_clause}
