@@ -312,7 +312,8 @@ def exportar_analise(
     critical: bool = False,
     curve: Optional[str] = None,
     trend: Optional[str] = None,
-    status: Optional[str] = None
+    status: Optional[str] = None,
+    coverage_days: int = 0  # Novo Parametro
 ):
     try:
         conn = get_db_connection()
@@ -320,56 +321,64 @@ def exportar_analise(
         raise HTTPException(status_code=500, detail=f"Erro banco: {e}")
 
     try:
-        # Reutilizando logica de filtro (Copy-Paste para garantir isolamento)
-        filters = []
-        params = {}
+        where_clauses = ["1=1"]
+        params = []
         
-        if only_changes:
-            filters.append("teve_alteracao_analise = TRUE")
+        if search:
+            where_clauses.append("(pro_codigo ILIKE %s OR pro_descricao ILIKE %s)")
+            params.extend([f"%{search}%", f"%{search}%"])
+            
+        if only_changes and coverage_days == 0: # Se for simulação, ignora filtro de mudanças por padrão? Ou mantemos? Mantendo comportamento original se não for simulação.
+            where_clauses.append("teve_alteracao_analise = TRUE")
 
-        filters.append("data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)")
+        # FILTER: Ensure we only fetch the latest analysis snapshot
+        where_clauses.append("data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)")
             
         if critical:
-            filters.append("(estoque_disponivel < estoque_min_sugerido)")
-            
+             where_clauses.append("estoque_disponivel < estoque_min_sugerido")
+
         if curve:
             curves = [c.strip().upper() for c in curve.split(",") if c.strip()]
             if curves:
-                curve_params = {f"curve_{i}": c for i, c in enumerate(curves)}
-                params.update(curve_params)
-                keys = ", ".join([f":{k}" for k in curve_params.keys()])
-                filters.append(f"curva_abc IN ({keys})")
-
+                where_clauses.append(f"curva_abc IN ({','.join(['%s'] * len(curves))})")
+                params.extend(curves)
+        
         if trend:
             trends = [t.strip() for t in trend.split(",") if t.strip()]
-            if trends:
-                 trend_params = {f"trend_{i}": t for i, t in enumerate(trends)}
-                 params.update(trend_params)
-                 keys = ", ".join([f":{k}" for k in trend_params.keys()])
-                 filters.append(f"tendencia_label IN ({keys})")
-                 
+            # Simplificacao: Busca por texto exato ou logica aproximada se necessario. 
+            # No frontend usamos labels "Subindo", "Caindo". No banco temos 'alerta_tendencia_alta'.
+            # Para exportacao exata, melhor filtrar pelo que temos certeza.
+            # Ajuste: Filtrar apenas se trend="Subindo" -> alerta_tendencia_alta='Sim'
+            if "Subindo" in trends:
+                where_clauses.append("alerta_tendencia_alta = 'Sim'")
+
         if status:
             status_list = [s.strip().lower() for s in status.split(",") if s.strip()]
             status_conditions = []
             if "critico" in status_list or "critical" in status_list:
-                status_conditions.append("(estoque_disponivel < estoque_min_sugerido)")
+                status_conditions.append("estoque_disponivel < estoque_min_sugerido")
             if "excesso" in status_list or "excess" in status_list:
-                status_conditions.append("(estoque_disponivel > estoque_max_sugerido)")
+                status_conditions.append("estoque_disponivel > estoque_max_sugerido")
             if "normal" in status_list:
-                status_conditions.append("(estoque_disponivel >= estoque_min_sugerido AND estoque_disponivel <= estoque_max_sugerido)")
-            if status_conditions:
-                filters.append(f"({' OR '.join(status_conditions)})")
-
-        if search:
-            filters.append("(pro_codigo LIKE :search OR pro_descricao ILIKE :search_desc)")
-            params["search"] = f"{search}%"
-            params["search_desc"] = f"%{search}%"
+                status_conditions.append("estoque_disponivel >= estoque_min_sugerido AND estoque_disponivel <= estoque_max_sugerido")
             
-        where_clause = " AND ".join(filters) if filters else "1=1"
+            if status_conditions:
+                where_clauses.append(f"({' OR '.join(status_conditions)})")
 
-        # Query p/ Export - Trazendo mais campos e calculando Status
-        export_sql = text(f"""
-            SELECT 
+        where_clause = " AND ".join(where_clauses)
+        
+        # Seleção de colunas muda baseada na cobertura
+        if coverage_days > 0:
+             # Modo Simulação: Traz dados brutos para calcular no Python
+             query_columns = """
+                pro_codigo, pro_descricao, estoque_disponivel, 
+                estoque_min_sugerido, estoque_max_sugerido, 
+                curva_abc, tipo_planejamento, sgr_codigo, alerta_tendencia_alta,
+                demanda_media_dia_ajustada, fornecedor1, qtd_vendida
+             """
+        else:
+             # Modo Padrão: Traz colunas formatadas para relatorio de analise
+             query_columns = """
                 pro_codigo as "Código",
                 pro_descricao as "Descrição",
                 mar_descricao as "Marca",
@@ -390,39 +399,130 @@ def exportar_analise(
                 tempo_medio_estoque as "Tempo Médio Est.",
                 fornecedor1 as "Fornecedor",
                 tipo_planejamento as "Tipo Planejamento",
-                dados_alteracao_json as "Detalhes Mudança"
+                dados_alteracao_json as "Detalhes Mudança" -- Mantem apenas no padrao
+             """
+
+        export_sql = text(f"""
+            SELECT {query_columns}
             FROM com_fifo_completo 
             WHERE {where_clause}
-            ORDER BY 
-                CASE WHEN teve_alteracao_analise = TRUE THEN 0 ELSE 1 END,
-                curva_abc ASC, 
-                pro_descricao ASC
+            ORDER BY curva_abc ASC, pro_descricao ASC
         """)
         
-        # Leitura com Pandas
         import pandas as pd
         import io
         from fastapi.responses import StreamingResponse
+        import numpy as np # Para calculos vetoriais se quisermos, mas loop simples resolve
 
         df = pd.read_sql(export_sql, conn, params=params)
         
-        # Converter colunas numericas se precisar (Pandas ja deve fazer)
-        
+        if coverage_days > 0:
+            # LÓGICA DE SIMULAÇÃO (Portada do TypeScript/Go)
+            
+            def calculate_row(row):
+                estoque = float(row['estoque_disponivel'] or 0)
+                dbMin = float(row['estoque_min_sugerido'] or 0)
+                dbMax = float(row['estoque_max_sugerido'] or 0)
+                tipo = (row['tipo_planejamento'] or "Normal").strip()
+                curva = (row['curva_abc'] or "C").upper()
+                sgr = int(row['sgr_codigo'] or 0)
+                alerta = row['alerta_tendencia_alta'] or "Não"
+
+                # 1. Sob Demanda
+                if tipo == "Sob_Demanda":
+                    return 0, 0, 0, 0, 0
+
+                # 2. Sem politica
+                if dbMin == 0 and dbMax == 0:
+                    return 0, 0, 0, 0, 0
+
+                # 3. Escalar
+                if sgr == 154:
+                    ref_dias_map = {"A": 120, "B": 180, "C": 240, "D": 120}
+                else:
+                    ref_dias_map = {"A": 60, "B": 90, "C": 120, "D": 45}
+                
+                ref_dias = ref_dias_map.get(curva, 240 if sgr == 154 else 120)
+                factor = coverage_days / ref_dias
+                
+                targetMin = np.ceil(dbMin * factor)
+                targetMax = np.ceil(dbMax * factor)
+                
+                if tipo == "Pouco_Historico":
+                    targetMin = np.ceil(targetMin / 2.0)
+                    targetMax = np.ceil(targetMax / 2.0)
+                
+                if targetMax < targetMin: targetMax = targetMin
+
+                if targetMax <= 0 or estoque >= targetMax:
+                    sugestao_final = 0
+                    sugestao_min = 0
+                else:
+                    baseNeededMax = targetMax - estoque
+                    baseNeededMin = max(0, targetMin - estoque) # Minimo para chegar no Min
+
+                    boost = 1.2 if (alerta == "Sim" and curva in ["A", "B"]) else 1.0
+                    
+                    valMax = baseNeededMax * boost
+                    valMin = baseNeededMin * boost
+                    
+                    if curva in ["A", "B"]:
+                        sugestao_final = np.ceil(valMax)
+                        sugestao_min = np.ceil(valMin)
+                    else:
+                        sugestao_final = round(valMax)
+                        sugestao_min = round(valMin)
+
+                return factor, targetMin, targetMax, max(0, sugestao_min), max(0, sugestao_final)
+
+            # Aplicar calculo
+            results = df.apply(calculate_row, axis=1, result_type='expand')
+            df[['Fator Escala', 'Min Ajustado', 'Max Ajustado', 'Sugestão Min', 'Sugestão Max']] = results
+            
+            # Formatar e renomear para output final
+            df['Dias Cobertura'] = coverage_days
+            
+            # Selecionar e reordenar colunas finais
+            final_columns = {
+                'pro_codigo': 'Código',
+                'pro_descricao': 'Descrição',
+                'curva_abc': 'Curva',
+                'tipo_planejamento': 'Planejamento',
+                'estoque_disponivel': 'Estoque Atual',
+                'estoque_min_sugerido': 'Min Original',
+                'estoque_max_sugerido': 'Max Original',
+                'Dias Cobertura': 'Dias Cobertura',
+                'Fator Escala': 'Fator Escala',
+                'Min Ajustado': 'Min Ajustado',
+                'Max Ajustado': 'Max Ajustado',
+                'Sugestão Min': 'Sugestão Min (Repor Seg.)',
+                'Sugestão Max': 'Sugestão Max (Ideal)',
+                'fornecedor1': 'Fornecedor'
+            }
+            df = df.rename(columns=final_columns)
+            # Manter apenas as colunas desejadas na ordem
+            desired_order = list(final_columns.values())
+            df = df[desired_order]
+
         output = io.BytesIO()
-        # MUDANÇA: engine openpyxl para compatibilidade
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Analise')
+            sheet_name = 'Simulacao Compra' if coverage_days > 0 else 'Analise Estoque'
+            df.to_excel(writer, index=False, sheet_name=sheet_name)
                 
         output.seek(0)
         
+        filename_prefix = "simulacao_compra" if coverage_days > 0 else "analise_estoque"
         headers = {
-            'Content-Disposition': f'attachment; filename="analise_estoque_{pd.Timestamp.now().strftime("%Y%m%d_%H%M")}.xlsx"'
+            'Content-Disposition': f'attachment; filename="{filename_prefix}_{pd.Timestamp.now().strftime("%Y%m%d_%H%M")}.xlsx"'
         }
         
         return StreamingResponse(output, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers=headers)
 
     except Exception as e:
         print(f"ERRO EXPORT: {e}")
+        # Importante: Logar stacktrace completo em produção
+        import traceback
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
