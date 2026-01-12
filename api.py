@@ -303,6 +303,127 @@ def listar_analise(
     finally:
         conn.close()
 
+@app.get("/analise/export")
+def exportar_analise(
+    search: Optional[str] = None,
+    only_changes: bool = False,
+    critical: bool = False,
+    curve: Optional[str] = None,
+    trend: Optional[str] = None,
+    status: Optional[str] = None
+):
+    try:
+        conn = get_db_connection()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro banco: {e}")
+
+    try:
+        # Reutilizando logica de filtro (Copy-Paste para garantir isolamento)
+        filters = []
+        params = {}
+        
+        if only_changes:
+            filters.append("teve_alteracao_analise = TRUE")
+
+        filters.append("data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)")
+            
+        if critical:
+            filters.append("(estoque_disponivel < estoque_min_sugerido)")
+            
+        if curve:
+            curves = [c.strip().upper() for c in curve.split(",") if c.strip()]
+            if curves:
+                curve_params = {f"curve_{i}": c for i, c in enumerate(curves)}
+                params.update(curve_params)
+                keys = ", ".join([f":{k}" for k in curve_params.keys()])
+                filters.append(f"curva_abc IN ({keys})")
+
+        if trend:
+            trends = [t.strip() for t in trend.split(",") if t.strip()]
+            if trends:
+                 trend_params = {f"trend_{i}": t for i, t in enumerate(trends)}
+                 params.update(trend_params)
+                 keys = ", ".join([f":{k}" for k in trend_params.keys()])
+                 filters.append(f"tendencia_label IN ({keys})")
+                 
+        if status:
+            status_list = [s.strip().lower() for s in status.split(",") if s.strip()]
+            status_conditions = []
+            if "critico" in status_list or "critical" in status_list:
+                status_conditions.append("(estoque_disponivel < estoque_min_sugerido)")
+            if "excesso" in status_list or "excess" in status_list:
+                status_conditions.append("(estoque_disponivel > estoque_max_sugerido)")
+            if "normal" in status_list:
+                status_conditions.append("(estoque_disponivel >= estoque_min_sugerido AND estoque_disponivel <= estoque_max_sugerido)")
+            if status_conditions:
+                filters.append(f"({' OR '.join(status_conditions)})")
+
+        if search:
+            filters.append("(pro_codigo LIKE :search OR pro_descricao ILIKE :search_desc)")
+            params["search"] = f"{search}%"
+            params["search_desc"] = f"%{search}%"
+            
+        where_clause = " AND ".join(filters) if filters else "1=1"
+
+        # Query p/ Export - Trazendo mais campos
+        export_sql = text(f"""
+            SELECT 
+                pro_codigo as "Código",
+                pro_descricao as "Descrição",
+                mar_descricao as "Marca",
+                curva_abc as "Curva",
+                estoque_disponivel as "Estoque",
+                demanda_media_dia_ajustada as "Média/Dia",
+                tendencia_label as "Tendência",
+                estoque_min_sugerido as "Min Sugerido",
+                estoque_max_sugerido as "Max Sugerido",
+                qtd_vendida as "Qtd Vendida",
+                valor_vendido as "Valor Vendido",
+                periodo_dias as "Dias Período",
+                tempo_medio_estoque as "Tempo Médio Est.",
+                fornecedor1 as "Fornecedor",
+                tipo_planejamento as "Tipo Planejamento",
+                dados_alteracao_json as "Detalhes Mudança"
+            FROM com_fifo_completo 
+            WHERE {where_clause}
+            ORDER BY 
+                CASE WHEN teve_alteracao_analise = TRUE THEN 0 ELSE 1 END,
+                curva_abc ASC, 
+                pro_descricao ASC
+        """)
+        
+        # Leitura com Pandas
+        import pandas as pd
+        import io
+        from fastapi.responses import StreamingResponse
+
+        df = pd.read_sql(export_sql, conn, params=params)
+        
+        # Converter colunas numericas se precisar (Pandas ja deve fazer)
+        
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+            df.to_excel(writer, index=False, sheet_name='Analise')
+            # Auto-adjust columns width
+            worksheet = writer.sheets['Analise']
+            for i, col in enumerate(df.columns):
+                max_len = max(df[col].astype(str).map(len).max(), len(col)) + 2
+                worksheet.set_column(i, i, max_len)
+                
+        output.seek(0)
+        
+        headers = {
+            'Content-Disposition': f'attachment; filename="analise_estoque_{pd.Timestamp.now().strftime("%Y%m%d_%H%M")}.xlsx"'
+        }
+        
+        return StreamingResponse(output, media_type='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', headers=headers)
+
+    except Exception as e:
+        print(f"ERRO EXPORT: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        conn.close()
+
 @app.get("/", response_class=HTMLResponse)
 def root():
     state = load_state()
