@@ -27,7 +27,7 @@ INTERVALO_DIAS = int(os.getenv('INTERVALO_DIAS', 7))
 # Caminhos dos arquivos
 BASE_DIR = Path(__file__).resolve().parent
 ARQUIVO_SAIDA = BASE_DIR / "resultado_fifo_completo.xlsx"
-ARQUIVO_ESTADO = BASE_DIR / "fifo_service_state.json"
+ARQUIVO_ESTADO = BASE_DIR / "data/fifo_service_state.json"
 ARQUIVO_ANTERIOR = BASE_DIR / "historico_analise_anterior.pkl"
 
 # Configurações de E-mail (PREENCHER AQUI)
@@ -1619,35 +1619,69 @@ def save_state(state):
         json.dump(state, f)
 
 def start_service():
-    print(f"Iniciando serviço de monitoramento FIFO. Intervalo: {INTERVALO_DIAS} dias.")
+    print(f"Iniciando serviço de monitoramento FIFO. Agendado para todo DOMINGO as 14:00.")
     
+    # Garantir que pasta data existe no caminho configurado
+    if ARQUIVO_ESTADO.parent.name == "data":
+        os.makedirs(ARQUIVO_ESTADO.parent, exist_ok=True)
+
     while True:
-        state = load_state()
-        last_run_str = state.get("last_run")
-        should_run = False
-        
-        if not last_run_str:
-            print("Primeira execução detectada. Rodando agora...")
-            should_run = True
-        else:
-            last_run = datetime.datetime.fromisoformat(last_run_str)
-            dias_passados = (datetime.datetime.now() - last_run).days
-            if dias_passados >= INTERVALO_DIAS:
-                print(f"Última execução há {dias_passados} dias. Rodando agora...")
-                should_run = True
+        try:
+            now = datetime.datetime.now()
+            
+            # Regra: Domingo (6) e Hora >= 14
+            is_sunday = (now.weekday() == 6)
+            is_time = (now.hour >= 14)
+
+            # Para teste/debug pode-se forçar com variavel de ambiente ou checar aqui
+            
+            if is_sunday and is_time:
+                state = load_state()
+                last_run_str = state.get("last_run")
+                
+                should_run = False
+                
+                if not last_run_str:
+                    print("Agendamento: Nenhuma execução anterior registrada. Rodando job de Domingo...")
+                    should_run = True
+                else:
+                    try:
+                        last_run = datetime.datetime.fromisoformat(last_run_str)
+                        # Se a última execução não foi HOJE, então roda.
+                        # Garante apenas uma execução no Domingo.
+                        if last_run.date() != now.date():
+                            print(f"Agendamento: Última execução foi {last_run}. Rodando job de Domingo agora...")
+                            should_run = True
+                        else:
+                            # Já rodou hoje, aguarda próxima semana
+                            pass
+                    except ValueError:
+                        print("Agendamento: Erro ao ler data anterior. Forçando execução...")
+                        should_run = True
+
+                if should_run:
+                    try:
+                        print(f"Iniciando execução agendada: {datetime.datetime.now()}")
+                        run_job()
+                        
+                        # Atualiza estado após sucesso
+                        state = load_state()
+                        state["last_run"] = datetime.datetime.now().isoformat()
+                        save_state(state)
+                        print("Job de Domingo concluído com sucesso.")
+                    except Exception as e:
+                        print(f"Erro fatal no job agendado: {e}")
+            
             else:
-                print(f"Última execução: {last_run_str}. Próxima em {INTERVALO_DIAS - dias_passados} dias.")
-        
-        if should_run:
-            try:
-                run_job()
-                state["last_run"] = datetime.datetime.now().isoformat()
-                save_state(state)
-            except Exception as e:
-                print(f"Erro fatal no job: {e}")
-        
-        # Dorme por 1 hora antes de checar novamente (para não consumir CPU)
-        time.sleep(3600) 
+                pass
+                # Se desejar logs verbose:
+                # print(f"Aguardando Domingo 14hs. Agora: {now}")
+
+        except Exception as e:
+            print(f"Erro no loop principal do serviço: {e}")
+
+        # Verifica a cada 10 minutos (600s) para não perder a janela, mas sem busy-wait
+        time.sleep(600) 
 
 if __name__ == "__main__":
     # Se o usuário passar argumento "run", roda direto
