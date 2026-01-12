@@ -129,6 +129,7 @@ class AnaliseItem(BaseModel):
     tempo_medio_estoque: Optional[float]
     data_min_venda: Optional[str]
     data_max_venda: Optional[str]
+    qtd_vendida: Optional[float]
     curva_abc: Optional[str]
     categoria_estocagem: Optional[str]
     estoque_min_sugerido: Optional[float]
@@ -246,7 +247,7 @@ def listar_analise(
                 id, pro_codigo, pro_descricao, sgr_codigo, mar_descricao, fornecedor1,
                 estoque_disponivel, demanda_media_dia, demanda_media_dia_ajustada,
                 tempo_medio_estoque, CAST(data_min_venda AS TEXT) as data_min_venda, 
-                CAST(data_max_venda AS TEXT) as data_max_venda,
+                CAST(data_max_venda AS TEXT) as data_max_venda, qtd_vendida,
                 curva_abc, categoria_estocagem, estoque_min_sugerido, estoque_max_sugerido,
                 tipo_planejamento, teve_alteracao_analise, 
                 CAST(data_processamento AS TEXT) as data_processamento,
