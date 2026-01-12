@@ -402,13 +402,9 @@ def exportar_analise(
         # Converter colunas numericas se precisar (Pandas ja deve fazer)
         
         output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='xlsxwriter') as writer:
+        # MUDANÇA: engine openpyxl para compatibilidade
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
             df.to_excel(writer, index=False, sheet_name='Analise')
-            # Auto-adjust columns width
-            worksheet = writer.sheets['Analise']
-            for i, col in enumerate(df.columns):
-                max_len = max(df[col].astype(str).map(len).max(), len(col)) + 2
-                worksheet.set_column(i, i, max_len)
                 
         output.seek(0)
         
@@ -472,25 +468,36 @@ import json
 from pathlib import Path
 
 BACKGROUND_Running = False
-ARQUIVO_ESTADO = Path("fifo_service_state.json")
+# CORREÇÃO: Usar caminho absoluto relativo ao arquivo para consistência
+BASE_DIR = Path(__file__).resolve().parent
+ARQUIVO_ESTADO = BASE_DIR / "fifo_service_state.json"
 INTERVALO_DIAS = int(os.getenv('INTERVALO_DIAS', 7))
 
 def load_state():
     if not ARQUIVO_ESTADO.exists():
+        print(f"DEBUG: Arquivo de estado não encontrado em {ARQUIVO_ESTADO}")
         return {}
     try:
         with open(ARQUIVO_ESTADO, "r") as f:
-            return json.load(f)
-    except:
+            state = json.load(f)
+            print(f"DEBUG: Estado carregado de {ARQUIVO_ESTADO}: {state}")
+            return state
+    except Exception as e:
+        print(f"DEBUG: Erro ao ler estado: {e}")
         return {}
 
 def save_state(state):
-    with open(ARQUIVO_ESTADO, "w") as f:
-        json.dump(state, f)
+    try:
+        with open(ARQUIVO_ESTADO, "w") as f:
+            json.dump(state, f)
+            print(f"DEBUG: Estado salvo em {ARQUIVO_ESTADO}")
+    except Exception as e:
+        print(f"Erro ao salvar estado: {e}")
 
 def background_scheduler():
     global BACKGROUND_Running
     print("Iniciando scheduler de background...")
+    print(f"Monitorando arquivo de estado: {ARQUIVO_ESTADO}")
     
     # Lazy import para evitar falha de startup da API se houver erro de dependencia no main.py
     try:
@@ -509,24 +516,36 @@ def background_scheduler():
             should_run = False
             
             if not last_run_str:
-                print("Primeira execução detectada. Rodando job...")
+                print("Primeira execução detectada (Sem data anterior). Rodando job...")
                 should_run = True
             else:
-                last_run = datetime.datetime.fromisoformat(last_run_str)
-                dias_passados = (datetime.datetime.now() - last_run).days
-                
-                if dias_passados >= INTERVALO_DIAS:
-                    print(f"Intervalo de {INTERVALO_DIAS} dias atingido. Rodando job...")
+                try:
+                    last_run = datetime.datetime.fromisoformat(last_run_str)
+                    now = datetime.datetime.now()
+                    dias_passados = (now - last_run).days
+                    
+                    if dias_passados >= INTERVALO_DIAS:
+                        print(f"Intervalo de {INTERVALO_DIAS} dias atingido. (Última: {last_run_str}, Passados: {dias_passados}). Rodando job...")
+                        should_run = True
+                    else:
+                        # Log apenas ocasional ou na startup para não floodar
+                        pass
+                        # print(f"Skipping analysis. Última execução: {last_run_str}. ({dias_passados} dias atrás)")
+                except ValueError:
+                    print("Erro ao parsear data anterior. Rodando job...")
                     should_run = True
-                else:
-                    print(f"Skipping analysis. Última execução: {last_run_str}. ({dias_passados} dias atrás)")
             
             if should_run:
-                BACKGROUND_Running = True
-                run_job()
-                state["last_run"] = datetime.datetime.now().isoformat()
-                save_state(state)
-                BACKGROUND_Running = False
+                if not BACKGROUND_Running:
+                   BACKGROUND_Running = True
+                   print(">>> Iniciando execução do Job FIFO...")
+                   run_job()
+                   state["last_run"] = datetime.datetime.now().isoformat()
+                   save_state(state)
+                   BACKGROUND_Running = False
+                   print(">>> Job FIFO finalizado.")
+                else:
+                    print("Job já está rodando. Ignorando trigger.")
                 
         except Exception as e:
             print(f"Erro no background scheduler: {e}")
