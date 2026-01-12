@@ -365,7 +365,7 @@ def exportar_analise(
             
         where_clause = " AND ".join(filters) if filters else "1=1"
 
-        # Query p/ Export - Trazendo mais campos
+        # Query p/ Export - Trazendo mais campos e calculando Status
         export_sql = text(f"""
             SELECT 
                 pro_codigo as "Código",
@@ -377,6 +377,11 @@ def exportar_analise(
                 tendencia_label as "Tendência",
                 estoque_min_sugerido as "Min Sugerido",
                 estoque_max_sugerido as "Max Sugerido",
+                CASE 
+                    WHEN estoque_disponivel < estoque_min_sugerido THEN 'Crítico'
+                    WHEN estoque_disponivel > estoque_max_sugerido THEN 'Excesso'
+                    ELSE 'Normal'
+                END as "Status",
                 qtd_vendida as "Qtd Vendida",
                 valor_vendido as "Valor Vendido",
                 periodo_dias as "Dias Período",
