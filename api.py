@@ -177,6 +177,9 @@ def listar_analise(
         
         if only_changes:
             filters.append("teve_alteracao_analise = TRUE")
+
+        # FILTER: Ensure we only fetch the latest analysis snapshot
+        filters.append("data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)")
             
         if critical:
             # Mantendo compatibilidade: Crítico

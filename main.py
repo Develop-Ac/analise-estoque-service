@@ -1125,16 +1125,19 @@ def detectar_alteracoes_via_banco(df_atual: pd.DataFrame):
     def verificar_linha(row):
         # Se é produto novo (não tem anterior)
         if pd.isna(row["MIN_ANT"]):
-            return True, "NOVO PRODUTO", "Novo na análise"
+            return True, "NOVO PRODUTO", "Novo na análise", {}
         
         diffs = []
         changed = False
+        changes = {}
         
         # Comparar Min (tratar NaN como diferente de numero)
         atual_min = row["ESTOQUE_MIN_SUGERIDO"]
         ant_min = row["MIN_ANT"]
         if atual_min != ant_min:
             diffs.append(f"Min: {float(ant_min):.0f} -> {atual_min}")
+            # Ensure serialization friendly types
+            changes["estoque_min_sugerido"] = {"old": float(ant_min), "new": float(atual_min) if atual_min is not None else 0}
             changed = True
             
         # Comparar Max
@@ -1142,6 +1145,7 @@ def detectar_alteracoes_via_banco(df_atual: pd.DataFrame):
         ant_max = row["MAX_ANT"]
         if atual_max != ant_max:
             diffs.append(f"Max: {float(ant_max):.0f} -> {atual_max}")
+            changes["estoque_max_sugerido"] = {"old": float(ant_max), "new": float(atual_max) if atual_max is not None else 0}
             changed = True
             
         # Comparar ABC
@@ -1149,21 +1153,23 @@ def detectar_alteracoes_via_banco(df_atual: pd.DataFrame):
         ant_abc = str(row["ABC_ANT"])
         if atual_abc != ant_abc:
             diffs.append(f"ABC: {ant_abc} -> {atual_abc}")
+            changes["curva_abc"] = {"old": ant_abc, "new": atual_abc}
             changed = True
             
         if changed:
-            return True, "ALTERADO", "; ".join(diffs)
+            return True, "ALTERADO", "; ".join(diffs), changes
             
-        return False, None, None
+        return False, None, None, {}
 
     # Aplicar verificação
     resultados = df_merge.apply(verificar_linha, axis=1)
     
     # Extrair resultados
     df_atual["TEVE_ALTERACAO_ANALISE"] = [res[0] for res in resultados]
+    df_atual["dados_alteracao_json"] = [json.dumps(res[3]) if res[0] and res[3] else None for res in resultados]
     
     # Montar df_mudancas para relatorio
-    for idx, (changed, tipo, detalhes) in enumerate(resultados):
+    for idx, (changed, tipo, detalhes, _) in enumerate(resultados):
         if changed and tipo == "ALTERADO": # Só listamos alterações de produtos existentes no email para não poluir
              mudancas.append({
                  "PRO_CODIGO": df_atual.iloc[idx]["PRO_CODIGO"],
@@ -1303,6 +1309,7 @@ def verificar_tabela_postgres():
 def salvar_metricas_postgres(df_metricas):
     """
     Salva as métricas calculadas na tabela com_fifo_completo do PostgreSQL
+    Mantém apenas as últimas 2 execuções (Penúltima e Última)
     """
     if df_metricas.empty:
         print("DataFrame de métricas vazio. Nada para salvar.")
@@ -1358,7 +1365,8 @@ def salvar_metricas_postgres(df_metricas):
         'TIPO_PLANEJAMENTO': 'tipo_planejamento',
         'ALERTA_TENDENCIA_ALTA': 'alerta_tendencia_alta',
         'DESCRICAO_CALCULO_ESTOQUE': 'descricao_calculo_estoque',
-        'TEVE_ALTERACAO_ANALISE': 'teve_alteracao_analise'
+        'TEVE_ALTERACAO_ANALISE': 'teve_alteracao_analise',
+        'dados_alteracao_json': 'dados_alteracao_json'
     }
     
     # Renomeia as colunas
@@ -1375,7 +1383,8 @@ def salvar_metricas_postgres(df_metricas):
         'categoria_estocagem', 'estoque_min_base', 'estoque_max_base',
         'fator_ajuste_tendencia', 'estoque_min_ajustado', 'estoque_max_ajustado',
         'estoque_min_sugerido', 'estoque_max_sugerido', 'tipo_planejamento',
-        'alerta_tendencia_alta', 'descricao_calculo_estoque', 'teve_alteracao_analise'
+        'alerta_tendencia_alta', 'descricao_calculo_estoque', 'teve_alteracao_analise',
+        'dados_alteracao_json'
     ]
     
     # Garante que todas as colunas necessárias existem (adiciona como None se não existir)
@@ -1409,6 +1418,34 @@ def salvar_metricas_postgres(df_metricas):
         )
         
         print(f"Salvos {len(df_save)} registros na tabela com_fifo_completo do PostgreSQL")
+        
+        # === LIMPEZA: Manter apenas as últimas 2 datas de análise ===
+        with engine.connect() as conn:
+            # Busca todas as datas distintas ordenadas da mais recente para a mais antiga
+            result = conn.execute(text("SELECT DISTINCT data_processamento FROM com_fifo_completo ORDER BY data_processamento DESC"))
+            dates = [row[0] for row in result]
+            
+            # Se houver mais de 2 datas, remove as antigas
+            if len(dates) > 2:
+                # A partir da 3ª data (índice 2), todas devem ser excluídas
+                cutoff_date = dates[1] # Mantém índice 0 e 1, cutoff é a segunda mais recente (limite inferior inclusivo para o DELETE é tudo MENOR que ela? Não, temos timestamps exatos)
+                
+                # Vamos deletar tudo que não seja as 2 primeiras datas
+                dates_to_keep = dates[:2]
+                
+                # Formata para string para usar na query (ou passamos parametro)
+                # Parametro Lista/Tuple pode ser chato, vamos deletar onde data < dates[1]
+                # Se dates[1] é a penúltima, queremos manter ela e a dates[0].
+                # Então removemos tudo onde data_processamento < dates[1].
+                
+                print(f"Limpando análises antigas. Mantendo apenas execuções de {dates[0]} e {dates[1]}")
+                
+                conn.execute(
+                    text("DELETE FROM com_fifo_completo WHERE data_processamento < :cutoff"),
+                    {"cutoff": cutoff_date}
+                )
+                conn.commit()
+                print("Limpeza concluída.")
         
     except Exception as e:
         print(f"Erro ao salvar no PostgreSQL: {e}")
