@@ -158,6 +158,8 @@ def listar_analise(
     page: int = 1,
     limit: int = 50,
     search: Optional[str] = None,
+    pro_codigos: Optional[str] = Query(None, description="Lista de códigos separados por virgula"),
+    marca: Optional[str] = None,
     only_changes: bool = False,
     critical: bool = False,
     curve: Optional[str] = None,
@@ -225,6 +227,20 @@ def listar_analise(
             filters.append("(pro_codigo LIKE :search OR pro_descricao ILIKE :search_desc)")
             params["search"] = f"{search}%"
             params["search_desc"] = f"%{search}%"
+
+        if pro_codigos:
+             # Separa os códigos por vírgula
+             codigos_list = [c.strip() for c in pro_codigos.split(",") if c.strip()]
+             if codigos_list:
+                 # Cria parametros dinamicos para o IN (:cod0, :cod1, ...)
+                 cod_params = {f"cod_{i}": c for i, c in enumerate(codigos_list)}
+                 params.update(cod_params)
+                 keys = ", ".join([f":{k}" for k in cod_params.keys()])
+                 filters.append(f"pro_codigo IN ({keys})")
+
+        if marca:
+            filters.append("mar_descricao ILIKE :marca")
+            params["marca"] = f"%{marca}%"
             
         where_clause = " AND ".join(filters) if filters else "1=1"
         
@@ -308,6 +324,8 @@ def listar_analise(
 @app.get("/analise/export")
 def exportar_analise(
     search: Optional[str] = None,
+    pro_codigos: Optional[str] = Query(None),
+    marca: Optional[str] = None,
     only_changes: bool = False,
     critical: bool = False,
     curve: Optional[str] = None,
@@ -327,6 +345,16 @@ def exportar_analise(
         if search:
             where_clauses.append("(pro_codigo ILIKE %s OR pro_descricao ILIKE %s)")
             params.extend([f"%{search}%", f"%{search}%"])
+
+        if pro_codigos:
+             codigos_list = [c.strip() for c in pro_codigos.split(",") if c.strip()]
+             if codigos_list:
+                 where_clauses.append(f"pro_codigo IN ({','.join(['%s'] * len(codigos_list))})")
+                 params.extend(codigos_list)
+
+        if marca:
+            where_clauses.append("mar_descricao ILIKE %s")
+            params.append(f"%{marca}%")
             
         if only_changes and coverage_days == 0: # Se for simulação, ignora filtro de mudanças por padrão? Ou mantemos? Mantendo comportamento original se não for simulação.
             where_clauses.append("teve_alteracao_analise = TRUE")
