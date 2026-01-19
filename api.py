@@ -343,8 +343,8 @@ def exportar_analise(
         params = {}
         
         if search:
-            where_clauses.append("(pro_codigo ILIKE :search OR pro_descricao ILIKE :search_desc)")
-            params["search"] = f"%{search}%"
+            where_clauses.append("(pro_codigo LIKE :search OR pro_descricao ILIKE :search_desc)")
+            params["search"] = f"{search}%"
             params["search_desc"] = f"%{search}%"
 
         if pro_codigos:
@@ -377,13 +377,13 @@ def exportar_analise(
                 where_clauses.append(f"curva_abc IN ({keys})")
         
         if trend:
+            # Trend -> tendencia_label (match logic from listar_analise)
             trends = [t.strip() for t in trend.split(",") if t.strip()]
-            # Simplificacao: Busca por texto exato ou logica aproximada se necessario. 
-            # No frontend usamos labels "Subindo", "Caindo". No banco temos 'alerta_tendencia_alta'.
-            # Para exportacao exata, melhor filtrar pelo que temos certeza.
-            # Ajuste: Filtrar apenas se trend="Subindo" -> alerta_tendencia_alta='Sim'
-            if "Subindo" in trends:
-                where_clauses.append("alerta_tendencia_alta = 'Sim'")
+            if trends:
+                 trend_params = {f"trend_{i}": t for i, t in enumerate(trends)}
+                 params.update(trend_params)
+                 keys = ", ".join([f":{k}" for k in trend_params.keys()])
+                 where_clauses.append(f"tendencia_label IN ({keys})")
 
         if status:
             status_list = [s.strip().lower() for s in status.split(",") if s.strip()]
