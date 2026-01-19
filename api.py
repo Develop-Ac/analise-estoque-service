@@ -340,21 +340,24 @@ def exportar_analise(
 
     try:
         where_clauses = ["1=1"]
-        params = []
+        params = {}
         
         if search:
-            where_clauses.append("(pro_codigo ILIKE %s OR pro_descricao ILIKE %s)")
-            params.extend([f"%{search}%", f"%{search}%"])
+            where_clauses.append("(pro_codigo ILIKE :search OR pro_descricao ILIKE :search_desc)")
+            params["search"] = f"%{search}%"
+            params["search_desc"] = f"%{search}%"
 
         if pro_codigos:
              codigos_list = [c.strip() for c in pro_codigos.split(",") if c.strip()]
              if codigos_list:
-                 where_clauses.append(f"pro_codigo IN ({','.join(['%s'] * len(codigos_list))})")
-                 params.extend(codigos_list)
+                 cod_params = {f"cod_{i}": c for i, c in enumerate(codigos_list)}
+                 params.update(cod_params)
+                 keys = ", ".join([f":{k}" for k in cod_params.keys()])
+                 where_clauses.append(f"pro_codigo IN ({keys})")
 
         if marca:
-            where_clauses.append("mar_descricao ILIKE %s")
-            params.append(f"%{marca}%")
+            where_clauses.append("mar_descricao ILIKE :marca")
+            params["marca"] = f"%{marca}%"
             
         if only_changes and coverage_days == 0: # Se for simulação, ignora filtro de mudanças por padrão? Ou mantemos? Mantendo comportamento original se não for simulação.
             where_clauses.append("teve_alteracao_analise = TRUE")
@@ -368,8 +371,10 @@ def exportar_analise(
         if curve:
             curves = [c.strip().upper() for c in curve.split(",") if c.strip()]
             if curves:
-                where_clauses.append(f"curva_abc IN ({','.join(['%s'] * len(curves))})")
-                params.extend(curves)
+                curve_params = {f"curve_{i}": c for i, c in enumerate(curves)}
+                params.update(curve_params)
+                keys = ", ".join([f":{k}" for k in curve_params.keys()])
+                where_clauses.append(f"curva_abc IN ({keys})")
         
         if trend:
             trends = [t.strip() for t in trend.split(",") if t.strip()]
