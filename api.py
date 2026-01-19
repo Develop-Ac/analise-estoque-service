@@ -359,7 +359,7 @@ def exportar_analise(
             where_clauses.append("mar_descricao ILIKE :marca")
             params["marca"] = f"%{marca}%"
             
-        if only_changes and coverage_days == 0: # Se for simulação, ignora filtro de mudanças por padrão? Ou mantemos? Mantendo comportamento original se não for simulação.
+        if only_changes: # Filter should apply regardless of simulation mode
             where_clauses.append("teve_alteracao_analise = TRUE")
 
         # FILTER: Ensure we only fetch the latest analysis snapshot
