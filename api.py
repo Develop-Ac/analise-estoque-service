@@ -1649,7 +1649,7 @@ def _get_stock_batches(pro_codes):
     conn = get_db_connection()
     try:
         # Sanitize
-        fmt_codes = [f"'{str(c).replace('\'','')}'" for c in pro_codes]
+        fmt_codes = [f"'{str(c).replace("'", "")}'" for c in pro_codes]
         in_clause = ",".join(fmt_codes)
         
         sql = text(f"""
