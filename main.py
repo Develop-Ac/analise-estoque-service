@@ -11,11 +11,15 @@ from email.mime.base import MIMEBase
 from email.mime.text import MIMEText
 from email import encoders
 import os
+import uuid
 import sys
 # Imports para PostgreSQL
 import psycopg2
 from sqlalchemy import create_engine, text
 import warnings
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ==========================================
 # CONFIGURAÇÕES GERAIS
@@ -59,23 +63,41 @@ def get_connection():
     password = os.getenv('SQL_PASSWORD', 'senha_secreta')
     
     tds_version = os.getenv('TDS_VERSION', '7.4')
-    
+    sql_driver = os.getenv('SQL_DRIVER', '{FreeTDS}') # Default to FreeTDS if not set, but .env will set it
+
     # É importante envolver senha em chaves {} se houver caracteres especiais
-    conn_str = (
-        "DRIVER={FreeTDS};"
-        f"SERVER={server};"
-        f"PORT={port};"
-        f"DATABASE={database};"
-        f"UID={{{user}}};"
-        f"PWD={{{password}}};"
-        f"TDS_Version={tds_version};"
-    )
+    if "FreeTDS" in sql_driver:
+        conn_str = (
+            f"DRIVER={sql_driver};"
+            f"SERVER={server};"
+            f"PORT={port};"
+            f"DATABASE={database};"
+            f"UID={{{user}}};"
+            f"PWD={{{password}}};"
+        )
+    else:
+        # Microsoft Driver (não aceita PORT como parametro separado, usa virgula no server)
+        conn_str = (
+            f"DRIVER={sql_driver};"
+            f"SERVER={server},{port};"
+            f"DATABASE={database};"
+            f"UID={{{user}}};"
+            f"PWD={{{password}}};"
+        )
+    
+    # DEBUG: Imprimir string de conexão (ocultando senha se possível, mas aqui é debug local)
+    print(f"DEBUG: Conectando com DRIVER={sql_driver}, SERVER={server}...")
+    # print(f"DEBUG: conn_str completo: {conn_str}") 
+
     return pyodbc.connect(conn_str)
 
 
 def get_postgres_engine():
     """Cria engine do SQLAlchemy para PostgreSQL"""
-    return create_engine(POSTGRES_URL)
+    print(f"DEBUG: POSTGRES_URL={POSTGRES_URL}")
+    # Replace postgres:// with postgresql:// just in case it is still wrong in memory for some reason
+    final_url = POSTGRES_URL.replace("postgres://", "postgresql://")
+    return create_engine(final_url)
 
 
 def criar_tabela_postgres():
@@ -122,23 +144,124 @@ def criar_tabela_postgres():
         alerta_tendencia_alta VARCHAR(10),
         descricao_calculo_estoque TEXT,
         teve_alteracao_analise BOOLEAN DEFAULT FALSE,
+        group_id VARCHAR(100),
+        grp_estoque_disponivel DECIMAL(15,4),
+        grp_qtd_vendida DECIMAL(15,4),
+        grp_valor_vendido DECIMAL(15,4),
+        grp_num_vendas INTEGER,
+        grp_vendas_ult_12m DECIMAL(15,4),
+        grp_vendas_12m_ant DECIMAL(15,4),
+        grp_estoque_min_base INTEGER,
+        grp_estoque_max_base INTEGER,
+        grp_estoque_min_ajustado INTEGER,
+        grp_estoque_max_ajustado INTEGER,
+        grp_estoque_min_sugerido INTEGER,
+        grp_estoque_max_sugerido INTEGER,
+        grp_demanda_media_dia DECIMAL(15,6),
+        rateio_prop_grupo DECIMAL(10,6),
+        tempo_medio_saldo_atual DECIMAL(15,2),
+        categoria_saldo_atual VARCHAR(50),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     
     CREATE INDEX IF NOT EXISTS idx_com_fifo_data_processamento ON com_fifo_completo (data_processamento);
-    CREATE INDEX IF NOT EXISTS idx_com_fifo_pro_codigo ON com_fifo_completo (pro_codigo);
     CREATE INDEX IF NOT EXISTS idx_com_fifo_curva_abc ON com_fifo_completo (curva_abc);
     CREATE INDEX IF NOT EXISTS idx_com_fifo_categoria_estocagem ON com_fifo_completo (categoria_estocagem);
+    CREATE INDEX IF NOT EXISTS idx_com_fifo_categoria_saldo_atual ON com_fifo_completo (categoria_saldo_atual);
     
-    -- Migração automática: Adicionar sgr_codigo se não existir (para tabelas antigas)
+    -- Tabela de Relacionamento de Itens (Similares)
+    CREATE TABLE IF NOT EXISTS com_relacionamento_itens (
+        id SERIAL PRIMARY KEY,
+        group_id VARCHAR(100) NOT NULL,
+        pro_codigo VARCHAR(50) NOT NULL UNIQUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+
+    -- Migração automática: Adicionar colunas novas se não existirem
     DO $$
     BEGIN
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
                        WHERE table_name='com_fifo_completo' AND column_name='sgr_codigo') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN sgr_codigo INTEGER;
         END IF;
+
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name='com_fifo_completo' AND column_name='sgr_descricao') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN sgr_descricao VARCHAR(200);
+        END IF;
+        
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns 
+                       WHERE table_name='com_fifo_completo' AND column_name='group_id') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN group_id VARCHAR(100);
+        END IF;
+
+        -- Migração colunas de grupo (GRP_*)
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_estoque_disponivel') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_estoque_disponivel DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_qtd_vendida') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_qtd_vendida DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_valor_vendido') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_valor_vendido DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_num_vendas') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_num_vendas INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_vendas_ult_12m') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_vendas_ult_12m DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_vendas_12m_ant') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_vendas_12m_ant DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_estoque_min_base') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_estoque_min_base INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_estoque_max_base') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_estoque_max_base INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_estoque_min_ajustado') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_estoque_min_ajustado INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_estoque_max_ajustado') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_estoque_max_ajustado INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_estoque_min_sugerido') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_estoque_min_sugerido INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_estoque_max_sugerido') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_estoque_max_sugerido INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grp_demanda_media_dia') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grp_demanda_media_dia DECIMAL(15,6);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='rateio_prop_grupo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN rateio_prop_grupo DECIMAL(10,6);
+        END IF;
+
+        -- NOVAS COLUNAS: Idade e Categoria do Saldo Atual (FIFO)
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='tempo_medio_saldo_atual') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN tempo_medio_saldo_atual DECIMAL(15,2);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='categoria_saldo_atual') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN categoria_saldo_atual VARCHAR(50);
+        END IF;
     END
     $$;
+
+    CREATE INDEX IF NOT EXISTS idx_com_fifo_group_id ON com_fifo_completo (group_id);
+    CREATE INDEX IF NOT EXISTS idx_rel_group_id ON com_relacionamento_itens (group_id);
+    CREATE INDEX IF NOT EXISTS idx_rel_pro_codigo ON com_relacionamento_itens (pro_codigo);
+
+    -- Tabela de Saldo Residual (FIFO detalhado)
+    CREATE TABLE IF NOT EXISTS com_data_saldo_produto (
+        id SERIAL PRIMARY KEY,
+        pro_codigo VARCHAR(50),
+        data_compra DATE,
+        saldo_residual DECIMAL(15,4),
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS idx_saldo_prod_codigo ON com_data_saldo_produto(pro_codigo);
     """
     
     try:
@@ -245,7 +368,8 @@ def carregar_dados_do_banco():
         SELECT 
             pro.pro_codigo,
             pro.pro_descricao,
-            pro.subgrp_codigo,
+            pro.subgrp_codigo AS SGR_CODIGO,
+            subp.subgrp_descricao AS SGR_DESCRICAO,
             pro.estoque_disponivel,
             mar.mar_descricao,
             f1.for_nome AS fornecedor1,
@@ -255,6 +379,9 @@ def carregar_dados_do_banco():
         LEFT JOIN marcas mar
             ON mar.empresa    = pro.empresa
            AND mar.mar_codigo = pro.mar_codigo
+        LEFT JOIN produtos_subgrupos SUBP
+            ON SUBP.subgrp_codigo = PRO.subgrp_codigo
+            AND SUBP.empresa = PRO.empresa
         LEFT JOIN fornecedores f1
             ON f1.empresa     = pro.empresa
            AND f1.for_codigo  = pro.for_codigo      -- fornecedor principal
@@ -292,6 +419,8 @@ def carregar_dados_do_banco():
         "ESTOQUE_DISPONIVEL":  "ESTOQUE_DISPONIVEL",
         "mar_descricao":       "MAR_DESCRICAO",
         "MAR_DESCRICAO":       "MAR_DESCRICAO",
+        "subgrp_descricao":    "SGR_DESCRICAO",
+        "SUBGRP_DESCRICAO":    "SGR_DESCRICAO",
         "fornecedor1":         "FORNECEDOR1",
         "FORNECEDOR1":         "FORNECEDOR1",
         "fornecedor2":         "FORNECEDOR2",
@@ -299,9 +428,134 @@ def carregar_dados_do_banco():
         "fornecedor3":         "FORNECEDOR3",
         "FORNECEDOR3":         "FORNECEDOR3",
     })
+    
+    # DEBUG: Verificar colunas carregadas
+    print("DEBUG: Colunas do df_saldo_produto:", df_saldo_produto.columns.tolist())
+    if "SGR_DESCRICAO" in df_saldo_produto.columns:
+        print("DEBUG: Amostra SGR_DESCRICAO:", df_saldo_produto["SGR_DESCRICAO"].head().tolist())
+    else:
+        print("DEBUG: SGR_DESCRICAO não encontrada no DataFrame!")
 
     conn.close()
     return df_saidas, df_ent, df_dev, df_saldo_produto
+
+def aplicar_analise_agrupada(df_met: pd.DataFrame) -> pd.DataFrame:
+    """
+    Análise agrupada por group_id (APENAS PARA EXIBIÇÃO):
+      - adiciona group_id (com_relacionamento_itens)
+      - cria colunas GRP_* com somatórios do grupo
+        * em especial, GRP_ESTOQUE_MIN_AJUSTADO / GRP_ESTOQUE_MAX_AJUSTADO = SOMA dos itens
+      - calcula RATEIO_PROP_GRUPO = QTD_VENDIDA / GRP_QTD_VENDIDA
+      - calcula GRP_DEMANDA_MEDIA_DIA ponderada por RATEIO_PROP_GRUPO (apenas exibição)
+    
+    IMPORTANTE:
+      - NÃO sobrescreve ESTOQUE_MIN_SUGERIDO / ESTOQUE_MAX_SUGERIDO
+      - NÃO altera min/max individual (nem ajustado nem sugerido)
+    """
+    print("Aplicando análise agrupada para produtos similares (apenas exibição, sem sobrescrever cálculos)...")
+
+    try:
+        engine_pg = get_postgres_engine()
+
+        df_groups = pd.read_sql(
+            "SELECT pro_codigo, group_id FROM com_relacionamento_itens",
+            engine_pg
+        )
+
+        if df_groups.empty:
+            return df_met
+
+        df_groups = df_groups.rename(columns={"pro_codigo": "PRO_CODIGO"})
+
+        # Tipos compatíveis
+        df_groups["PRO_CODIGO"] = df_groups["PRO_CODIGO"].astype(str).str.strip()
+        df_met["PRO_CODIGO"] = df_met["PRO_CODIGO"].astype(str).str.strip()
+
+        # Merge group_id
+        if "group_id" not in df_met.columns:
+            df_met = df_met.merge(df_groups, on="PRO_CODIGO", how="left")
+        else:
+            df_met = df_met.merge(df_groups, on="PRO_CODIGO", how="left", suffixes=("", "_new"))
+            df_met["group_id"] = df_met["group_id"].fillna(df_met["group_id_new"])
+            df_met = df_met.drop(columns=["group_id_new"])
+
+        mask_grouped = df_met["group_id"].notna()
+        if not mask_grouped.any():
+            return df_met
+
+        # Somar colunas relevantes para o grupo (sem alterar as individuais)
+        cols_sum_base = [
+            "ESTOQUE_DISPONIVEL",
+            "QTD_VENDIDA",
+            "VALOR_VENDIDO",
+            "NUM_VENDAS",
+            "VENDAS_ULT_12M",
+            "VENDAS_12M_ANT",
+            "ESTOQUE_MIN_BASE",
+            "ESTOQUE_MAX_BASE",
+            # <<< aqui é o que você pediu: somar AJUSTADO no grupo >>>
+            "ESTOQUE_MIN_AJUSTADO",
+            "ESTOQUE_MAX_AJUSTADO",
+            # (opcional) também somar sugerido para consulta/exibição, sem mexer no individual
+            "ESTOQUE_MIN_SUGERIDO",
+            "ESTOQUE_MAX_SUGERIDO",
+        ]
+        cols_sum = [c for c in cols_sum_base if c in df_met.columns]
+
+        for c in cols_sum:
+            df_met[c] = pd.to_numeric(df_met[c], errors="coerce").fillna(0)
+
+        grp_agg = (
+            df_met.loc[mask_grouped]
+            .groupby("group_id")[cols_sum]
+            .sum()
+            .reset_index()
+            .rename(columns={c: f"GRP_{c}" for c in cols_sum})
+        )
+
+        df_met = df_met.merge(grp_agg, on="group_id", how="left")
+
+        # ===== RATEIO_PROP_GRUPO (baseado em vendas) =====
+        if "GRP_QTD_VENDIDA" in df_met.columns and "QTD_VENDIDA" in df_met.columns:
+            def calc_prop(row):
+                if pd.isna(row["group_id"]):
+                    return np.nan
+                grp_v = float(row.get("GRP_QTD_VENDIDA", 0) or 0)
+                if grp_v <= 0:
+                    return 0.0
+                qtd = float(row.get("QTD_VENDIDA", 0) or 0)
+                return qtd / grp_v
+
+            df_met["RATEIO_PROP_GRUPO"] = df_met.apply(calc_prop, axis=1)
+        else:
+            df_met["RATEIO_PROP_GRUPO"] = np.nan
+
+        # ===== GRP_DEMANDA_MEDIA_DIA (ponderada por rateio, apenas exibição) =====
+        # Observação: isso vira uma "média ponderada" da demanda do grupo, útil pra leitura.
+        if "DEMANDA_MEDIA_DIA" in df_met.columns:
+            df_met["DEMANDA_MEDIA_DIA"] = pd.to_numeric(df_met["DEMANDA_MEDIA_DIA"], errors="coerce").fillna(0)
+            df_met["_DEMANDA_PONDERADA"] = df_met["DEMANDA_MEDIA_DIA"] * df_met["RATEIO_PROP_GRUPO"].fillna(0)
+
+            grp_demanda = (
+                df_met.loc[mask_grouped]
+                .groupby("group_id")["_DEMANDA_PONDERADA"]
+                .sum()
+                .reset_index()
+                .rename(columns={"_DEMANDA_PONDERADA": "GRP_DEMANDA_MEDIA_DIA"})
+            )
+
+            df_met = df_met.merge(grp_demanda, on="group_id", how="left")
+            df_met = df_met.drop(columns=["_DEMANDA_PONDERADA"])
+
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # IMPORTANTE: NÃO ratear e NÃO sobrescrever ESTOQUE_MIN/MAX_SUGERIDO
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+
+        return df_met
+
+    except Exception as e:
+        print(f"Erro ao aplicar análise agrupada: {e}")
+        return df_met
 
 
 # ==========================================
@@ -312,39 +566,32 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                                     df_ent_valid: pd.DataFrame,
                                     df_saldo_produto: pd.DataFrame) -> pd.DataFrame:
     """
-    Calcula métricas, min/max, tendência, etc.
+    Calcula métricas, min/max, tendência, ruptura, etc. (ORDENADO CORRETAMENTE)
     """
     df = df_sai_fifo.copy()
     df["DATA"] = pd.to_datetime(df["DATA"], errors="coerce")
     df["DATA_COMPRA"] = pd.to_datetime(df["DATA_COMPRA"], errors="coerce")
 
-
     # Diferença em dias entre saída e compra
     df["DPM"] = (df["DATA"] - df["DATA_COMPRA"]).dt.days
 
     hoje = pd.Timestamp.today().normalize()
-    ult_12m_ini = hoje - pd.DateOffset(months=12)
-    ant_12m_ini = hoje - pd.DateOffset(months=24)
-    data_inicio_ruptura = hoje - pd.DateOffset(days=730) # 2 anos para analise de ruptura
+    data_inicio_ruptura = hoje - pd.DateOffset(days=730)
 
     metricas = []
-
     print("\nCalculando métricas por produto...")
-
 
     for cod, grp in df.groupby("PRO_CODIGO"):
         grp_valid = grp.dropna(subset=["QUANTIDADE_AJUSTADA"])
         if grp_valid.empty:
             continue
 
-        # ===== tempo médio ponderado =====
         grp_dpm = grp_valid.dropna(subset=["DPM"])
         if grp_dpm.empty:
             tempo_medio = np.nan
         else:
             tempo_medio = np.average(grp_dpm["DPM"], weights=grp_dpm["QUANTIDADE_AJUSTADA"])
 
-        # totais gerais
         qtd_vendida = grp_valid["QUANTIDADE_AJUSTADA"].sum()
         valor_vendido = grp_valid["TOTAL_LIQUIDO"].sum() if "TOTAL_LIQUIDO" in grp_valid.columns else np.nan
 
@@ -356,52 +603,39 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             periodo_dias = max((data_max - data_min).days + 1, 1)
 
         num_vendas = len(grp_valid)
+        demanda_media_dia = (qtd_vendida / periodo_dias) if periodo_dias and periodo_dias > 0 else np.nan
 
-        if periodo_dias and periodo_dias > 0:
-            demanda_media_dia = qtd_vendida / periodo_dias
-        else:
-            demanda_media_dia = np.nan
-
-        # ===== TENDÊNCIA PONDERADA (12m, 6m, 90d) =====
-        # Intervalos atuais
+        # ===== Tendência ponderada (12m, 6m, 90d) =====
         data_12m_ini = hoje - pd.DateOffset(months=12)
         data_06m_ini = hoje - pd.DateOffset(months=6)
         data_90d_ini = hoje - pd.DateOffset(days=90)
-        
-        # Intervalos anteriores (para comparação)
+
         data_12m_ant_ini = hoje - pd.DateOffset(months=24)
         data_06m_ant_ini = hoje - pd.DateOffset(months=12)
         data_90d_ant_ini = hoje - pd.DateOffset(days=180)
-        
-        # Filtragems
-        # Ultimos 12m
+
         vendas_12m_atual = grp_valid[(grp_valid["DATA"] >= data_12m_ini) & (grp_valid["DATA"] <= hoje)]["QUANTIDADE_AJUSTADA"].sum()
         vendas_12m_ant   = grp_valid[(grp_valid["DATA"] >= data_12m_ant_ini) & (grp_valid["DATA"] < data_12m_ini)]["QUANTIDADE_AJUSTADA"].sum()
-        
-        # Ultimos 6m
+
         vendas_06m_atual = grp_valid[(grp_valid["DATA"] >= data_06m_ini) & (grp_valid["DATA"] <= hoje)]["QUANTIDADE_AJUSTADA"].sum()
         vendas_06m_ant   = grp_valid[(grp_valid["DATA"] >= data_06m_ant_ini) & (grp_valid["DATA"] < data_06m_ini)]["QUANTIDADE_AJUSTADA"].sum()
-        
-        # Ultimos 90d
+
         vendas_90d_atual = grp_valid[(grp_valid["DATA"] >= data_90d_ini) & (grp_valid["DATA"] <= hoje)]["QUANTIDADE_AJUSTADA"].sum()
         vendas_90d_ant   = grp_valid[(grp_valid["DATA"] >= data_90d_ant_ini) & (grp_valid["DATA"] < data_90d_ini)]["QUANTIDADE_AJUSTADA"].sum()
-        
+
         def calc_trend_ratio(atual, anterior):
             if anterior > 0:
                 return atual / anterior
             elif atual > 0:
-                return 2.0 # Dobrou (0 -> algo)
+                return 2.0
             else:
-                return 1.0 # Estável (0 -> 0)
-        
+                return 1.0
+
         t12 = calc_trend_ratio(vendas_12m_atual, vendas_12m_ant)
         t06 = calc_trend_ratio(vendas_06m_atual, vendas_06m_ant)
         t90 = calc_trend_ratio(vendas_90d_atual, vendas_90d_ant)
-        
-        # Média Ponderada: 20% 12m, 50% 6m, 30% 90d
+
         fator_tendencia = (t12 * 0.20) + (t06 * 0.50) + (t90 * 0.30)
-        
-        # Usar vendas_12m_atual como referencial para compatibilidade
         vendas_ult_12m = vendas_12m_atual
 
         if pd.isna(fator_tendencia):
@@ -428,240 +662,99 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             "FATOR_TENDENCIA": fator_tendencia,
             "TENDENCIA_LABEL": tendencia_label,
         })
-    
-    # ===== CÁLCULO DE RUPTURA (RETROATIVO) =====
-    # Para calcular dias de ruptura, precisamos reconstruir o saldo dia a dia.
-    # Faremos isso de forma vetorizada para todos os produtos de uma vez (ou por chunks se necessario),
-    # mas como já estamos num loop, vamos tentar otimizar por produto ou fazer um pré-processamento.
-    
-    # Estratégia Híbrida:
-    # O loop acima calcula metricas de vendas. Vamos fazer a ruptura FORA do loop para vetorizar melhor,
-    # ou aproveitar dados já filtrados se performar bem.
-    # Dado que "metricas" é uma lista de dicts, podemos enriquecê-la depois ou calcular agora.
-    # Vamos calcular agora por produto para manter simplicidade da logica (embora menos performatico que puro vetorizacao total)
-    # Mas para 730 dias * N produtos pode ficar lento.
-    # MELHOR: Pré-calcular movimentação diária de TODOS produtos e depois só consultar.
-    pass
 
     df_met = pd.DataFrame(metricas)
     if df_met.empty:
         return df_met
 
     # ==========================================
-    # LOGICA DE RUPTURA E DEMANDA AJUSTADA
+    # RUPTURA (2 anos) + DEMANDA AJUSTADA
     # ==========================================
     print("Calculando dias de ruptura (últimos 2 anos)...")
-    
-    # 1. Preparar movimentos diários (Saídas e Entradas)
-    # Saídas (negativo)
-    # Usamos o df_sai_fifo ORIGINAL (ou df_saidas carregado na main) para garantir todas saídas?
-    # O parametro é df_sai_fifo, que já é o de vendas. 
-    # Precisamos garantir que temos todas as movimentações que afetam estoque?
-    # O ideal seria usar todas as saídas do período.
-    
-    # Vamos criar um DF de movimentos consolidado
+
     df_movs_sai = df_sai_fifo[["PRO_CODIGO", "DATA", "QUANTIDADE_AJUSTADA"]].copy()
     df_movs_sai["QTD_MOV"] = -df_movs_sai["QUANTIDADE_AJUSTADA"]
-    
+
     df_movs_ent = df_ent_valid[["PRO_CODIGO", "DATA", "QUANTIDADE"]].copy()
     df_movs_ent["QTD_MOV"] = df_movs_ent["QUANTIDADE"]
-    
-    # Concatenar
-    df_all_movs = pd.concat([
-        df_movs_sai[["PRO_CODIGO", "DATA", "QTD_MOV"]],
-        df_movs_ent[["PRO_CODIGO", "DATA", "QTD_MOV"]]
-    ], ignore_index=True)
-    
-    # Filtrar últimos 2 anos (730 dias)
-    mask_per = df_all_movs["DATA"] >= data_inicio_ruptura
-    df_all_movs = df_all_movs.loc[mask_per].copy()
-    
-    # Agrupar por Dia
+
+    df_all_movs = pd.concat(
+        [df_movs_sai[["PRO_CODIGO", "DATA", "QTD_MOV"]], df_movs_ent[["PRO_CODIGO", "DATA", "QTD_MOV"]]],
+        ignore_index=True
+    )
+
+    df_all_movs["DATA"] = pd.to_datetime(df_all_movs["DATA"], errors="coerce")
+    df_all_movs = df_all_movs.loc[df_all_movs["DATA"] >= data_inicio_ruptura].copy()
+
     df_daily_change = df_all_movs.groupby(["PRO_CODIGO", "DATA"])["QTD_MOV"].sum().reset_index()
-    
-    # Dicionário de saldo atual
+
+    # saldo atual
+    df_saldo_produto["PRO_CODIGO"] = df_saldo_produto["PRO_CODIGO"].astype(str).str.strip()
     saldo_atual_map = df_saldo_produto.set_index("PRO_CODIGO")["ESTOQUE_DISPONIVEL"].to_dict()
-    
-    # Função para contar dias de ruptura
-    ruptura_map = {}
-    
-    # Lista de produtos na análise
-    prods_analise = df_met["PRO_CODIGO"].unique()
-    
-    # Vamos criar um range de datas completo para o período? Não, basta iterar as mudanças reverso.
-    # Mas para contar "DIAS" de ruptura, precisamos saber o estado em CADA dia.
-    # Se entre mov A (dia 10) e mov B (dia 20) não houve nada, o saldo ficou constante.
-    
-    date_range = pd.date_range(start=data_inicio_ruptura, end=hoje, freq='D')
-    total_dias_analise = len(date_range) # aprox 730
-    
-    # Otimização: Pivotar df_daily_change para ter (Index=Data, Col=Produto) => Tabela de Mudanças.
-    # Fillna(0).
-    # Cumsum reverso.
-    # Isso pode ser pesado se forem muitos produtos. Quantos produtos são?
-    # Se for < 5000 productos e 730 dias, matriz de 3.5M floats. Tranquilo (28MB).
-    
-    # Filtrar df_daily_change apenas para produtos em prods_analise para economizar memória
+
+    prods_analise = df_met["PRO_CODIGO"].astype(str).str.strip().unique()
+    df_daily_change["PRO_CODIGO"] = df_daily_change["PRO_CODIGO"].astype(str).str.strip()
     df_daily_change = df_daily_change[df_daily_change["PRO_CODIGO"].isin(prods_analise)]
-    
+
+    ruptura_map = {}
+    date_range = pd.date_range(start=data_inicio_ruptura, end=hoje, freq="D")
+
     if not df_daily_change.empty:
         df_pivot = df_daily_change.pivot(index="DATA", columns="PRO_CODIGO", values="QTD_MOV").fillna(0)
-        
-        # Reindexar para garantir todos os dias
         df_pivot = df_pivot.reindex(date_range, fill_value=0)
-        
-        # Agora temos as MUDANÇAS diárias.
-        # Queremos o SALDO ao FINAL de cada dia.
-        # Sabemos o saldo HOJE (último dia do range ou "amanhã" dependendo de quando roda).
-        # Vamos assumir que "ESTOQUE_DISPONIVEL" é o saldo final de "hoje".
-        
-        # Saldo[t-1] = Saldo[t] - Mudanca[t]
-        # Vamos fazer um cumsum reverso das mudanças de trás pra frente?
-        # Saldo_Dia(d) = Saldo_Atual - Soma_Mudancas(d+1 até Hoje)
-        
-        # Inverter ordem temporal
-        df_pivot_rev = df_pivot.iloc[::-1] # Do mais recente para antigo
-        
-        # Mudanças acumuladas do futuro para o passado (excluindo o próprio dia para calcular o começo... nao, queremos o fim do dia)
-        # Saldo_Fim_Dia_X = Saldo_Fim_Hoje - (Mudancas de Hoje até Dia X+1) ... Complicado.
-        
-        # Vamos pensar:
-        # Hoje (Final): 10. Mudança Hoje: +2.
-        # Então Ontem (Final): 10 - 2 = 8.
-        # Anteontem (Final): 8 - Mudança_Ontem.
-        
-        # Então precisamos das mudanças em ordem inversa.
-        change_cum_rev = df_pivot_rev.cumsum()
-        
-        # Agora para cada coluna (produto), o saldo hist é:
-        # Saldo_Hist_Rev = Saldo_Atual - Change_Cum_Rev
-        # (Isso dá o saldo ANTES da movimentação do dia se incluirmos o dia no cumsum?
-        #  Se mudança hoje foi +2 (Entrada), Saldo Final = 10. Antes da entrada era 8.
-        #  Se a ruptura conta se o dia terminou <= 0 ou começou <= 0?
-        #  Geralmente disponibilidade é fim do dia.
-        #  Então: Saldo_Fim_Dia_T = Saldo_Atual - Soma_Mud(T+1 .. Hoje).
-        #  O cumsum normal inclui a linha atual.
-        #  Change_Cum_Rev[0] (Hoje) = Mudanca_Hoje.
-        #  Saldo_Fim_Ontem = Saldo_Atual - Mudanca_Hoje.
-        
-        # Então precisamos shiftar o cumsum ou subtrair?
-        # Saldo_Fim_Reconstruido = Saldo_Atual - df_pivot_rev.shift(1).fillna(0).cumsum() ???
-        # Nao. Saldo_Fim_Hoje = Saldo_Atual (dado).
-        # Saldo_Fim_Ontem = Saldo_Atual - Mudanca_Hoje.
-        # Saldo_Fim_Anteontem = Saldo_Atual - (Mudanca_Hoje + Mudanca_Ontem).
-        
-        # Logo: Os valores a subtrair para obter o histórico PASSADO são o CUMSUM REVERSO das mudanças.
-        # S_rev = Change_Cum_Rev.
-        # Histórico Saldo (ordem reversa) = Saldo_Atual - S_rev.
-        
-        # Vamos aplicar isso produto a produto para usar o Saldo Atual correto
+
+        df_pivot_rev = df_pivot.iloc[::-1]
         stock_history_rev = pd.DataFrame(index=df_pivot_rev.index, columns=df_pivot_rev.columns)
-        
+
         for col in df_pivot_rev.columns:
-            s_atual = saldo_atual_map.get(col, 0)
-            # Saldo reconstruído REVERSO (do mais recente pro antigo)
-            # Dia_0 (Hoje, ou ultimo): Saldo_Fim = Saldo_Atual - 0? Nao, Saldo_Total é o que temos.
-            # O dataframe pivot tem a mudança DO DIA.
-            # O Saldo no FIM do dia T (onde T é hoje) é S_atual.
-            # O Saldo no FIM do dia T-1 é S_atual - Mudanca_T.
-            
-            changes = df_pivot_rev[col].values
-            # Cumsum retorna [c0, c0+c1, c0+c1+c2...]
-            # Nos queremos subtrair.
-            
-            # Serie de subtratores:
-            # [Mudanca_Hoje, Mudanca_Hoje+Mudanca_Ontem, ...]
+            s_atual = float(saldo_atual_map.get(col, 0) or 0)
+            changes = df_pivot_rev[col].to_numpy()
             subtractions = np.cumsum(changes)
-            
-            # O saldo do dia T (hoje) é S_satual.
-            # O saldo do dia T-1 é S_atual - changes[0].
-            # O saldo do dia T-2 é S_atual - changes[0] - changes[1] = S_atual - subtractions[1].
-            
-            # Logo, o array reconstruído (excluindo hoje pois já sabemos, ou ajustando)
-            # Se quisermos incluir HOJE no histórico:
-            # Saldo_Hoje = S_atual.
-            # Histórico = [S_atual, S_atual-sub[0], S_atual-sub[1], ...]
-            # O ultimo elemento de 'subtractions' corresponde à mudança do dia mais antigo.
-            # O array resultante terá len = len(changes).
-            
-            # Vamos criar o array de saldos.
-            # Precisa estar alinhado com o indice.
-            # len(subtractions) == len(index).
-            # Mas subtractions[0] é a mudança de HOJE.
-            # Saldo[Hoje] = S_atual.
-            # Saldo[Ontem] = S_atual - subtractions[0].
-            # ...
-            # Então devemos shiftar subtractions ou inserir 0 no inicio e remover ultimo?
-            
-            # Array de saldos fins de dia (do mais recente pro antigo):
-            # [S_atual, S_atual - sub[0], S_atual - sub[1], ... S_atual - sub[n-2]]
-            # O sub[n-1] seria para o dia ANTES do range (não nos importa).
-            
-            saldos_arr = np.empty_like(subtractions)
-            saldos_arr[0] = s_atual # Dia mais recente
-            saldos_arr[1:] = s_atual - subtractions[:-1] # Demais dias
-            
+
+            saldos_arr = np.empty_like(subtractions, dtype=float)
+            saldos_arr[0] = s_atual
+            saldos_arr[1:] = s_atual - subtractions[:-1]
+
             stock_history_rev[col] = saldos_arr
-            
-        # Agora contamos quantos dias <= 0
-        # (Fillna na criação caso algum nulo?)
+
         ruptura_counts = (stock_history_rev <= 0).sum()
         ruptura_map = ruptura_counts.to_dict()
-        
-    df_met["DIAS_RUPTURA"] = df_met["PRO_CODIGO"].map(ruptura_map).fillna(0)
-    
-    # 2. Demand Ajustada
-    # Regra: DEMANDA_AJUSTADA = DEMANDA * (1 + (DIAS_RUPTURA_2ANOS / 730))
-    # Na verdade, o requisito diz: "dividir por 2 anos". 2 anos = 730 dias fixo? Ou período real?
-    # Usuario disse "dividir por 2 anos". Vamos usar 730.
-    
+
+    df_met["DIAS_RUPTURA"] = df_met["PRO_CODIGO"].astype(str).str.strip().map(ruptura_map).fillna(0).astype(int)
+
     def calc_demand_ajustada(row):
         dem = row["DEMANDA_MEDIA_DIA"]
         rup = row["DIAS_RUPTURA"]
-        
         if pd.isna(dem) or dem <= 0:
-            return 0
-        
-        # Fator de correção
-        # Ex: 100 dias ruptura em 730 dias. Fator = 100/730 = 0.136
-        # Nova demanda = Demanda + (Demanda * Fator) = Demanda * (1 + Fator)
+            return 0.0
         fator = rup / 730.0
-        return dem * (1 + fator)
-        
+        return float(dem) * (1 + fator)
+
     df_met["DEMANDA_MEDIA_DIA_AJUSTADA"] = df_met.apply(calc_demand_ajustada, axis=1)
 
-    # ===== FIM CÁLCULO DE RUPTURA =====
-
-
-    # ===== juntar estoque disponível e descrição =====
+    # ==========================================
+    # (MUITO IMPORTANTE) MERGE DO SALDO AQUI
+    # ==========================================
     colunas_saldo = [
-        "PRO_CODIGO",
-        "PRO_DESCRICAO",
-        "SGR_CODIGO",
-        "ESTOQUE_DISPONIVEL",
-        "MAR_DESCRICAO",
-        "FORNECEDOR1",
-        "FORNECEDOR2",
-        "FORNECEDOR3",
+        "PRO_CODIGO", "PRO_DESCRICAO", "SGR_CODIGO", "SGR_DESCRICAO",
+        "ESTOQUE_DISPONIVEL", "MAR_DESCRICAO",
+        "FORNECEDOR1", "FORNECEDOR2", "FORNECEDOR3",
     ]
-
     colunas_saldo = [c for c in colunas_saldo if c in df_saldo_produto.columns]
 
-    df_met = df_met.merge(
-        df_saldo_produto[colunas_saldo],
-        on="PRO_CODIGO",
-        how="left"
-    )
+    df_met["PRO_CODIGO"] = df_met["PRO_CODIGO"].astype(str).str.strip()
+    df_saldo_produto["PRO_CODIGO"] = df_saldo_produto["PRO_CODIGO"].astype(str).str.strip()
 
-    # ===== Curva ABCD por VALOR_VENDIDO =====
-    df_met["VALOR_VENDIDO"] = df_met["VALOR_VENDIDO"].fillna(0)
+    df_met = df_met.merge(df_saldo_produto[colunas_saldo], on="PRO_CODIGO", how="left")
+
+    # ==========================================
+    # Curva ABC
+    # ==========================================
+    df_met["VALOR_VENDIDO"] = pd.to_numeric(df_met["VALOR_VENDIDO"], errors="coerce").fillna(0)
     df_met = df_met.sort_values("VALOR_VENDIDO", ascending=False).reset_index(drop=True)
 
     total_valor = df_met["VALOR_VENDIDO"].sum()
-    if total_valor > 0:
-        df_met["PCT_ACUM_VALOR"] = df_met["VALOR_VENDIDO"].cumsum() / total_valor * 100
-    else:
-        df_met["PCT_ACUM_VALOR"] = 0
+    df_met["PCT_ACUM_VALOR"] = (df_met["VALOR_VENDIDO"].cumsum() / total_valor * 100) if total_valor > 0 else 0
 
     def classificar_abc(pct):
         if pct <= 70:
@@ -675,7 +768,9 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
 
     df_met["CURVA_ABC"] = df_met["PCT_ACUM_VALOR"].apply(classificar_abc)
 
-    # ===== Categoria de estocagem por tempo médio =====
+    # ==========================================
+    # Categoria estocagem
+    # ==========================================
     def cat_estocagem(t):
         if pd.isna(t):
             return "Sem Dados"
@@ -690,10 +785,11 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
 
     df_met["CATEGORIA_ESTOCAGEM"] = df_met["TEMPO_MEDIO_ESTOQUE"].apply(cat_estocagem)
 
-    # ===== Estoque mínimo/máximo base =====
+    # ==========================================
+    # Min/Max base e ajustado
+    # ==========================================
     LEAD_TIME = 17
-    
-    # Regras por grupo. 'default' e '154'
+
     regras_dias = {
         "default": {
             "A": (20, 60),
@@ -711,58 +807,38 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
 
     def calc_min_max_base(row):
         curva = row["CURVA_ABC"]
-        # MUDANÇA: Usar Demanda Ajustada pela ruptura
         dem = row["DEMANDA_MEDIA_DIA_AJUSTADA"]
         sgr = row.get("SGR_CODIGO", None)
         data_max = row["DATA_MAX_VENDA"]
-        
-        # Seleciona regra
+
         regra_selecionada = regras_dias.get(sgr, regras_dias["default"])
-        
+
         if pd.isna(dem) or dem <= 0 or curva not in regra_selecionada:
-             # Se nao tem demanda, min/max base 0
             return pd.Series({"ESTOQUE_MIN_BASE": 0, "ESTOQUE_MAX_BASE": 0})
-            
+
         dias_min_regra, dias_max_regra = regra_selecionada[curva]
-        
-        # Soma leadtime
         dias_min_final = dias_min_regra + LEAD_TIME
         dias_max_final = dias_max_regra + LEAD_TIME
-        
-        # Calculo base
+
         val_min = dem * dias_min_final
         val_max = dem * dias_max_final
-        
-        if curva in ["A", "B"]:
-            # Arredondar para CIMA sempre (solicitado pelo usuario)
-            est_min = int(np.ceil(val_min))
-            est_max = int(np.ceil(val_max))
-        else:
-            # Manter calculo original (que era ceil tambem, mas explicito)
-            est_min = int(np.ceil(val_min))
-            est_max = int(np.ceil(val_max))
-        
-        # Regra de inatividade
+
+        est_min = int(np.ceil(val_min))
+        est_max = int(np.ceil(val_max))
+
         dias_corte = 365 if sgr == 154 else 240
-        hoje = pd.Timestamp.today().normalize()
-        
-        if pd.isna(data_max):
-             # nunca vendeu
-             pass
-        else:
-             dias_sem_venda = (hoje - data_max).days
-             if dias_sem_venda > dias_corte:
-                 # Forçar Min=0 e Max baixo (sob demanda)
-                 est_min = 0
-                 # Max baixo: 15 dias de cobertura ou 1
-                 est_max = max(1, int(np.ceil(dem * 15)))
-        
+
+        if not pd.isna(data_max):
+            dias_sem_venda = (hoje - data_max).days
+            if dias_sem_venda > dias_corte:
+                est_min = 0
+                est_max = max(1, int(np.ceil(dem * 15)))
+
         return pd.Series({"ESTOQUE_MIN_BASE": est_min, "ESTOQUE_MAX_BASE": est_max})
 
     base_minmax = df_met.apply(calc_min_max_base, axis=1)
     df_met = pd.concat([df_met, base_minmax], axis=1)
 
-    # ===== Ajuste por tendência (fator 0.5 a 2.0) =====
     def fator_ajuste_tendencia(f):
         if pd.isna(f):
             return 1.0
@@ -770,17 +846,16 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
 
     df_met["FATOR_AJUSTE_TENDENCIA"] = df_met["FATOR_TENDENCIA"].apply(fator_ajuste_tendencia)
 
-    df_met["ESTOQUE_MIN_AJUSTADO"] = (
-        df_met["ESTOQUE_MIN_BASE"] * df_met["FATOR_AJUSTE_TENDENCIA"]
-    ).apply(lambda x: int(np.ceil(x)))
-    df_met["ESTOQUE_MAX_AJUSTADO"] = (
-        df_met["ESTOQUE_MAX_BASE"] * df_met["FATOR_AJUSTE_TENDENCIA"]
-    ).apply(lambda x: int(np.ceil(x)))
+    df_met["ESTOQUE_MIN_AJUSTADO"] = (df_met["ESTOQUE_MIN_BASE"] * df_met["FATOR_AJUSTE_TENDENCIA"]).apply(lambda x: int(np.ceil(x)))
+    df_met["ESTOQUE_MAX_AJUSTADO"] = (df_met["ESTOQUE_MAX_BASE"] * df_met["FATOR_AJUSTE_TENDENCIA"]).apply(lambda x: int(np.ceil(x)))
 
-    # ===== Regra especial para produtos com poucas vendas (<= 10) =====
+    # ==========================================
+    # Pouco histórico / Sob demanda / Normal -> SUGERIDO
+    # ==========================================
     def ajustar_pouco_historico(row):
         num_vendas = row["NUM_VENDAS"]
         qtd_vendida = row["QTD_VENDIDA"]
+
         if num_vendas is None or num_vendas <= 0:
             return pd.Series({
                 "ESTOQUE_MIN_SUGERIDO": row["ESTOQUE_MIN_AJUSTADO"],
@@ -792,7 +867,6 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             qtd_media_venda = qtd_vendida / num_vendas if num_vendas > 0 else 0
 
             if not pd.isna(row["TEMPO_MEDIO_ESTOQUE"]) and row["TEMPO_MEDIO_ESTOQUE"] <= 5:
-                # compra casada / sob demanda
                 min_sug = 0
                 max_sug = max(1, int(np.ceil(qtd_media_venda * 1.5)))
                 tipo = "Sob_Demanda"
@@ -806,32 +880,45 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                 "ESTOQUE_MAX_SUGERIDO": max_sug,
                 "TIPO_PLANEJAMENTO": tipo,
             })
-        else:
-            return pd.Series({
-                "ESTOQUE_MIN_SUGERIDO": row["ESTOQUE_MIN_AJUSTADO"],
-                "ESTOQUE_MAX_SUGERIDO": row["ESTOQUE_MAX_AJUSTADO"],
-                "TIPO_PLANEJAMENTO": "Normal",
-            })
+
+        return pd.Series({
+            "ESTOQUE_MIN_SUGERIDO": row["ESTOQUE_MIN_AJUSTADO"],
+            "ESTOQUE_MAX_SUGERIDO": row["ESTOQUE_MAX_AJUSTADO"],
+            "TIPO_PLANEJAMENTO": "Normal",
+        })
 
     ajuste_hist = df_met.apply(ajustar_pouco_historico, axis=1)
     df_met = pd.concat([df_met, ajuste_hist], axis=1)
 
-    # ===== remover produtos com última venda em 2019 e sem estoque =====
+    # ==========================================
+    # AGORA SIM: AGRUPAMENTO (no lugar correto)
+    # ==========================================
+    df_met = aplicar_analise_agrupada(df_met)
+
+    # ==========================================
+    # Remover itens velhos sem estoque (após saldo já existir)
+    # ==========================================
     corte_data = pd.Timestamp("2020-01-01")
+    df_met["ESTOQUE_DISPONIVEL"] = pd.to_numeric(df_met["ESTOQUE_DISPONIVEL"], errors="coerce").fillna(0)
+
     mask_velho_sem_estoque = (
         (df_met["DATA_MAX_VENDA"] < corte_data) &
-        ((df_met["ESTOQUE_DISPONIVEL"].fillna(0)) <= 0)
+        (df_met["ESTOQUE_DISPONIVEL"] <= 0)
     )
     df_met = df_met.loc[~mask_velho_sem_estoque].copy()
 
-    # ===== alerta de tendência alta =====
+    # ==========================================
+    # Alerta tendência alta
+    # ==========================================
     df_met["ALERTA_TENDENCIA_ALTA"] = np.where(
         (df_met["TENDENCIA_LABEL"] == "Subindo") & (df_met["FATOR_TENDENCIA"] >= 1.2),
         "Sim",
         "Não"
     )
 
-    # ===== descrição textual por produto =====
+    # ==========================================
+    # Descrição (por último, já com grupo pronto)
+    # ==========================================
     def montar_descricao(row):
         curva = row["CURVA_ABC"]
         cat = row["CATEGORIA_ESTOCAGEM"]
@@ -852,79 +939,81 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
 
         partes = []
 
-        partes.append(
-            f"Produto curva {curva}, categoria de estocagem '{cat}', "
-            f"com {num_vendas} vendas no período e demanda média original "
-            f"de {dem_orig:.3f} un/dia."
-            if not pd.isna(dem_orig) else
-            f"Produto curva {curva}, categoria de estocagem '{cat}', "
-            f"com {num_vendas} vendas no período."
-        )
+        if not pd.isna(dem_orig):
+            partes.append(
+                f"Produto curva {curva}, categoria '{cat}', com {num_vendas} vendas e demanda média original "
+                f"de {dem_orig:.3f} un/dia."
+            )
+        else:
+            partes.append(
+                f"Produto curva {curva}, categoria '{cat}', com {num_vendas} vendas no período."
+            )
 
         if dias_rup > 0:
             partes.append(
-                f"Houve {dias_rup:.0f} dias de ruptura estimativa nos últimos 2 anos. "
+                f"Houve {dias_rup:.0f} dias de ruptura estimados nos últimos 2 anos. "
                 f"A demanda foi ajustada para {dem_ajus:.3f} un/dia."
             )
-
 
         sgr = row.get("SGR_CODIGO", None)
         regra_selecionada = regras_dias.get(sgr, regras_dias["default"])
 
         if curva in regra_selecionada:
             dias_min, dias_max = regra_selecionada[curva]
-            # Ajuste visual para dizer o real usado
             dias_min_total = dias_min + LEAD_TIME
             dias_max_total = dias_max + LEAD_TIME
-            
             partes.append(
-                f"A regra base da curva {curva} (grupo {sgr if sgr==154 else 'padrão'}) considera {dias_min} a {dias_max} dias + {LEAD_TIME} dias de Lead Time, "
-                f"resultando em cobertura de {dias_min_total} a {dias_max_total} dias. "
-                f"Isso gera estoque base de {est_min_base} un a {est_max_base} un."
+                f"Regra base curva {curva} considera {dias_min}-{dias_max} dias + {LEAD_TIME} lead time "
+                f"(cobertura {dias_min_total}-{dias_max_total} dias), gerando base {est_min_base}-{est_max_base} un."
             )
 
         if not pd.isna(fator_tend):
             partes.append(
-                f"Nos últimos 12 meses, as vendas estão classificadas como '{tend_label}' "
-                f"(fator de tendência ≈ {fator_tend:.2f})."
+                f"Tendência 12m: '{tend_label}' (fator ≈ {fator_tend:.2f})."
             )
         else:
-            partes.append("Não há histórico suficiente para cálculo de tendência de 12 meses.")
+            partes.append("Sem histórico suficiente para tendência 12m.")
 
         if tipo == "Normal":
             if est_min_base != est_min_aj or est_max_base != est_max_aj:
                 partes.append(
-                    f"Foi aplicado um ajuste de tendência, multiplicando o estoque base, "
-                    f"gerando mínimo ajustado de {est_min_aj} un e máximo ajustado de {est_max_aj} un."
+                    f"Ajuste de tendência aplicado: mínimo {est_min_aj} e máximo {est_max_aj}."
                 )
             partes.append(
-                f"Como planejamento 'Normal', o estoque sugerido final é mínimo de "
-                f"{est_min_final} un e máximo de {est_max_final} un."
+                f"Planejamento 'Normal': sugerido final {est_min_final}-{est_max_final} un."
             )
         elif tipo == "Sob_Demanda":
-            partes.append(
-                f"Produto com poucas vendas ({num_vendas}) e tempo médio muito baixo... (Sob Demanda)"
-            )
+            partes.append("Planejamento 'Sob Demanda' por poucas vendas e giro muito rápido.")
         elif tipo == "Pouco_Historico":
-            partes.append(
-                f"Produto com poucas vendas ({num_vendas}) e histórico limitado... (Pouco Historico)"
-            )
+            partes.append("Planejamento 'Pouco Histórico' por baixa quantidade de vendas.")
 
         if row["ALERTA_TENDENCIA_ALTA"] == "Sim":
-            partes.append(
-                "Atenção: o produto apresenta forte tendência de alta nos últimos 12 meses."
-            )
+            partes.append("Atenção: forte tendência de alta nos últimos 12 meses.")
 
         if not pd.isna(est_atual):
-            partes.append(
-                f"O estoque atual é de {est_atual} un."
-            )
+            partes.append(f"Estoque atual: {est_atual:.0f} un.")
+
+        # Info do grupo (se existir)
+        if pd.notna(row.get("group_id", np.nan)):
+            grp_est = row.get("GRP_ESTOQUE_DISPONIVEL", np.nan)
+            grp_vnd = row.get("GRP_QTD_VENDIDA", np.nan)
+            prop = row.get("RATEIO_PROP_GRUPO", np.nan)
+
+            txt = f"Análise unificada do grupo {str(row['group_id'])[:8]}."
+            if pd.notna(grp_est):
+                txt += f" Estoque grupo: {float(grp_est):.0f}."
+            if pd.notna(grp_vnd):
+                txt += f" Venda grupo: {float(grp_vnd):.0f}."
+            if pd.notna(prop):
+                txt += f" Rateio do item: {float(prop)*100:.1f}%."
+            partes.append(txt)
 
         return " ".join(partes)
 
     df_met["DESCRICAO_CALCULO_ESTOQUE"] = df_met.apply(montar_descricao, axis=1)
 
     return df_met
+
 
 
 # ==========================================
@@ -1349,10 +1438,13 @@ def salvar_metricas_postgres(df_metricas):
         'ESTOQUE_DISPONIVEL': 'estoque_disponivel',
         'MAR_DESCRICAO': 'mar_descricao',
         'SGR_CODIGO': 'sgr_codigo',
+        'SGR_DESCRICAO': 'sgr_descricao',
+        'group_id': 'group_id',
         'FORNECEDOR1': 'fornecedor1',
         'FORNECEDOR2': 'fornecedor2',
         'FORNECEDOR3': 'fornecedor3',
         'PCT_ACUM_VALOR': 'pct_acum_valor',
+        'CURVA_ABC': 'curva_abc',
         'CURVA_ABC': 'curva_abc',
         'CATEGORIA_ESTOCAGEM': 'categoria_estocagem',
         'ESTOQUE_MIN_BASE': 'estoque_min_base',
@@ -1366,6 +1458,22 @@ def salvar_metricas_postgres(df_metricas):
         'ALERTA_TENDENCIA_ALTA': 'alerta_tendencia_alta',
         'DESCRICAO_CALCULO_ESTOQUE': 'descricao_calculo_estoque',
         'TEVE_ALTERACAO_ANALISE': 'teve_alteracao_analise',
+        'GRP_ESTOQUE_DISPONIVEL': 'grp_estoque_disponivel',
+        'GRP_QTD_VENDIDA': 'grp_qtd_vendida',
+        'GRP_VALOR_VENDIDO': 'grp_valor_vendido',
+        'GRP_NUM_VENDAS': 'grp_num_vendas',
+        'GRP_VENDAS_ULT_12M': 'grp_vendas_ult_12m',
+        'GRP_VENDAS_12M_ANT': 'grp_vendas_12m_ant',
+        'GRP_ESTOQUE_MIN_BASE': 'grp_estoque_min_base',
+        'GRP_ESTOQUE_MAX_BASE': 'grp_estoque_max_base',
+        'GRP_ESTOQUE_MIN_AJUSTADO': 'grp_estoque_min_ajustado',
+        'GRP_ESTOQUE_MAX_AJUSTADO': 'grp_estoque_max_ajustado',
+        'GRP_ESTOQUE_MIN_SUGERIDO': 'grp_estoque_min_sugerido',
+        'GRP_ESTOQUE_MAX_SUGERIDO': 'grp_estoque_max_sugerido',
+        'GRP_DEMANDA_MEDIA_DIA': 'grp_demanda_media_dia',
+        'RATEIO_PROP_GRUPO': 'rateio_prop_grupo',
+        'TEMPO_MEDIO_SALDO_ATUAL': 'tempo_medio_saldo_atual',
+        'CATEGORIA_SALDO_ATUAL': 'categoria_saldo_atual',
         'dados_alteracao_json': 'dados_alteracao_json'
     }
     
@@ -1378,12 +1486,17 @@ def salvar_metricas_postgres(df_metricas):
         'valor_vendido', 'data_min_venda', 'data_max_venda', 'periodo_dias',
         'demanda_media_dia', 'num_vendas', 'vendas_ult_12m', 'vendas_12m_ant',
         'fator_tendencia', 'tendencia_label', 'dias_ruptura', 'demanda_media_dia_ajustada',
-        'pro_descricao', 'estoque_disponivel', 'mar_descricao', 'sgr_codigo', 'fornecedor1',
+        'pro_descricao', 'estoque_disponivel', 'mar_descricao', 'sgr_codigo', 'sgr_descricao', 'group_id', 'fornecedor1',
         'fornecedor2', 'fornecedor3', 'pct_acum_valor', 'curva_abc',
         'categoria_estocagem', 'estoque_min_base', 'estoque_max_base',
         'fator_ajuste_tendencia', 'estoque_min_ajustado', 'estoque_max_ajustado',
         'estoque_min_sugerido', 'estoque_max_sugerido', 'tipo_planejamento',
         'alerta_tendencia_alta', 'descricao_calculo_estoque', 'teve_alteracao_analise',
+        'grp_estoque_disponivel', 'grp_qtd_vendida', 'grp_valor_vendido', 'grp_num_vendas',
+        'grp_vendas_ult_12m', 'grp_vendas_12m_ant', 'grp_estoque_min_base', 'grp_estoque_max_base',
+        'grp_estoque_min_ajustado', 'grp_estoque_max_ajustado', 'grp_estoque_min_sugerido',
+        'grp_estoque_max_sugerido', 'grp_demanda_media_dia', 'rateio_prop_grupo',
+        'tempo_medio_saldo_atual', 'categoria_saldo_atual',
         'dados_alteracao_json'
     ]
     
@@ -1467,6 +1580,48 @@ def salvar_dados_postgres(df_metricas, df_mudancas, df_long):
     print("Dados salvos com sucesso no PostgreSQL!")
 
 
+def salvar_distribuicao_fifo_postgres(df_long):
+    """
+    Salva a distribuição detalhada do FIFO (lotes residuais) na tabela com_data_saldo_produto.
+    Estratégia: Limpar tabela e reinserir (Snapshot atual).
+    """
+    if df_long.empty:
+        return
+
+    print("Salvando distribuição FIFO (lotes) no PostgreSQL...")
+    engine = get_postgres_engine()
+    
+    # Preparar DataFrame
+    # df_long columns expected: PRO_CODIGO, DATA_COMPRA_RESIDUAL, QTD_RESTANTE, ...
+    
+    df_save = df_long[["PRO_CODIGO", "DATA_COMPRA_RESIDUAL", "QTD_RESTANTE"]].copy()
+    df_save.columns = ["pro_codigo", "data_compra", "saldo_residual"]
+    
+    # Converter datas
+    df_save["data_compra"] = pd.to_datetime(df_save["data_compra"], errors='coerce')
+    
+    try:
+        with engine.connect() as conn:
+            # Opção 1: Truncate (mais rápido se for atualizar tudo)
+            # Opção 2: Delete by pro_codigo se for parcial (mas aqui estamos rodando tudo)
+            # Vamos usar Truncate/Delete All para garantir snapshot limpo
+            conn.execute(text("TRUNCATE TABLE com_data_saldo_produto RESTART IDENTITY"))
+            conn.commit()
+            
+        df_save.to_sql(
+            'com_data_saldo_produto',
+            engine,
+            if_exists='append',
+            index=False,
+            method='multi',
+            chunksize=1000
+        )
+        print(f"Salvos {len(df_save)} lotes residuais em com_data_saldo_produto.")
+        
+    except Exception as e:
+        print(f"Erro ao salvar distribuição FIFO: {e}")
+
+
 # ==========================================
 # EXECUÇÃO DO JOB
 # ==========================================
@@ -1477,6 +1632,14 @@ def run_job():
     # 1) Carregar dados
     df_saidas, df_ent, df_dev, df_saldo_produto = carregar_dados_do_banco()
     
+    # === CORREÇÃO DE TIPOS: Garantir que PRO_CODIGO seja string em todos os DataFrames ===
+    df_saidas["PRO_CODIGO"] = df_saidas["PRO_CODIGO"].astype(str).str.strip()
+    df_ent["PRO_CODIGO"] = df_ent["PRO_CODIGO"].astype(str).str.strip()
+    if not df_dev.empty:
+        df_dev["PRO_CODIGO"] = df_dev["PRO_CODIGO"].astype(str).str.strip()
+    df_saldo_produto["PRO_CODIGO"] = df_saldo_produto["PRO_CODIGO"].astype(str).str.strip()
+    # ===================================================================================
+
     # 2) Processamento de limpeza (Simplificado aqui, puxando lógica do script original)
     df_sai = df_saidas.copy()
     df_sai["QUANTIDADE"] = pd.to_numeric(df_sai.get("QUANTIDADE"), errors="coerce")
@@ -1562,6 +1725,48 @@ def run_job():
     # 5) FIFO Atual
     df_long, df_wide, df_div = calcular_fifo_saldo_atual(df_ent_valid, df_sai_fifo, df_saldo_produto)
     
+    # === ETAPA NOVA: Calcular Idade Média do Saldo Atual e Classificar ===
+    # Agrupar df_long por produto para calcular weighted average age
+    if not df_long.empty:
+        # Calcular Idade de cada camada
+        # Age = (Hoje - DataCompra).days
+        hoje = pd.Timestamp.today().normalize()
+        df_long["DATA_COMPRA_RESIDUAL"] = pd.to_datetime(df_long["DATA_COMPRA_RESIDUAL"], errors='coerce')
+        df_long["LAYER_AGE_DAYS"] = (hoje - df_long["DATA_COMPRA_RESIDUAL"]).dt.days.fillna(0)
+        
+        # Weighted Avg per Protocol
+        # Weighted Age = Sum(Age * Qty) / Sum(Qty)
+        
+        # Helper storage
+        prod_age_map = {}
+        
+        for cod, grp in df_long.groupby("PRO_CODIGO"):
+            total_qty = grp["QTD_RESTANTE"].sum()
+            if total_qty > 0:
+                weighted_sum = (grp["LAYER_AGE_DAYS"] * grp["QTD_RESTANTE"]).sum()
+                avg_age = weighted_sum / total_qty
+                prod_age_map[cod] = avg_age
+            else:
+                prod_age_map[cod] = 0 # Should not happen if filtered, but safety
+        
+        # Mapear para df_metricas
+        # Função cat_estocagem já existe no escopo (definida dentro de calcular_metricas_e_classificar... ops, escopo fechado)
+        # Precisamos redefinir ou extrair a lógica de cat_estocagem.
+        # Vamos redefinir aqui para facilidade.
+        def get_cat_saldo(t):
+            if pd.isna(t): return None
+            if t <= 60: return "Rápido"
+            elif t <= 120: return "Médio"
+            elif t <= 240: return "Lento"
+            else: return "Obsoleto"
+            
+        df_metricas["TEMPO_MEDIO_SALDO_ATUAL"] = df_metricas["PRO_CODIGO"].map(prod_age_map)
+        df_metricas["CATEGORIA_SALDO_ATUAL"] = df_metricas["TEMPO_MEDIO_SALDO_ATUAL"].apply(get_cat_saldo)
+        
+    else:
+        df_metricas["TEMPO_MEDIO_SALDO_ATUAL"] = None
+        df_metricas["CATEGORIA_SALDO_ATUAL"] = None
+    
     # 6) Comparação com Anterior
     # 6) Comparação com Anterior (AGORA VIA BANCO)
     df_metricas, df_mudancas = detectar_alteracoes_via_banco(df_metricas)
@@ -1570,6 +1775,7 @@ def run_job():
     print("Salvando dados no PostgreSQL...")
     try:
         salvar_dados_postgres(df_metricas, df_mudancas, df_long)
+        salvar_distribuicao_fifo_postgres(df_long)
     except Exception as e:
         print(f"Erro ao salvar no PostgreSQL: {e}")
         return
@@ -1598,8 +1804,106 @@ def run_job():
     print("="*50)
     verificar_tabela_postgres()
     
+    # 11) Auto-Agrupamento Similares
+    agrupar_similares_automaticamente()
+    
     print("Job finalizado com sucesso.")
 
+
+    print("Dados salvos com sucesso no PostgreSQL!")
+
+# --------------------------------------------------------------------------------------
+# AUTO-AGRUPAMENTO
+# --------------------------------------------------------------------------------------
+def agrupar_similares_automaticamente():
+    """
+    Identifica produtos com descrições idênticas e cria grupos na tabela com_relacionamento_itens.
+    Executa apenas para itens que ainda não possuem relacionamento.
+    """
+    print("Iniciando auto-agrupamento de produtos similares...")
+    try:
+        engine = get_postgres_engine()
+        with engine.connect() as conn:
+            # 1. Encontrar descrições duplicadas
+            # Considera apenas itens ativos na analise (presentes em com_fifo_completo)
+            # Otimização: Buscar apenas descrições que tenham itens NÃO AGRUPADOS ou SEM GRUPO COMPLETO
+            # JOIN com a tabela de relacionamento para ver quem já tem grupo.
+            # Condição HAVING: Tem duplicatas (COUNT > 1) E (Contagem de Grupos < Contagem de Itens)
+            # Ou seja, pelo menos um item da descrição não tem registro na tabela de relacionamento.
+            sql_duplicados = text("""
+                SELECT f.pro_descricao, COUNT(f.pro_codigo) as qtd
+                FROM com_fifo_completo f
+                LEFT JOIN com_relacionamento_itens r ON f.pro_codigo = r.pro_codigo
+                WHERE f.pro_descricao IS NOT NULL AND f.pro_descricao <> ''
+                GROUP BY f.pro_descricao 
+                HAVING COUNT(f.pro_codigo) > 1 
+                   AND COUNT(r.group_id) < COUNT(f.pro_codigo)
+            """)
+            result = conn.execute(sql_duplicados).fetchall()
+            
+            if not result:
+                print("Nenhuma descrição duplicada encontrada para agrupamento.")
+                return
+
+            print(f"Encontrados {len(result)} descrições com duplicatas.")
+            
+            novos_grupos = 0
+            novos_itens = 0
+            
+            for i, row in enumerate(result):
+                if i % 100 == 0:
+                    print(f"  Processando grupo {i}/{len(result)}...")
+                    conn.commit() # Commit parcial para não perder tudo se cair
+                
+                descricao = row[0]
+                if not descricao: continue
+                
+                # Buscar produtos com essa descricao
+                sql_prods = text("SELECT pro_codigo FROM com_fifo_completo WHERE pro_descricao = :desc")
+                prods = conn.execute(sql_prods, {"desc": descricao}).fetchall()
+                pro_codigos = [p[0] for p in prods]
+                
+                if not pro_codigos: continue
+                
+                # Verificar se algum já tem grupo
+                # Busca grupos já existentes para esses códigos
+                existing_groups = set()
+                for pc in pro_codigos:
+                    g = conn.execute(text("SELECT group_id FROM com_relacionamento_itens WHERE pro_codigo = :c"), {"c": pc}).scalar()
+                    if g:
+                        existing_groups.add(g)
+                
+                # Determinar ID do grupo
+                group_id = None
+                if len(existing_groups) == 1:
+                    # Todos (que tem grupo) estão no mesmo grupo. Usar esse.
+                    group_id = list(existing_groups)[0]
+                elif len(existing_groups) > 1:
+                    # Mais de um grupo existente.
+                    # Simplificação: Usar o primeiro encontrado e mover os outros (merge) ou ignorar?
+                    # Vamos usar o primeiro e agrupar os 'sem grupo' nele. Não vamos fazer merge de grupos existentes agora para evitar complexidade.
+                    group_id = list(existing_groups)[0]
+                else:
+                    # Nenhum tem grupo. Criar novo.
+                    group_id = str(uuid.uuid4())
+                    novos_grupos += 1
+                
+                # Inserir itens que não estão em grupo nenhum
+                # Se já estiverem em OUTRO grupo, mantemos lá (respeita decisão manual anterior?)
+                # Para "Auto", vamos apenas preencher os vazios.
+                
+                for pc in pro_codigos:
+                    curr = conn.execute(text("SELECT group_id FROM com_relacionamento_itens WHERE pro_codigo = :c"), {"c": pc}).scalar()
+                    if not curr:
+                        # Inserir
+                        conn.execute(text("INSERT INTO com_relacionamento_itens (group_id, pro_codigo) VALUES (:g, :c)"), {"g": group_id, "c": pc})
+                        novos_itens += 1
+            
+            conn.commit()
+            print(f"Auto-agrupamento concluído: {novos_grupos} novos grupos, {novos_itens} produtos vinculados.")
+            
+    except Exception as e:
+        print(f"Erro no auto-agrupamento: {e}")
 
 # ==========================================
 # LOOP DE SERVIÇO
