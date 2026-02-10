@@ -161,6 +161,7 @@ def criar_tabela_postgres():
         rateio_prop_grupo DECIMAL(10,6),
         tempo_medio_saldo_atual DECIMAL(15,2),
         categoria_saldo_atual VARCHAR(50),
+        pro_referencia VARCHAR(50),
         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );
     
@@ -245,6 +246,11 @@ def criar_tabela_postgres():
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='categoria_saldo_atual') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN categoria_saldo_atual VARCHAR(50);
+        END IF;
+
+        -- Referência
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='pro_referencia') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN pro_referencia VARCHAR(50);
         END IF;
     END
     $$;
@@ -370,6 +376,7 @@ def carregar_dados_do_banco():
             pro.pro_descricao,
             pro.subgrp_codigo AS SGR_CODIGO,
             subp.subgrp_descricao AS SGR_DESCRICAO,
+            pro.referencia AS PRO_REFERENCIA,
             pro.estoque_disponivel,
             mar.mar_descricao,
             f1.for_nome AS fornecedor1,
@@ -425,8 +432,9 @@ def carregar_dados_do_banco():
         "FORNECEDOR1":         "FORNECEDOR1",
         "fornecedor2":         "FORNECEDOR2",
         "FORNECEDOR2":         "FORNECEDOR2",
-        "fornecedor3":         "FORNECEDOR3",
         "FORNECEDOR3":         "FORNECEDOR3",
+        "referencia":          "PRO_REFERENCIA", # Caso venha lowercase do SQL
+        "pro_referencia":      "PRO_REFERENCIA"
     })
     
     # DEBUG: Verificar colunas carregadas
@@ -1474,6 +1482,7 @@ def salvar_metricas_postgres(df_metricas):
         'RATEIO_PROP_GRUPO': 'rateio_prop_grupo',
         'TEMPO_MEDIO_SALDO_ATUAL': 'tempo_medio_saldo_atual',
         'CATEGORIA_SALDO_ATUAL': 'categoria_saldo_atual',
+        'PRO_REFERENCIA': 'pro_referencia',
         'dados_alteracao_json': 'dados_alteracao_json'
     }
     
@@ -1497,6 +1506,7 @@ def salvar_metricas_postgres(df_metricas):
         'grp_estoque_min_ajustado', 'grp_estoque_max_ajustado', 'grp_estoque_min_sugerido',
         'grp_estoque_max_sugerido', 'grp_demanda_media_dia', 'rateio_prop_grupo',
         'tempo_medio_saldo_atual', 'categoria_saldo_atual',
+        'pro_referencia',
         'dados_alteracao_json'
     ]
     

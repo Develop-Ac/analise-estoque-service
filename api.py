@@ -137,6 +137,7 @@ class AnaliseItem(BaseModel):
     id: int
     pro_codigo: str
     pro_descricao: str
+    pro_referencia: Optional[str] = None
     sgr_codigo: Optional[int]
     sgr_descricao: Optional[str]
     mar_descricao: Optional[str]
@@ -1017,7 +1018,7 @@ def listar_analise(
         # Query Dados
         data_sql = text(f"""
             SELECT 
-                id, pro_codigo, pro_descricao, sgr_codigo, sgr_descricao, mar_descricao, fornecedor1,
+                id, pro_codigo, pro_descricao, pro_referencia, sgr_codigo, sgr_descricao, mar_descricao, fornecedor1,
                 estoque_disponivel, demanda_media_dia, demanda_media_dia_ajustada,
                 tempo_medio_estoque, CAST(data_min_venda AS TEXT) as data_min_venda, 
                 CAST(data_max_venda AS TEXT) as data_max_venda, qtd_vendida,
