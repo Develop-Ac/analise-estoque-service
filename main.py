@@ -399,6 +399,8 @@ def carregar_dados_do_banco():
             ON f3.empresa     = pro.empresa
            AND f3.for_codigo  = pro.for_codigo3     -- fornecedor 3
         WHERE pro.empresa = 3
+          AND UPPER(pro.inativo) = ''N''
+          AND UPPER(pro.comercializavel) = ''S''
     ')
     """
 
@@ -672,6 +674,53 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
         })
 
     df_met = pd.DataFrame(metricas)
+    
+    # ==========================================
+    # ADICIONAR PRODUTOS QUE SÓ TÊM ENTRADAS (SEM VENDAS)
+    # ==========================================
+    # Identifica produtos que existem no saldo mas não têm vendas
+    # Esses produtos vão ter min/max = 0 mas precisam estar no banco
+    if not df_saldo_produto.empty:
+        # Produtos com estoque
+        produtos_com_estoque = set(df_saldo_produto["PRO_CODIGO"].astype(str).str.strip().unique())
+        
+        # Produtos já processados (com vendas)
+        if not df_met.empty:
+            produtos_processados = set(df_met["PRO_CODIGO"].astype(str).str.strip().unique())
+        else:
+            produtos_processados = set()
+        
+        # Produtos que só têm entradas (diferença entre os dois sets)
+        produtos_so_entradas = produtos_com_estoque - produtos_processados
+        
+        if produtos_so_entradas:
+            print(f"\nEncontrados {len(produtos_so_entradas)} produtos com apenas entradas (sem vendas)...")
+            print("Esses produtos serão salvos com estoque_min_sugerido=0 e estoque_max_sugerido=0")
+            
+            # Criar registros mínimos para produtos só com entradas
+            metricas_so_entradas = []
+            for cod in produtos_so_entradas:
+                metricas_so_entradas.append({
+                    "PRO_CODIGO": cod,
+                    "TEMPO_MEDIO_ESTOQUE": np.nan,
+                    "QTD_VENDIDA": 0,
+                    "VALOR_VENDIDO": 0,
+                    "DATA_MIN_VENDA": pd.NaT,
+                    "DATA_MAX_VENDA": pd.NaT,
+                    "PERIODO_DIAS": 0,
+                    "DEMANDA_MEDIA_DIA": 0,
+                    "NUM_VENDAS": 0,
+                    "VENDAS_ULT_12M": 0,
+                    "VENDAS_12M_ANT": 0,
+                    "FATOR_TENDENCIA": 1.0,
+                    "TENDENCIA_LABEL": "Sem Dados",
+                })
+            
+            # Adicionar ao DataFrame de métricas
+            df_so_entradas = pd.DataFrame(metricas_so_entradas)
+            df_met = pd.concat([df_met, df_so_entradas], ignore_index=True)
+            print(f"Adicionados {len(metricas_so_entradas)} produtos sem vendas ao DataFrame de métricas")
+    
     if df_met.empty:
         return df_met
 
@@ -868,7 +917,7 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             return pd.Series({
                 "ESTOQUE_MIN_SUGERIDO": row["ESTOQUE_MIN_AJUSTADO"],
                 "ESTOQUE_MAX_SUGERIDO": row["ESTOQUE_MAX_AJUSTADO"],
-                "TIPO_PLANEJAMENTO": "Normal",
+                "TIPO_PLANEJAMENTO": "Sem_Historico",
             })
 
         if num_vendas <= 10:
