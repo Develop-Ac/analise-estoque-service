@@ -134,9 +134,9 @@ class LoteEstoque(BaseModel):
     qtd: float
     dias_em_estoque: int
 class AnaliseItem(BaseModel):
-    id: int
-    pro_codigo: str
-    pro_descricao: str
+    id: Optional[int] = None
+    pro_codigo: Optional[str] = None
+    pro_descricao: Optional[str] = None
     pro_referencia: Optional[str] = None
     sgr_codigo: Optional[int]
     sgr_descricao: Optional[str]
