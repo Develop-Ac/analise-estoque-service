@@ -7,3 +7,4 @@ openpyxl
 fastapi
 uvicorn
 python-dotenv
+pymongo

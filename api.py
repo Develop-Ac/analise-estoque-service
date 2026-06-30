@@ -39,9 +39,9 @@ app.add_middleware(
 )
 
 def get_db_connection():
-    engine = create_engine(POSTGRES_URL)
-    return engine.connect()
-
+    # SQLAlchemy 2.x não aceita o alias 'postgres://' — normaliza para 'postgresql://'
+    url = POSTGRES_URL.replace("postgres://", "postgresql://")
+    engine = create_engine(url)
     return engine.connect()
 
 def get_sql_connection():
@@ -186,7 +186,22 @@ class AnaliseItem(BaseModel):
     rateio_prop_grupo: Optional[float] = None
     tempo_medio_saldo_atual: Optional[float] = None
     categoria_saldo_atual: Optional[str] = None
-    
+
+    # Estoque de segurança estatístico / ABC-XYZ / venda perdida
+    demanda_real_dia: Optional[float] = None
+    sigma_demanda_dia: Optional[float] = None
+    cv_demanda: Optional[float] = None
+    classe_xyz: Optional[str] = None
+    estoque_seguranca: Optional[int] = None
+    nivel_servico_z: Optional[float] = None
+    lead_time_dias: Optional[int] = None
+    venda_perdida_12m: Optional[float] = None
+    valor_vendido_12m: Optional[float] = None
+    padrao_demanda: Optional[str] = None
+    metodo_reposicao: Optional[str] = None
+    fator_sazonal: Optional[float] = None
+    demanda_planejamento_dia: Optional[float] = None
+
     # Detailed Stock Info
     estoque_obsoleto: Optional[float] = 0
     lotes_estoque: Optional[List[LoteEstoque]] = []
@@ -1032,10 +1047,14 @@ def listar_analise(
                 grp_vendas_ult_12m, grp_vendas_12m_ant, grp_estoque_min_base, grp_estoque_max_base,
                 grp_estoque_min_ajustado, grp_estoque_max_ajustado, grp_estoque_min_sugerido,
                 grp_estoque_max_sugerido, grp_demanda_media_dia, rateio_prop_grupo,
-                tempo_medio_saldo_atual, categoria_saldo_atual
-            FROM com_fifo_completo 
+                tempo_medio_saldo_atual, categoria_saldo_atual,
+                demanda_real_dia, sigma_demanda_dia, cv_demanda, classe_xyz,
+                estoque_seguranca, nivel_servico_z, lead_time_dias,
+                venda_perdida_12m, valor_vendido_12m,
+                padrao_demanda, metodo_reposicao, fator_sazonal, demanda_planejamento_dia
+            FROM com_fifo_completo
             WHERE {where_clause}
-            ORDER BY 
+            ORDER BY
                 -- 1. Melhor Curva do Grupo (Prioridade A)
                 MIN(curva_abc) OVER (PARTITION BY CASE WHEN group_id IS NOT NULL AND group_id <> '' THEN group_id ELSE pro_codigo END) ASC,
                 
@@ -1687,3 +1706,344 @@ def _get_stock_batches(pro_codes):
         return {}
     finally:
         conn.close()
+
+
+# ==========================================
+# SUGESTÃO DE COMPRA (ponto de pedido)
+# ==========================================
+def get_all_realtime_stocks():
+    """Estoque atual de TODOS os produtos ativos (empresa 3) numa query só."""
+    inner = ("SELECT pro_codigo, estoque_disponivel FROM produtos "
+             "WHERE empresa = 3 AND UPPER(inativo) = 'N' AND UPPER(comercializavel) = 'S'")
+    query = f"SELECT * FROM OPENQUERY(CONSULTA, '{inner.replace(chr(39), chr(39)*2)}')"
+    conn = get_sql_connection()
+    m = {}
+    try:
+        cur = conn.cursor()
+        cur.execute(query)
+        for row in cur.fetchall():
+            if row[0] is not None:
+                m[str(row[0]).strip()] = float(row[1]) if row[1] is not None else 0.0
+    finally:
+        conn.close()
+    return m
+
+
+def _sug_norm(s):
+    return (str(s).strip() if s is not None else "")
+
+
+def _sug_float(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    if f != f:  # NaN
+        return 0.0
+    return f
+
+
+def _sug_posicao(it, stock_map, usar_rt):
+    """Estoque (realtime se disponível, senão snapshot) + em trânsito de UM item."""
+    cod = _sug_norm(it.get("pro_codigo"))
+    est = stock_map.get(cod) if usar_rt else None
+    estoque = float(est) if est is not None else _sug_float(it.get("estoque_snapshot"))
+    transito = _sug_float(it.get("em_transito"))
+    return cod, estoque, transito
+
+
+def montar_sugestao_compra(items, stock_map, *, consolidar_grupo=True, usar_estoque_realtime=True,
+                           fornecedor=None, curva=None, apenas_zerados=False):
+    """
+    Transforma as linhas de com_fifo_completo (1 por produto/marca) na sugestão de
+    compra agrupada por fornecedor. FUNÇÃO PURA — usada pelo endpoint e pela validação.
+
+    Cada item (dict) deve ter as chaves: pro_codigo, pro_descricao, mar_descricao,
+    sgr_descricao, fornecedor1, curva_abc, classe_xyz, padrao_demanda, metodo_reposicao,
+    ponto_pedido (mín individual), maximo (máx individual), estoque_snapshot, em_transito,
+    demanda_media_dia_ajustada, valor_vendido_12m, sob_encomenda, grupo_chave,
+    grupo_estoque_min, grupo_estoque_max, grupo_curva, grupo_padrao, grupo_metodo.
+
+    Modo grupo (consolidar_grupo=True):
+      - omite produtos "Sob Encomenda";
+      - produtos com grupo_chave usam grupo_estoque_min/max e a POSIÇÃO CONSOLIDADA
+        (soma do estoque+trânsito de todas as marcas do grupo) -> 1 linha por GRUPO;
+      - produtos sem grupo_chave (avulsos não-originais) caem no cálculo individual.
+    """
+    import math
+    from collections import defaultdict
+
+    usar_rt = usar_estoque_realtime and bool(stock_map)
+    curvas_filtro = [c.strip().upper() for c in curva.split(",")] if curva else None
+    ordem_curva = {"A": 0, "B": 1, "C": 2, "D": 3}
+    grupos = {}  # fornecedor -> [rec]
+
+    def _passa_filtros_comuns(curva_item, estoque_total):
+        if curvas_filtro and (curva_item or "").upper() not in curvas_filtro:
+            return False
+        if apenas_zerados and estoque_total > 0:
+            return False
+        return True
+
+    def _registrar(bucket, rec):
+        grupos.setdefault(bucket, []).append(rec)
+
+    def _tratar_individual(it):
+        ponto = _sug_float(it.get("ponto_pedido"))
+        maximo = _sug_float(it.get("maximo"))
+        if maximo <= 0 or ponto <= 0:
+            return
+        cod, estoque, transito = _sug_posicao(it, stock_map, usar_rt)
+        posicao = estoque + transito
+        if posicao > ponto:
+            return
+        qtd = int(math.ceil(maximo - posicao))
+        if qtd <= 0:
+            return
+        curva_item = _sug_norm(it.get("curva_abc"))
+        if not _passa_filtros_comuns(curva_item, estoque):
+            return
+        forn = _sug_norm(it.get("fornecedor1")) or "SEM FORNECEDOR"
+        if fornecedor and fornecedor.lower() not in forn.lower():
+            return
+        _registrar(forn, {
+            "tipo": "individual",
+            "grupo_chave": None,
+            "pro_codigo": cod,
+            "pro_descricao": it.get("pro_descricao"),
+            "marca": it.get("mar_descricao"),
+            "subgrupo": it.get("sgr_descricao"),
+            "curva_abc": curva_item,
+            "classe_xyz": it.get("classe_xyz"),
+            "padrao_demanda": it.get("padrao_demanda"),
+            "metodo_reposicao": it.get("metodo_reposicao"),
+            "qtd_itens_grupo": 1,
+            "marcas": [it.get("mar_descricao")] if it.get("mar_descricao") else [],
+            "fornecedores": [forn],
+            "estoque_atual": round(estoque, 2),
+            "em_transito": round(transito, 2),
+            "posicao": round(posicao, 2),
+            "ponto_pedido": int(ponto),
+            "maximo": int(maximo),
+            "qtd_sugerida": qtd,
+            "criticidade": "Zerado" if estoque <= 0 else "Abaixo do mínimo",
+            "deficit": round(ponto - posicao, 2),
+            "membros": [],
+        })
+
+    if not consolidar_grupo:
+        for it in items:
+            if it.get("sob_encomenda"):
+                continue
+            _tratar_individual(it)
+    else:
+        membros = defaultdict(list)
+        avulsos = []
+        for it in items:
+            if it.get("sob_encomenda"):
+                continue
+            gk = it.get("grupo_chave")
+            if gk is not None and _sug_norm(gk) != "":
+                membros[_sug_norm(gk)].append(it)
+            else:
+                avulsos.append(it)
+
+        for gk, mem in membros.items():
+            # grupo_estoque_min/max são iguais para todos os membros (vêm do merge); usa o maior por segurança
+            maximo = max((_sug_float(m.get("grupo_estoque_max")) for m in mem), default=0.0)
+            ponto = max((_sug_float(m.get("grupo_estoque_min")) for m in mem), default=0.0)
+            if maximo <= 0:
+                continue
+
+            estoque_total = transito_total = 0.0
+            membros_det = []
+            for m in mem:
+                cod, est, tr = _sug_posicao(m, stock_map, usar_rt)
+                estoque_total += est
+                transito_total += tr
+                membros_det.append({
+                    "pro_codigo": cod,
+                    "marca": m.get("mar_descricao"),
+                    "fornecedor": _sug_norm(m.get("fornecedor1")) or "SEM FORNECEDOR",
+                    "estoque_atual": round(est, 2),
+                    "em_transito": round(tr, 2),
+                    "valor_vendido_12m": _sug_float(m.get("valor_vendido_12m")),
+                    "demanda_media_dia_ajustada": _sug_float(m.get("demanda_media_dia_ajustada")),
+                })
+            posicao = estoque_total + transito_total
+            if posicao > ponto:
+                continue
+            qtd = int(math.ceil(maximo - posicao))
+            if qtd <= 0:
+                continue
+
+            # atributos do grupo (compartilhados entre membros)
+            curva_item = next((_sug_norm(m.get("grupo_curva")) for m in mem if m.get("grupo_curva")), "")
+            padrao = next((m.get("grupo_padrao") for m in mem if m.get("grupo_padrao")), None)
+            metodo = next((m.get("grupo_metodo") for m in mem if m.get("grupo_metodo")), None)
+            if not _passa_filtros_comuns(curva_item, estoque_total):
+                continue
+
+            # ordena membros por relevância (vendas) p/ escolher fornecedor/marca primários
+            membros_det.sort(key=lambda x: (-x["valor_vendido_12m"], -x["demanda_media_dia_ajustada"],
+                                            -x["estoque_atual"]))
+            forns_ord, seen_f = [], set()
+            marcas_ord, seen_m = [], set()
+            for d in membros_det:
+                f = d["fornecedor"]
+                if f not in seen_f:
+                    seen_f.add(f); forns_ord.append(f)
+                mk = d.get("marca")
+                if mk and mk not in seen_m:
+                    seen_m.add(mk); marcas_ord.append(mk)
+            primario = forns_ord[0] if forns_ord else "SEM FORNECEDOR"
+
+            # filtro/bucket por fornecedor: se filtrado, joga no fornecedor casado
+            if fornecedor:
+                casado = next((f for f in forns_ord if fornecedor.lower() in f.lower()), None)
+                if not casado:
+                    continue
+                bucket = casado
+            else:
+                bucket = primario
+
+            sgr = next((m.get("sgr_descricao") for m in mem if m.get("sgr_descricao")), None)
+            _registrar(bucket, {
+                "tipo": "grupo",
+                "grupo_chave": gk,
+                "pro_codigo": membros_det[0]["pro_codigo"],  # representativo (maior venda)
+                "pro_descricao": gk,
+                "marca": marcas_ord[0] if marcas_ord else None,
+                "subgrupo": sgr,
+                "curva_abc": curva_item,
+                "classe_xyz": None,
+                "padrao_demanda": padrao,
+                "metodo_reposicao": metodo,
+                "qtd_itens_grupo": len(mem),
+                "marcas": marcas_ord,
+                "fornecedores": forns_ord,
+                "estoque_atual": round(estoque_total, 2),
+                "em_transito": round(transito_total, 2),
+                "posicao": round(posicao, 2),
+                "ponto_pedido": int(ponto),
+                "maximo": int(maximo),
+                "qtd_sugerida": qtd,
+                "criticidade": "Zerado" if estoque_total <= 0 else "Abaixo do mínimo",
+                "deficit": round(ponto - posicao, 2),
+                "membros": membros_det,
+            })
+
+        for it in avulsos:
+            _tratar_individual(it)
+
+    fornecedores = []
+    for f, its in grupos.items():
+        its.sort(key=lambda x: (ordem_curva.get(x["curva_abc"], 9), -x["deficit"]))
+        fornecedores.append({
+            "fornecedor": f,
+            "qtd_itens": len(its),
+            "qtd_total_sugerida": sum(x["qtd_sugerida"] for x in its),
+            "itens": its,
+        })
+    fornecedores.sort(key=lambda x: -x["qtd_itens"])
+
+    return {
+        "modo": "grupo" if consolidar_grupo else "individual",
+        "total_itens": sum(g["qtd_itens"] for g in fornecedores),
+        "total_fornecedores": len(fornecedores),
+        "estoque_realtime": usar_rt,
+        "fornecedores": fornecedores,
+    }
+
+
+def _carregar_itens_sugestao(conn):
+    """Lê as linhas base da última análise + em trânsito (tolerante a colunas novas ausentes)."""
+    existentes = {r[0] for r in conn.execute(text(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='com_fifo_completo'"
+    ))}
+
+    def opt(c):
+        return c if c in existentes else f"NULL AS {c}"
+
+    sql = text(f"""
+        WITH base AS (
+            SELECT pro_codigo, pro_descricao, mar_descricao, sgr_descricao, fornecedor1,
+                   curva_abc, {opt('classe_xyz')}, {opt('padrao_demanda')}, {opt('metodo_reposicao')},
+                   COALESCE(estoque_min_sugerido,0) AS ponto_pedido,
+                   COALESCE(estoque_max_sugerido,0) AS maximo,
+                   COALESCE(estoque_disponivel,0)   AS estoque_snapshot,
+                   demanda_media_dia_ajustada,
+                   {opt('valor_vendido_12m')},
+                   {opt('sob_encomenda')}, {opt('grupo_chave')},
+                   {opt('grupo_estoque_min')}, {opt('grupo_estoque_max')},
+                   {opt('grupo_curva')}, {opt('grupo_padrao')}, {opt('grupo_metodo')}
+            FROM com_fifo_completo
+            WHERE data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)
+        ),
+        pedido AS (
+            SELECT i.pro_codigo::text AS pro_codigo, SUM(i.quantidade) AS qtd_ped
+            FROM com_pedido p
+            JOIN com_pedido_itens i ON i.pedido_id = p.id
+            WHERE p.status IN ('Liberado', 'Em Trânsito parcialmente')
+            GROUP BY i.pro_codigo::text
+        ),
+        recebido AS (
+            SELECT vi.pro_codigo::text AS pro_codigo, SUM(vi.quantidade_alocada) AS qtd_rec
+            FROM com_pedido p
+            JOIN com_pedido_nfe_vinculo v ON v.pedido_id = p.id
+            JOIN com_pedido_nfe_vinculo_item vi ON vi.vinculo_id = v.id
+            WHERE p.status IN ('Liberado', 'Em Trânsito parcialmente')
+              AND COALESCE(v.confirmado, false) = true
+              AND COALESCE(v.rejeitado, false) = false
+            GROUP BY vi.pro_codigo::text
+        )
+        SELECT b.*,
+               GREATEST(COALESCE(ped.qtd_ped,0) - COALESCE(rec.qtd_rec,0), 0) AS em_transito
+        FROM base b
+        LEFT JOIN pedido   ped ON ped.pro_codigo = b.pro_codigo::text
+        LEFT JOIN recebido rec ON rec.pro_codigo = b.pro_codigo::text
+    """)
+    return [dict(r) for r in conn.execute(sql).mappings().all()]
+
+
+@app.get("/compras/sugestao")
+def sugestao_compra(
+    fornecedor: Optional[str] = None,
+    curva: Optional[str] = None,
+    apenas_zerados: bool = False,
+    usar_estoque_realtime: bool = True,
+    consolidar_grupo: bool = True,
+):
+    """
+    Lista o que COMPRAR, agrupado por fornecedor, usando o ponto de pedido.
+
+      Posição   = estoque atual (ERP) + em trânsito (pedidos Liberado / Em Trânsito parcialmente,
+                  já descontado o que foi recebido por NF)
+      Comprar?  = Posição <= ponto de pedido
+      Quanto?   = Máximo - Posição
+
+    Com consolidar_grupo=True (padrão): usa o mín/máx CONSOLIDADO do grupo (mesma descrição,
+    várias marcas), soma a posição de todas as marcas e devolve 1 linha por grupo; produtos
+    "Sob Encomenda" (originais) são omitidos. Com False: usa o mín/máx individual por marca.
+    """
+    conn = get_db_connection()
+    try:
+        items = _carregar_itens_sugestao(conn)
+    finally:
+        conn.close()
+
+    stock_map = {}
+    if usar_estoque_realtime:
+        try:
+            stock_map = get_all_realtime_stocks()
+        except Exception as e:
+            print(f"AVISO: estoque realtime indisponível, usando snapshot. {e}")
+
+    return montar_sugestao_compra(
+        items, stock_map,
+        consolidar_grupo=consolidar_grupo,
+        usar_estoque_realtime=usar_estoque_realtime,
+        fornecedor=fornecedor,
+        curva=curva,
+        apenas_zerados=apenas_zerados,
+    )

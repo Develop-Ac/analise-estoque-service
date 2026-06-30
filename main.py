@@ -13,6 +13,7 @@ from email import encoders
 import os
 import uuid
 import sys
+import math
 # Imports para PostgreSQL
 import psycopg2
 from sqlalchemy import create_engine, text
@@ -45,6 +46,92 @@ EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", "email_destino@exemplo.com")
 # Configurações PostgreSQL
 POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://usuario:senha@host:5432/database")
 TABELA_FIFO = "com_fifo_completo"
+
+# ==========================================
+# PARÂMETROS DE REPOSIÇÃO / ESTOQUE DE SEGURANÇA
+# ==========================================
+# Janela recente usada como base da demanda e da variabilidade (substitui a
+# média desde 2005). ABC também passa a ser calculada sobre esta janela.
+JANELA_DEMANDA_MESES = int(os.getenv("JANELA_DEMANDA_MESES", 12))
+
+# Lead time (prazo de reposição) em dias. Não há prazo por fornecedor no ERP,
+# então usamos um valor global configurável (a regra do subgrupo 154 segue
+# valendo no ciclo, em regras_dias).
+LEAD_TIME_DIAS = int(os.getenv("LEAD_TIME_DIAS", 17))
+
+# Z (fator de nível de serviço) por curva — A=98%, B=95%, C=90%, D=85%.
+# Estoque de segurança = Z * sigma_demanda_dia * sqrt(lead_time)  (Silver-Pyke).
+Z_POR_CURVA = {
+    "A": float(os.getenv("Z_CURVA_A", 2.054)),  # 98%
+    "B": float(os.getenv("Z_CURVA_B", 1.645)),  # 95%
+    "C": float(os.getenv("Z_CURVA_C", 1.282)),  # 90%
+    "D": float(os.getenv("Z_CURVA_D", 1.036)),  # 85%
+}
+
+# Limiares XYZ pelo coeficiente de variação (CV) da demanda mensal.
+#   X = previsível (CV baixo) | Y = média | Z = errática (CV alto)
+XYZ_LIMIAR_X = float(os.getenv("XYZ_LIMIAR_X", 0.5))
+XYZ_LIMIAR_Y = float(os.getenv("XYZ_LIMIAR_Y", 1.0))
+
+# Tratamento de outliers da VENDA_PERDIDA (cap por evento). Poucos lançamentos
+# atípicos (cotações grandes / erro de digitação) concentram a maior parte da
+# quantidade, então limitamos cada apontamento.
+VP_CAP_MULT = float(os.getenv("VP_CAP_MULT", 3.0))    # x venda média por evento do item
+VP_CAP_PISO = float(os.getenv("VP_CAP_PISO", 5.0))    # teto mínimo por evento (un)
+VP_CAP_TETO = float(os.getenv("VP_CAP_TETO", 200.0))  # teto absoluto por evento (un)
+
+# Dias médios por mês (conversão sigma mensal -> diário)
+DIAS_POR_MES = 30.44
+
+# Teto do estoque de segurança, em nº de ciclos de demanda da classe.
+# Evita que itens A/Z (demanda intermitente) peçam segurança exagerada, onde a
+# hipótese de normalidade do SS clássico superestima. 0 ou negativo = sem teto.
+SS_CAP_CICLOS = float(os.getenv("SS_CAP_CICLOS", 1.0))
+
+# ==========================================
+# AGRUPAMENTO POR PRODUTO (consolida marcas) E PRODUTOS ORIGINAIS
+# ==========================================
+# O "mesmo produto" é agrupado pela DESCRIÇÃO (a marca fica no mar_codigo), e a
+# demanda é consolidada entre as marcas (substitutos). Produtos ORIGINAIS
+# (montadora/genuíno) saem do cálculo estocado — são por encomenda.
+# Regra do original: marca contém ORIGINAL/GENUINO, MENOS as exceções abaixo
+# (marcas aftermarket que só usam "original" no nome).
+MARCAS_ORIGINAL_EXCECOES = [s.strip().upper() for s in os.getenv(
+    "MARCAS_ORIGINAL_EXCECOES", "DECAL LINE,DRIFT,INDUSTRIA ORIGINAL,ORIGINAL PARTS"
+).split(",") if s.strip()]
+
+def marca_eh_original(mar):
+    """True se a marca é OEM/encomenda (montadora-original ou genuíno)."""
+    m = str(mar or "").upper()
+    if not ("ORIGINAL" in m or "ORIGINAIS" in m or "GENUINO" in m):
+        return False
+    return not any(ex in m for ex in MARCAS_ORIGINAL_EXCECOES)
+
+# Nível de serviço (PROBABILIDADE) por curva — usado no ponto de pedido via
+# Poisson/Binomial Negativa para itens intermitentes (espelha os Z acima).
+NS_POR_CURVA = {
+    "A": float(os.getenv("NS_CURVA_A", 0.98)),
+    "B": float(os.getenv("NS_CURVA_B", 0.95)),
+    "C": float(os.getenv("NS_CURVA_C", 0.90)),
+    "D": float(os.getenv("NS_CURVA_D", 0.85)),
+}
+
+# Croston/SBA: constante de suavização (a correção de viés usa 1 - alpha/2).
+ALPHA_CROSTON = float(os.getenv("ALPHA_CROSTON", 0.1))
+
+# Limiares Syntetos-Boylan-Croston (classificação do padrão de demanda):
+#   ADI  = intervalo médio entre vendas (esparsidade)
+#   CV²  = variabilidade do tamanho das vendas
+SBC_ADI = float(os.getenv("SBC_ADI", 1.32))
+SBC_CV2 = float(os.getenv("SBC_CV2", 0.49))
+
+# Sazonalidade (índice por subgrupo, anos completos)
+SAZ_ANOS = int(os.getenv("SAZ_ANOS", 5))
+SAZ_AMPLITUDE_MIN = float(os.getenv("SAZ_AMPLITUDE_MIN", 1.5))  # pico/vale mínimo p/ ser "sazonal"
+SAZ_VOL_MIN = float(os.getenv("SAZ_VOL_MIN", 300))             # volume anual mínimo do subgrupo
+SAZ_CONSIST_MIN = float(os.getenv("SAZ_CONSIST_MIN", 0.6))     # consistência do trimestre de pico
+SAZ_FATOR_MIN = float(os.getenv("SAZ_FATOR_MIN", 0.5))         # trava do fator sazonal
+SAZ_FATOR_MAX = float(os.getenv("SAZ_FATOR_MAX", 2.0))
 
 # ==========================================
 # CONEXÃO ODBC / CARGA DE DADOS
@@ -252,8 +339,94 @@ def criar_tabela_postgres():
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='pro_referencia') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN pro_referencia VARCHAR(50);
         END IF;
+
+        -- ===== Estoque de segurança estatístico / ABC-XYZ / venda perdida =====
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='demanda_real_dia') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN demanda_real_dia DECIMAL(15,6);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='sigma_demanda_dia') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN sigma_demanda_dia DECIMAL(15,6);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='cv_demanda') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN cv_demanda DECIMAL(10,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='classe_xyz') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN classe_xyz VARCHAR(2);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='estoque_seguranca') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN estoque_seguranca INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='nivel_servico_z') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN nivel_servico_z DECIMAL(6,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='lead_time_dias') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN lead_time_dias INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='venda_perdida_12m') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN venda_perdida_12m DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='valor_vendido_12m') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN valor_vendido_12m DECIMAL(15,4);
+        END IF;
+
+        -- ===== Padrão de demanda (Croston/Poisson) + sazonalidade =====
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='padrao_demanda') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN padrao_demanda VARCHAR(20);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='metodo_reposicao') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN metodo_reposicao VARCHAR(30);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='fator_sazonal') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN fator_sazonal DECIMAL(8,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='demanda_planejamento_dia') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN demanda_planejamento_dia DECIMAL(15,6);
+        END IF;
+
+        -- ===== Originais (encomenda) + cálculo consolidado por grupo (descrição) =====
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='sob_encomenda') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN sob_encomenda BOOLEAN DEFAULT FALSE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_chave') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_chave VARCHAR(255);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_qtd_itens') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_qtd_itens INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_estoque_disponivel') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_estoque_disponivel DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_demanda_dia') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_demanda_dia DECIMAL(15,6);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_fator_sazonal') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_fator_sazonal DECIMAL(8,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_curva') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_curva VARCHAR(10);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_padrao') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_padrao VARCHAR(20);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_metodo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_metodo VARCHAR(30);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_estoque_min') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_estoque_min INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_estoque_max') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_estoque_max INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_estoque_seguranca') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_estoque_seguranca INTEGER;
+        END IF;
     END
     $$;
+
+    CREATE INDEX IF NOT EXISTS idx_com_fifo_classe_xyz ON com_fifo_completo (classe_xyz);
+    CREATE INDEX IF NOT EXISTS idx_com_fifo_padrao_demanda ON com_fifo_completo (padrao_demanda);
+    CREATE INDEX IF NOT EXISTS idx_com_fifo_grupo_chave ON com_fifo_completo (grupo_chave);
+    CREATE INDEX IF NOT EXISTS idx_com_fifo_sob_encomenda ON com_fifo_completo (sob_encomenda);
 
     CREATE INDEX IF NOT EXISTS idx_com_fifo_group_id ON com_fifo_completo (group_id);
     CREATE INDEX IF NOT EXISTS idx_rel_group_id ON com_relacionamento_itens (group_id);
@@ -280,21 +453,26 @@ def criar_tabela_postgres():
         raise
 
 
-def carregar_dados_do_banco():
+def carregar_dados_do_banco(corte=None):
     """
     Lê do banco as "abas" lógicas:
-      - SAIDAS_GERAL  (saídas detalhadas a partir de 2005)
+      - SAIDAS_GERAL  (saídas detalhadas a partir de `corte`, default 2005)
       - ENTRADAS
       - DEVOLUCOES
       - SALDO_PRODUTO (estoque atual)
+
+    `corte` (YYYY-MM-DD ou None): no modo incremental (empacotamento), só lê
+    movimento de saída/entrada a partir do corte (janela). As camadas anteriores
+    vêm do pacote no Mongo. None = carga completa (desde 2005), usada no backfill.
     """
     conn = get_connection()
 
+    data_ini = str(corte) if corte else "2005-01-01"
+
     # >>>>>>>>>>>>> SQLs <<<<<<<<<<<<
 
-    # MUDANÇA: Buscando todas as saídas desde 2005, sem consolidação pré-2020
-    # MUDANÇA: Usando OPENQUERY para performance e acesso ao Linked Server
-    sql_saidas_geral = """
+    # Saídas a partir de `data_ini` (OPENQUERY no Linked Server CONSULTA).
+    sql_saidas_geral = f"""
     SELECT * FROM OPENQUERY(CONSULTA, '
         SELECT
             LE.pro_codigo,
@@ -307,16 +485,16 @@ def carregar_dados_do_banco():
             LE.origem,
             LE.quantidade
         FROM lanctos_estoque LE
-        WHERE LE.data    >= ''2005-01-01''
+        WHERE LE.data    >= ''{data_ini}''
           AND LE.empresa = 3
-          AND LE.origem IN (''NFS'',''EVF'', ''EFD'')   
+          AND LE.origem IN (''NFS'',''EVF'', ''EFD'')
           AND NOT EXISTS (
                 SELECT 1
                 FROM lanctos_estoque C
                 WHERE C.empresa = LE.empresa
                   AND C.nfs     = LE.nfs
                   AND C.origem  = ''CNS''
-                  AND C.data    >= ''2005-01-01''
+                  AND C.data    >= ''{data_ini}''
             )
         ORDER BY
             LE.pro_codigo ASC,
@@ -325,7 +503,7 @@ def carregar_dados_do_banco():
     ')
     """
 
-    sql_entradas = """
+    sql_entradas = f"""
     SELECT * FROM OPENQUERY(CONSULTA, '
         SELECT
             LE.pro_codigo,
@@ -347,7 +525,7 @@ def carregar_dados_do_banco():
                 ROWS UNBOUNDED PRECEDING
             ) AS qtd_acumulada
         FROM lanctos_estoque LE
-        WHERE LE.data >= ''2005-01-01''
+        WHERE LE.data >= ''{data_ini}''
           AND LE.origem IN (''NFE'',''CNE'',''LIA'',''CAD'',''CDE'')
           AND LE.empresa = 3
         ORDER BY
@@ -404,17 +582,37 @@ def carregar_dados_do_banco():
     ')
     """
 
+    # Venda perdida (demanda observada perdida) — base para correção de demanda
+    # censurada. Tabela pequena (empresa 3); filtramos a janela no pandas.
+    sql_venda_perdida = """
+    SELECT * FROM OPENQUERY(CONSULTA, '
+        SELECT
+            vp.pro_codigo,
+            vp.quantidade,
+            vp.data
+        FROM venda_perdida vp
+        WHERE vp.empresa = 3
+          AND vp.quantidade > 0
+    ')
+    """
+
     print("\nLendo dados do banco via ODBC...")
 
     df_saidas      = pd.read_sql(sql_saidas_geral,  conn)
     df_ent         = pd.read_sql(sql_entradas,      conn)
     df_dev         = pd.read_sql(sql_devolucoes,    conn)
     df_saldo_produto = pd.read_sql(sql_saldo_produto, conn)
+    try:
+        df_vp      = pd.read_sql(sql_venda_perdida,  conn)
+    except Exception as e:
+        print(f"  - AVISO: falha ao ler VENDA_PERDIDA ({e}). Seguindo sem ela.")
+        df_vp = pd.DataFrame(columns=["PRO_CODIGO", "QUANTIDADE", "DATA"])
 
     print(f"  - Saídas carregadas: {len(df_saidas)} registros")
     print(f"  - Entradas carregadas: {len(df_ent)} registros")
     print(f"  - Devoluções carregadas: {len(df_dev)} registros")
     print(f"  - Produtos (Saldo) carregados: {len(df_saldo_produto)} registros")
+    print(f"  - Venda perdida carregada: {len(df_vp)} registros")
 
     # Normalizar nomes das colunas de saldo_produto
     df_saldo_produto = df_saldo_produto.rename(columns={
@@ -447,7 +645,7 @@ def carregar_dados_do_banco():
         print("DEBUG: SGR_DESCRICAO não encontrada no DataFrame!")
 
     conn.close()
-    return df_saidas, df_ent, df_dev, df_saldo_produto
+    return df_saidas, df_ent, df_dev, df_saldo_produto, df_vp
 
 def aplicar_analise_agrupada(df_met: pd.DataFrame) -> pd.DataFrame:
     """
@@ -497,16 +695,11 @@ def aplicar_analise_agrupada(df_met: pd.DataFrame) -> pd.DataFrame:
         cols_sum_base = [
             "ESTOQUE_DISPONIVEL",
             "QTD_VENDIDA",
-            "VALOR_VENDIDO",
             "NUM_VENDAS",
             "VENDAS_ULT_12M",
-            "VENDAS_12M_ANT",
             "ESTOQUE_MIN_BASE",
             "ESTOQUE_MAX_BASE",
-            # <<< aqui é o que você pediu: somar AJUSTADO no grupo >>>
-            "ESTOQUE_MIN_AJUSTADO",
-            "ESTOQUE_MAX_AJUSTADO",
-            # (opcional) também somar sugerido para consulta/exibição, sem mexer no individual
+            # soma do sugerido para consulta/exibição, sem mexer no individual
             "ESTOQUE_MIN_SUGERIDO",
             "ESTOQUE_MAX_SUGERIDO",
         ]
@@ -572,11 +765,400 @@ def aplicar_analise_agrupada(df_met: pd.DataFrame) -> pd.DataFrame:
 # MÉTRICAS, ABC, TENDÊNCIA, ESTOQUE MIN/MÁX
 # ==========================================
 
+def _quantil_demanda(media, var, p, z):
+    """
+    Ponto de pedido = quantil (nível p) da demanda no horizonte, escolhendo a
+    distribuição certa para o padrão:
+      - media<=0            -> 0
+      - media grande (>=60) -> aproximação Normal: media + z*sqrt(var)
+      - var ~ media         -> Poisson exata (demanda intermitente)
+      - var > media         -> Binomial Negativa exata (demanda grumosa/sobredispersa)
+    Retorna inteiro.
+    """
+    try:
+        media = float(media); var = float(var); p = float(p); z = float(z)
+    except (TypeError, ValueError):
+        return 0
+    if media <= 0:
+        return 0
+    var = max(var, media)  # nunca abaixo da Poisson (var=media)
+
+    if media >= 60:
+        return int(math.ceil(media + z * math.sqrt(var)))
+
+    # Poisson exata
+    if var <= media * 1.10:
+        cdf = 0.0; pmf = math.exp(-media); k = 0
+        while k < 100000:
+            cdf += pmf
+            if cdf >= p:
+                return k
+            k += 1
+            pmf *= media / k
+        return k
+
+    # Binomial Negativa (mean=media, var=var): r>0, 0<pr<1
+    r = media * media / (var - media)
+    pr = r / (r + media)
+    cdf = 0.0
+    pmf = pr ** r            # P(X=0)
+    k = 0
+    while k < 100000:
+        cdf += pmf
+        if cdf >= p:
+            return k
+        k += 1
+        pmf *= (k + r - 1) / k * (1 - pr)
+    return k
+
+
+def calcular_indices_sazonais(df_sai_fifo: pd.DataFrame,
+                              df_saldo_produto: pd.DataFrame,
+                              hoje: pd.Timestamp,
+                              anos: int = SAZ_ANOS,
+                              vendas_mensais_extra: pd.DataFrame = None) -> dict:
+    """
+    Índice sazonal multiplicativo por SUBGRUPO, em anos completos.
+    Normaliza cada ano pela sua média mensal (remove crescimento) e tira a média
+    entre anos. Marca como confiável só quando há amplitude, volume, histórico e
+    CONSISTÊNCIA (pico no mesmo trimestre na maioria dos anos) — evita rotular
+    ruído de item de baixo giro como sazonal.
+
+    Retorna: { sgr_codigo(int): {"idx": [12 índices jan..dez], "confiavel": bool} }
+    """
+    ano_fim = hoje.year - 1            # último ano completo
+    ano_ini = ano_fim - anos + 1
+    if df_saldo_produto.empty:
+        return {}
+
+    sp = df_saldo_produto.copy()
+    sp["PRO_CODIGO"] = sp["PRO_CODIGO"].astype(str).str.strip()
+    pro2sgr = sp.dropna(subset=["SGR_CODIGO"]).set_index("PRO_CODIGO")["SGR_CODIGO"].to_dict()
+
+    s = df_sai_fifo[["PRO_CODIGO", "DATA", "QUANTIDADE_AJUSTADA"]].copy()
+    s["DATA"] = pd.to_datetime(s["DATA"], errors="coerce")
+    s["PRO_CODIGO"] = s["PRO_CODIGO"].astype(str).str.strip()
+    s = s[(s["DATA"].dt.year >= ano_ini) & (s["DATA"].dt.year <= ano_fim)]
+    s["SGR"] = s["PRO_CODIGO"].map(pro2sgr)
+    s = s.dropna(subset=["SGR"])
+    s["ANO"] = s["DATA"].dt.year
+    s["MES"] = s["DATA"].dt.month
+    partes_agg = [s[["SGR", "ANO", "MES", "QUANTIDADE_AJUSTADA"]]]
+
+    # Meses CONGELADOS no pacote (modo incremental): SGR_CODIGO, ANO, MES, QTD
+    if vendas_mensais_extra is not None and not vendas_mensais_extra.empty:
+        ex = vendas_mensais_extra.copy()
+        ex = ex[(ex["ANO"] >= ano_ini) & (ex["ANO"] <= ano_fim)]
+        if not ex.empty:
+            ex = ex.rename(columns={"SGR_CODIGO": "SGR", "QTD": "QUANTIDADE_AJUSTADA"})
+            partes_agg.append(ex[["SGR", "ANO", "MES", "QUANTIDADE_AJUSTADA"]])
+
+    base = pd.concat(partes_agg, ignore_index=True)
+    if base.empty:
+        return {}
+    agg = base.groupby(["SGR", "ANO", "MES"])["QUANTIDADE_AJUSTADA"].sum().reset_index()
+
+    indices = {}
+    for sgr, g in agg.groupby("SGR"):
+        piv = g.pivot_table(index="ANO", columns="MES",
+                            values="QUANTIDADE_AJUSTADA", aggfunc="sum").reindex(columns=range(1, 13))
+        piv = piv.dropna(how="all")
+        if piv.shape[0] < 3:
+            continue
+        media_ano = piv.mean(axis=1)
+        norm = piv.div(media_ano, axis=0)
+        idx = norm.mean(axis=0)
+        if idx.isna().any() or idx.sum() == 0:
+            continue
+        idx = idx / idx.mean()
+        vol = float(piv.sum(axis=1).mean())
+        amp = float(idx.max() / idx.min()) if idx.min() > 0 else np.inf
+        tri_geral = (int(idx.idxmax()) - 1) // 3
+        tri_ano = ((piv.idxmax(axis=1) - 1) // 3)
+        consist = float((tri_ano == tri_geral).mean())
+        confiavel = (vol >= SAZ_VOL_MIN) and (amp >= SAZ_AMPLITUDE_MIN) and (consist >= SAZ_CONSIST_MIN)
+        try:
+            key = int(sgr)
+        except (TypeError, ValueError):
+            continue
+        indices[key] = {"idx": [float(idx.get(m, 1.0)) for m in range(1, 13)],
+                        "confiavel": bool(confiavel)}
+    return indices
+
+
+def _fator_sazonal_forward(indices_sgr, hoje, horizonte_dias):
+    """Fator sazonal médio dos meses cobertos por [hoje, hoje+horizonte]."""
+    if not indices_sgr or not indices_sgr.get("confiavel"):
+        return 1.0
+    idx = indices_sgr["idx"]
+    fim = hoje + pd.Timedelta(days=int(horizonte_dias))
+    meses = pd.period_range(hoje.to_period("M"), fim.to_period("M"), freq="M")
+    vals = [idx[m.month - 1] for m in meses]
+    if not vals:
+        return 1.0
+    return float(min(max(float(np.mean(vals)), SAZ_FATOR_MIN), SAZ_FATOR_MAX))
+
+
+def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
+                                             df_vp: pd.DataFrame,
+                                             hoje: pd.Timestamp,
+                                             janela_meses: int = JANELA_DEMANDA_MESES) -> pd.DataFrame:
+    """
+    Demanda real recente por produto na janela de `janela_meses`, somando
+    vendas + venda perdida observada (com cap por evento). Base para:
+      - demanda média diária (substitui a média desde 2005 e o fator de ruptura);
+      - desvio-padrão diário da demanda -> estoque de segurança estatístico;
+      - coeficiente de variação (CV) -> classe XYZ;
+      - valor vendido na janela -> curva ABC recente.
+
+    Retorna DataFrame por PRO_CODIGO com:
+      DEM_DIA_VENDAS, DEM_DIA_REAL, SIGMA_DEMANDA_DIA, CV_DEMANDA,
+      VENDA_PERDIDA_12M, VALOR_VENDIDO_12M
+    """
+    data_ini = (hoje - pd.DateOffset(months=janela_meses)).normalize()
+    dias_janela = max((hoje - data_ini).days, 1)
+    meses = pd.period_range(data_ini.to_period("M"), hoje.to_period("M"), freq="M")
+    n_meses = max(len(meses), 1)
+
+    # ---------- Vendas na janela ----------
+    s = df_sai_fifo[["PRO_CODIGO", "DATA", "QUANTIDADE_AJUSTADA"]].copy()
+    s["DATA"] = pd.to_datetime(s["DATA"], errors="coerce")
+    s["PRO_CODIGO"] = s["PRO_CODIGO"].astype(str).str.strip()
+    s["QUANTIDADE_AJUSTADA"] = pd.to_numeric(s["QUANTIDADE_AJUSTADA"], errors="coerce").fillna(0)
+    if "TOTAL_LIQUIDO" in df_sai_fifo.columns:
+        s["TOTAL_LIQUIDO"] = pd.to_numeric(df_sai_fifo["TOTAL_LIQUIDO"], errors="coerce").fillna(0).values
+    else:
+        s["TOTAL_LIQUIDO"] = 0.0
+    s = s[(s["DATA"] >= data_ini) & (s["DATA"] <= hoje)]
+    s["MES"] = s["DATA"].dt.to_period("M")
+
+    vendas_mes = s.groupby(["PRO_CODIGO", "MES"])["QUANTIDADE_AJUSTADA"].sum()
+    valor_12m = s.groupby("PRO_CODIGO")["TOTAL_LIQUIDO"].sum()
+
+    # venda média por evento (linha de venda) — usada como referência do cap da VP
+    linhas = s.groupby("PRO_CODIGO")["QUANTIDADE_AJUSTADA"].agg(["sum", "count"])
+    media_evento = (linhas["sum"] / linhas["count"]).replace([np.inf, -np.inf], np.nan)
+
+    # ---------- Venda perdida (cap por evento) ----------
+    vp_mes = pd.Series(dtype=float)
+    vp_total = pd.Series(dtype=float)
+    qtd_capada = 0.0
+    n_vp_janela = 0
+    if df_vp is not None and not df_vp.empty:
+        v = df_vp.rename(columns={c: str(c).upper() for c in df_vp.columns}).copy()
+        v["PRO_CODIGO"] = v["PRO_CODIGO"].astype(str).str.strip()
+        v["DATA"] = pd.to_datetime(v["DATA"], errors="coerce")
+        v["QUANTIDADE"] = pd.to_numeric(v["QUANTIDADE"], errors="coerce").fillna(0)
+        v = v[(v["DATA"] >= data_ini) & (v["DATA"] <= hoje) & (v["QUANTIDADE"] > 0)]
+        n_vp_janela = len(v)
+        if not v.empty:
+            cap = media_evento.reindex(v["PRO_CODIGO"].values).fillna(0).to_numpy() * VP_CAP_MULT
+            cap = np.maximum(cap, VP_CAP_PISO)
+            cap = np.minimum(cap, VP_CAP_TETO)
+            q_orig = v["QUANTIDADE"].to_numpy(dtype=float)
+            q_cap = np.minimum(q_orig, cap)
+            qtd_capada = float((q_orig - q_cap).sum())
+            v = v.assign(Q_CAP=q_cap)
+            v["MES"] = v["DATA"].dt.to_period("M")
+            vp_mes = v.groupby(["PRO_CODIGO", "MES"])["Q_CAP"].sum()
+            vp_total = v.groupby("PRO_CODIGO")["Q_CAP"].sum()
+
+    print(f"  - Venda perdida na janela ({janela_meses}m): {n_vp_janela} apontamentos; "
+          f"quantidade aparada pelo cap: {qtd_capada:.0f} un")
+
+    # ---------- Demanda mensal real = vendas + venda perdida ----------
+    demanda_mes = vendas_mes.add(vp_mes, fill_value=0)
+
+    if demanda_mes.empty:
+        return pd.DataFrame(columns=["PRO_CODIGO", "DEM_DIA_VENDAS", "DEM_DIA_REAL",
+                                     "SIGMA_DEMANDA_DIA", "CV_DEMANDA",
+                                     "VENDA_PERDIDA_12M", "VALOR_VENDIDO_12M",
+                                     "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES"])
+
+    mat = demanda_mes.unstack(fill_value=0).reindex(columns=meses, fill_value=0)
+    vendas_mat = (vendas_mes.unstack(fill_value=0).reindex(columns=meses, fill_value=0)
+                  if not vendas_mes.empty else pd.DataFrame(index=mat.index))
+
+    res = pd.DataFrame(index=mat.index)
+    res["DEM_DIA_REAL"] = mat.sum(axis=1) / dias_janela
+    sigma_mes = mat.std(axis=1, ddof=1) if n_meses > 1 else pd.Series(0.0, index=mat.index)
+    media_mes = mat.mean(axis=1)
+    # variância escala com o tempo -> sigma_dia = sigma_mes / sqrt(dias por mês)
+    res["SIGMA_DEMANDA_DIA"] = sigma_mes / np.sqrt(dias_janela / n_meses)
+    res["CV_DEMANDA"] = np.where(media_mes > 0, sigma_mes / media_mes, 0.0)
+
+    # ---------- Padrão de demanda (Syntetos-Boylan-Croston) ----------
+    # ADI = nº de meses / meses com venda ; CV² = variância/média² dos tamanhos
+    nz = (mat > 0).sum(axis=1).astype(float)
+    sums = mat.sum(axis=1).astype(float)
+    sumsq = (mat * mat).sum(axis=1).astype(float)
+    nz_safe = nz.replace(0, np.nan)
+    mean_size = sums / nz_safe
+    var_size = (sumsq / nz_safe) - mean_size ** 2
+    res["ADI"] = (float(n_meses) / nz_safe).fillna(9999.0)
+    res["CV2_TAMANHO"] = (var_size.clip(lower=0) / (mean_size ** 2)).where(mean_size > 0, 0.0).fillna(0.0)
+    # tamanho médio do lote (qtd dos meses com venda) — base da Poisson composta
+    res["MEAN_SIZE_MES"] = mean_size.fillna(0.0)
+    res["VENDA_PERDIDA_12M"] = vp_total.reindex(mat.index).fillna(0) if not vp_total.empty else 0.0
+    res["VALOR_VENDIDO_12M"] = valor_12m.reindex(mat.index).fillna(0)
+    if not vendas_mat.empty:
+        res["DEM_DIA_VENDAS"] = vendas_mat.reindex(index=mat.index).fillna(0).sum(axis=1) / dias_janela
+    else:
+        res["DEM_DIA_VENDAS"] = 0.0
+
+    res = res.reset_index().rename(columns={res.index.name or "index": "PRO_CODIGO"})
+    if "PRO_CODIGO" not in res.columns:
+        res = res.rename(columns={res.columns[0]: "PRO_CODIGO"})
+    return res
+
+
+# Cobertura por classe: (dias_min, dias_max). A diferença vira o "dias de ciclo"
+# (lote de reposição). Subgrupo 154 = giro mais lento.
+REGRAS_DIAS = {
+    "default": {"A": (20, 60), "B": (30, 90), "C": (45, 120), "D": (0, 45)},
+    154:       {"A": (45, 120), "B": (60, 180), "C": (90, 240), "D": (0, 120)},
+}
+
+def _classificar_padrao(dem, adi, cv2):
+    if (dem or 0) <= 0:
+        return "Sem_Giro"
+    try:
+        adi = float(adi); cv2 = float(cv2)
+    except (TypeError, ValueError):
+        return "Suave"
+    if adi < SBC_ADI and cv2 < SBC_CV2:
+        return "Suave"
+    if adi < SBC_ADI:
+        return "Erratico"
+    if cv2 < SBC_CV2:
+        return "Intermitente"
+    return "Grumoso"
+
+def calcular_min_max(curva, dem, sigma_dia, padrao, sgr, data_max, cv2, msize, hoje):
+    """
+    Min/Máx (s,S) escolhendo o método pelo padrão de demanda:
+      - Suave/Errático -> Normal: SS=Z·σ·√LT (teto N ciclos); min=d·LT+SS; max=min+d·ciclo
+      - Intermitente/Grumoso -> Poisson composta: quantil da distribuição discreta
+    `dem` já deve vir sazonalizada. Retorna dict (min, max, ss, z).
+    """
+    regra = REGRAS_DIAS.get(sgr, REGRAS_DIAS["default"])
+    z = Z_POR_CURVA.get(curva, Z_POR_CURVA["C"])
+    try: sigma_dia = float(sigma_dia) if not pd.isna(sigma_dia) else 0.0
+    except (TypeError, ValueError): sigma_dia = 0.0
+    try: dem = float(dem) if not pd.isna(dem) else 0.0
+    except (TypeError, ValueError): dem = 0.0
+    if dem <= 0 or curva not in regra:
+        return {"ESTOQUE_MIN_BASE": 0, "ESTOQUE_MAX_BASE": 0, "ESTOQUE_SEGURANCA": 0, "NIVEL_SERVICO_Z": 0.0}
+    dmin, dmax = regra[curva]; dias_ciclo = max(dmax - dmin, 1)
+    if padrao in ("Intermitente", "Grumoso"):
+        dem_c = dem * (1 - ALPHA_CROSTON / 2.0); p = NS_POR_CURVA.get(curva, 0.90)
+        try: cv2 = float(cv2 or 0.0); msize = float(msize or 0.0)
+        except (TypeError, ValueError): cv2, msize = 0.0, 0.0
+        disp = max(msize * (1.0 + cv2), 1.0)
+        media_lt = dem_c * LEAD_TIME_DIAS; media_ltc = dem_c * (LEAD_TIME_DIAS + dias_ciclo)
+        rop = _quantil_demanda(media_lt, media_lt * disp, p, z)
+        S = _quantil_demanda(media_ltc, media_ltc * disp, p, z)
+        est_min = int(rop); est_max = int(max(S, rop + 1)); est_ss = int(max(rop - media_lt, 0))
+    else:
+        ss = z * sigma_dia * np.sqrt(LEAD_TIME_DIAS)
+        if SS_CAP_CICLOS and SS_CAP_CICLOS > 0:
+            ss = min(ss, dem * dias_ciclo * SS_CAP_CICLOS)
+        rop = dem * LEAD_TIME_DIAS + ss; max_nivel = rop + dem * dias_ciclo
+        est_min = int(np.ceil(rop)); est_max = int(np.ceil(max_nivel)); est_ss = int(np.ceil(ss))
+    dias_corte = 365 if sgr == 154 else 240
+    if not pd.isna(data_max) and (hoje - data_max).days > dias_corte:
+        est_min = 0; est_max = max(1, int(np.ceil(dem * 15))); est_ss = 0
+    return {"ESTOQUE_MIN_BASE": est_min, "ESTOQUE_MAX_BASE": est_max,
+            "ESTOQUE_SEGURANCA": est_ss, "NIVEL_SERVICO_Z": round(float(z), 4)}
+
+METODO_LABEL = {"Suave": "Normal (Z·σ·√LT)", "Erratico": "Normal (Z·σ·√LT)",
+                "Intermitente": "Croston+Poisson", "Grumoso": "Croston+Binomial Neg",
+                "Sem_Giro": "—"}
+
+def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz):
+    """
+    Cálculo CONSOLIDADO por grupo de produto (= descrição), somando a demanda de
+    TODAS as marcas (substitutos), EXCLUINDO os produtos ORIGINAIS (encomenda).
+    Reaproveita o mesmo motor de demanda/variabilidade, re-chaveando por descrição.
+    Retorna DataFrame por GRUPO com min/máx/SS consolidados (efeito de pooling).
+    """
+    sp = df_saldo_produto.copy()
+    sp["PRO_CODIGO"] = sp["PRO_CODIGO"].astype(str).str.strip()
+    sp["IS_ORIG"] = sp["MAR_DESCRICAO"].apply(marca_eh_original) if "MAR_DESCRICAO" in sp.columns else False
+    sp["GRUPO"] = sp["PRO_DESCRICAO"].astype(str).str.strip()
+    nao = sp[(~sp["IS_ORIG"]) & (sp["GRUPO"] != "")].copy()
+    if nao.empty:
+        return pd.DataFrame()
+    pro2grp = nao.set_index("PRO_CODIGO")["GRUPO"].to_dict()
+
+    sai = df_sai_fifo.copy()
+    sai["PRO_CODIGO"] = sai["PRO_CODIGO"].astype(str).str.strip()
+    sai["GRP"] = sai["PRO_CODIGO"].map(pro2grp)
+    sai = sai.dropna(subset=["GRP"]).copy()
+    sai["DATA"] = pd.to_datetime(sai["DATA"], errors="coerce")
+    dmax_grp = sai.groupby("GRP")["DATA"].max()
+    sai["PRO_CODIGO"] = sai["GRP"]  # re-chaveia: grupo vira o "produto"
+
+    vp = pd.DataFrame()
+    if df_vp is not None and not df_vp.empty:
+        vp = df_vp.rename(columns={c: str(c).upper() for c in df_vp.columns}).copy()
+        vp["PRO_CODIGO"] = vp["PRO_CODIGO"].astype(str).str.strip()
+        vp["GRP"] = vp["PRO_CODIGO"].map(pro2grp)
+        vp = vp.dropna(subset=["GRP"]).copy()
+        vp["PRO_CODIGO"] = vp["GRP"]
+
+    g = calcular_demanda_recente_e_variabilidade(sai, vp, hoje)
+    if g is None or g.empty:
+        return pd.DataFrame()
+    g = g.rename(columns={"PRO_CODIGO": "GRUPO"})
+
+    grp_sgr = nao.groupby("GRUPO")["SGR_CODIGO"].agg(lambda s: s.dropna().iloc[0] if s.dropna().size else None)
+    grp_est = pd.to_numeric(nao["ESTOQUE_DISPONIVEL"], errors="coerce").fillna(0).groupby(nao["GRUPO"]).sum()
+    grp_n = nao.groupby("GRUPO")["PRO_CODIGO"].nunique()
+
+    g["SGR_CODIGO"] = g["GRUPO"].map(grp_sgr)
+    g["DATA_MAX_VENDA"] = g["GRUPO"].map(dmax_grp)
+    g["GRUPO_ESTOQUE_DISPONIVEL"] = g["GRUPO"].map(grp_est).fillna(0.0)
+    g["GRUPO_QTD_ITENS"] = g["GRUPO"].map(grp_n).fillna(0).astype(int)
+
+    # ABC sobre o valor 12m do grupo
+    g = g.sort_values("VALOR_VENDIDO_12M", ascending=False).reset_index(drop=True)
+    tot = g["VALOR_VENDIDO_12M"].sum()
+    g["_PCT"] = (g["VALOR_VENDIDO_12M"].cumsum() / tot * 100) if tot > 0 else 0
+    g["GRUPO_CURVA"] = g["_PCT"].apply(lambda p: "A" if p <= 70 else "B" if p <= 90 else "C" if p <= 97 else "D")
+    g["GRUPO_PADRAO"] = g.apply(lambda r: _classificar_padrao(r["DEM_DIA_REAL"], r.get("ADI"), r.get("CV2_TAMANHO")), axis=1)
+
+    horiz = LEAD_TIME_DIAS + 60
+    def _fs(sgr):
+        try: k = int(sgr)
+        except (TypeError, ValueError): return 1.0
+        return _fator_sazonal_forward(indices_saz.get(k), hoje, horiz)
+    g["GRUPO_FATOR_SAZONAL"] = g["SGR_CODIGO"].apply(_fs)
+    g["GRUPO_DEMANDA_DIA"] = pd.to_numeric(g["DEM_DIA_REAL"], errors="coerce").fillna(0.0) * g["GRUPO_FATOR_SAZONAL"]
+
+    res = g.apply(lambda r: calcular_min_max(r["GRUPO_CURVA"], r["GRUPO_DEMANDA_DIA"], r["SIGMA_DEMANDA_DIA"],
+                  r["GRUPO_PADRAO"], r["SGR_CODIGO"], r["DATA_MAX_VENDA"], r.get("CV2_TAMANHO"),
+                  r.get("MEAN_SIZE_MES"), hoje), axis=1)
+    g["GRUPO_ESTOQUE_MIN"] = [x["ESTOQUE_MIN_BASE"] for x in res]
+    g["GRUPO_ESTOQUE_MAX"] = [x["ESTOQUE_MAX_BASE"] for x in res]
+    g["GRUPO_ESTOQUE_SEGURANCA"] = [x["ESTOQUE_SEGURANCA"] for x in res]
+    g["GRUPO_METODO"] = g["GRUPO_PADRAO"].map(METODO_LABEL).fillna("Normal (Z·σ·√LT)")
+
+    cols = ["GRUPO", "GRUPO_QTD_ITENS", "GRUPO_ESTOQUE_DISPONIVEL", "GRUPO_DEMANDA_DIA",
+            "GRUPO_FATOR_SAZONAL", "GRUPO_CURVA", "GRUPO_PADRAO", "GRUPO_METODO",
+            "GRUPO_ESTOQUE_MIN", "GRUPO_ESTOQUE_MAX", "GRUPO_ESTOQUE_SEGURANCA"]
+    return g[cols]
+
+
 def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                                     df_ent_valid: pd.DataFrame,
-                                    df_saldo_produto: pd.DataFrame) -> pd.DataFrame:
+                                    df_saldo_produto: pd.DataFrame,
+                                    df_vp: pd.DataFrame = None,
+                                    vendas_mensais_extra: pd.DataFrame = None) -> pd.DataFrame:
     """
-    Calcula métricas, min/max, tendência, ruptura, etc. (ORDENADO CORRETAMENTE)
+    Calcula métricas (demanda 12m + venda perdida), ABC/XYZ, padrão de demanda,
+    sazonalidade e min/máx. `vendas_mensais_extra` (modo incremental) traz os meses
+    congelados do pacote para a sazonalidade.
     """
     df = df_sai_fifo.copy()
     df["DATA"] = pd.to_datetime(df["DATA"], errors="coerce")
@@ -586,7 +1168,6 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     df["DPM"] = (df["DATA"] - df["DATA_COMPRA"]).dt.days
 
     hoje = pd.Timestamp.today().normalize()
-    data_inicio_ruptura = hoje - pd.DateOffset(days=730)
 
     metricas = []
     print("\nCalculando métricas por produto...")
@@ -603,74 +1184,29 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             tempo_medio = np.average(grp_dpm["DPM"], weights=grp_dpm["QUANTIDADE_AJUSTADA"])
 
         qtd_vendida = grp_valid["QUANTIDADE_AJUSTADA"].sum()
-        valor_vendido = grp_valid["TOTAL_LIQUIDO"].sum() if "TOTAL_LIQUIDO" in grp_valid.columns else np.nan
 
         data_min = grp_valid["DATA"].min()
         data_max = grp_valid["DATA"].max()
-        if pd.isna(data_min) or pd.isna(data_max):
-            periodo_dias = np.nan
-        else:
-            periodo_dias = max((data_max - data_min).days + 1, 1)
 
         num_vendas = len(grp_valid)
-        demanda_media_dia = (qtd_vendida / periodo_dias) if periodo_dias and periodo_dias > 0 else np.nan
 
-        # ===== Tendência ponderada (12m, 6m, 90d) =====
+        # Vendas dos últimos 12m (informativo). A demanda do modelo vem de
+        # calcular_demanda_recente_e_variabilidade (janela 12m + venda perdida);
+        # a tendência/sazonalidade do passado foi removida (sazonalidade forward
+        # já ajusta a demanda do próximo período).
         data_12m_ini = hoje - pd.DateOffset(months=12)
-        data_06m_ini = hoje - pd.DateOffset(months=6)
-        data_90d_ini = hoje - pd.DateOffset(days=90)
-
-        data_12m_ant_ini = hoje - pd.DateOffset(months=24)
-        data_06m_ant_ini = hoje - pd.DateOffset(months=12)
-        data_90d_ant_ini = hoje - pd.DateOffset(days=180)
-
-        vendas_12m_atual = grp_valid[(grp_valid["DATA"] >= data_12m_ini) & (grp_valid["DATA"] <= hoje)]["QUANTIDADE_AJUSTADA"].sum()
-        vendas_12m_ant   = grp_valid[(grp_valid["DATA"] >= data_12m_ant_ini) & (grp_valid["DATA"] < data_12m_ini)]["QUANTIDADE_AJUSTADA"].sum()
-
-        vendas_06m_atual = grp_valid[(grp_valid["DATA"] >= data_06m_ini) & (grp_valid["DATA"] <= hoje)]["QUANTIDADE_AJUSTADA"].sum()
-        vendas_06m_ant   = grp_valid[(grp_valid["DATA"] >= data_06m_ant_ini) & (grp_valid["DATA"] < data_06m_ini)]["QUANTIDADE_AJUSTADA"].sum()
-
-        vendas_90d_atual = grp_valid[(grp_valid["DATA"] >= data_90d_ini) & (grp_valid["DATA"] <= hoje)]["QUANTIDADE_AJUSTADA"].sum()
-        vendas_90d_ant   = grp_valid[(grp_valid["DATA"] >= data_90d_ant_ini) & (grp_valid["DATA"] < data_90d_ini)]["QUANTIDADE_AJUSTADA"].sum()
-
-        def calc_trend_ratio(atual, anterior):
-            if anterior > 0:
-                return atual / anterior
-            elif atual > 0:
-                return 2.0
-            else:
-                return 1.0
-
-        t12 = calc_trend_ratio(vendas_12m_atual, vendas_12m_ant)
-        t06 = calc_trend_ratio(vendas_06m_atual, vendas_06m_ant)
-        t90 = calc_trend_ratio(vendas_90d_atual, vendas_90d_ant)
-
-        fator_tendencia = (t12 * 0.20) + (t06 * 0.50) + (t90 * 0.30)
-        vendas_ult_12m = vendas_12m_atual
-
-        if pd.isna(fator_tendencia):
-            tendencia_label = "Sem Dados"
-        elif fator_tendencia >= 1.2:
-            tendencia_label = "Subindo"
-        elif fator_tendencia <= 0.8:
-            tendencia_label = "Caindo"
-        else:
-            tendencia_label = "Estável"
+        vendas_ult_12m = grp_valid[
+            (grp_valid["DATA"] >= data_12m_ini) & (grp_valid["DATA"] <= hoje)
+        ]["QUANTIDADE_AJUSTADA"].sum()
 
         metricas.append({
             "PRO_CODIGO": cod,
             "TEMPO_MEDIO_ESTOQUE": tempo_medio,
             "QTD_VENDIDA": qtd_vendida,
-            "VALOR_VENDIDO": valor_vendido,
             "DATA_MIN_VENDA": data_min,
             "DATA_MAX_VENDA": data_max,
-            "PERIODO_DIAS": periodo_dias,
-            "DEMANDA_MEDIA_DIA": demanda_media_dia,
             "NUM_VENDAS": num_vendas,
             "VENDAS_ULT_12M": vendas_ult_12m,
-            "VENDAS_12M_ANT": vendas_12m_ant,
-            "FATOR_TENDENCIA": fator_tendencia,
-            "TENDENCIA_LABEL": tendencia_label,
         })
 
     df_met = pd.DataFrame(metricas)
@@ -704,16 +1240,10 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                     "PRO_CODIGO": cod,
                     "TEMPO_MEDIO_ESTOQUE": np.nan,
                     "QTD_VENDIDA": 0,
-                    "VALOR_VENDIDO": 0,
                     "DATA_MIN_VENDA": pd.NaT,
                     "DATA_MAX_VENDA": pd.NaT,
-                    "PERIODO_DIAS": 0,
-                    "DEMANDA_MEDIA_DIA": 0,
                     "NUM_VENDAS": 0,
                     "VENDAS_ULT_12M": 0,
-                    "VENDAS_12M_ANT": 0,
-                    "FATOR_TENDENCIA": 1.0,
-                    "TENDENCIA_LABEL": "Sem Dados",
                 })
             
             # Adicionar ao DataFrame de métricas
@@ -725,69 +1255,37 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
         return df_met
 
     # ==========================================
-    # RUPTURA (2 anos) + DEMANDA AJUSTADA
+    # DEMANDA RECENTE + VARIABILIDADE (janela 12m, inclui VENDA_PERDIDA)
+    #   - substitui a demanda média desde 2005 pela demanda da janela recente
+    #   - traz sigma diário (estoque de segurança) e CV (classe XYZ)
     # ==========================================
-    print("Calculando dias de ruptura (últimos 2 anos)...")
+    print("Calculando demanda recente, venda perdida e variabilidade...")
+    df_met["PRO_CODIGO"] = df_met["PRO_CODIGO"].astype(str).str.strip()
+    df_rec = calcular_demanda_recente_e_variabilidade(df_sai_fifo, df_vp, hoje)
 
-    df_movs_sai = df_sai_fifo[["PRO_CODIGO", "DATA", "QUANTIDADE_AJUSTADA"]].copy()
-    df_movs_sai["QTD_MOV"] = -df_movs_sai["QUANTIDADE_AJUSTADA"]
+    cols_rec = ["DEM_DIA_VENDAS", "DEM_DIA_REAL", "SIGMA_DEMANDA_DIA",
+                "CV_DEMANDA", "VENDA_PERDIDA_12M", "VALOR_VENDIDO_12M",
+                "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES"]
+    if df_rec is not None and not df_rec.empty:
+        df_rec["PRO_CODIGO"] = df_rec["PRO_CODIGO"].astype(str).str.strip()
+        df_met = df_met.merge(df_rec[["PRO_CODIGO"] + cols_rec], on="PRO_CODIGO", how="left")
+    for c in cols_rec:
+        if c not in df_met.columns:
+            df_met[c] = 0.0
+        df_met[c] = pd.to_numeric(df_met[c], errors="coerce").fillna(0.0)
 
-    df_movs_ent = df_ent_valid[["PRO_CODIGO", "DATA", "QUANTIDADE"]].copy()
-    df_movs_ent["QTD_MOV"] = df_movs_ent["QUANTIDADE"]
+    # Demanda de reposição = demanda recente (vendas-only para exibição)
+    df_met["DEMANDA_MEDIA_DIA"] = df_met["DEM_DIA_VENDAS"]
+    df_met["LEAD_TIME_DIAS"] = LEAD_TIME_DIAS
 
-    df_all_movs = pd.concat(
-        [df_movs_sai[["PRO_CODIGO", "DATA", "QTD_MOV"]], df_movs_ent[["PRO_CODIGO", "DATA", "QTD_MOV"]]],
-        ignore_index=True
-    )
-
-    df_all_movs["DATA"] = pd.to_datetime(df_all_movs["DATA"], errors="coerce")
-    df_all_movs = df_all_movs.loc[df_all_movs["DATA"] >= data_inicio_ruptura].copy()
-
-    df_daily_change = df_all_movs.groupby(["PRO_CODIGO", "DATA"])["QTD_MOV"].sum().reset_index()
-
-    # saldo atual
+    # ==========================================
+    # DEMANDA AJUSTADA = demanda real recente (vendas + venda perdida observada)
+    #   A antiga "ruptura em 2 anos" (pivot diário) e a inflação por
+    #   (1 + dias_ruptura/730) foram REMOVIDAS: a venda perdida já corrige a
+    #   demanda censurada na própria janela de 12m.
+    # ==========================================
     df_saldo_produto["PRO_CODIGO"] = df_saldo_produto["PRO_CODIGO"].astype(str).str.strip()
-    saldo_atual_map = df_saldo_produto.set_index("PRO_CODIGO")["ESTOQUE_DISPONIVEL"].to_dict()
-
-    prods_analise = df_met["PRO_CODIGO"].astype(str).str.strip().unique()
-    df_daily_change["PRO_CODIGO"] = df_daily_change["PRO_CODIGO"].astype(str).str.strip()
-    df_daily_change = df_daily_change[df_daily_change["PRO_CODIGO"].isin(prods_analise)]
-
-    ruptura_map = {}
-    date_range = pd.date_range(start=data_inicio_ruptura, end=hoje, freq="D")
-
-    if not df_daily_change.empty:
-        df_pivot = df_daily_change.pivot(index="DATA", columns="PRO_CODIGO", values="QTD_MOV").fillna(0)
-        df_pivot = df_pivot.reindex(date_range, fill_value=0)
-
-        df_pivot_rev = df_pivot.iloc[::-1]
-        stock_history_rev = pd.DataFrame(index=df_pivot_rev.index, columns=df_pivot_rev.columns)
-
-        for col in df_pivot_rev.columns:
-            s_atual = float(saldo_atual_map.get(col, 0) or 0)
-            changes = df_pivot_rev[col].to_numpy()
-            subtractions = np.cumsum(changes)
-
-            saldos_arr = np.empty_like(subtractions, dtype=float)
-            saldos_arr[0] = s_atual
-            saldos_arr[1:] = s_atual - subtractions[:-1]
-
-            stock_history_rev[col] = saldos_arr
-
-        ruptura_counts = (stock_history_rev <= 0).sum()
-        ruptura_map = ruptura_counts.to_dict()
-
-    df_met["DIAS_RUPTURA"] = df_met["PRO_CODIGO"].astype(str).str.strip().map(ruptura_map).fillna(0).astype(int)
-
-    def calc_demand_ajustada(row):
-        dem = row["DEMANDA_MEDIA_DIA"]
-        rup = row["DIAS_RUPTURA"]
-        if pd.isna(dem) or dem <= 0:
-            return 0.0
-        fator = rup / 730.0
-        return float(dem) * (1 + fator)
-
-    df_met["DEMANDA_MEDIA_DIA_AJUSTADA"] = df_met.apply(calc_demand_ajustada, axis=1)
+    df_met["DEMANDA_MEDIA_DIA_AJUSTADA"] = pd.to_numeric(df_met["DEM_DIA_REAL"], errors="coerce").fillna(0.0)
 
     # ==========================================
     # (MUITO IMPORTANTE) MERGE DO SALDO AQUI
@@ -805,13 +1303,13 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     df_met = df_met.merge(df_saldo_produto[colunas_saldo], on="PRO_CODIGO", how="left")
 
     # ==========================================
-    # Curva ABC
+    # Curva ABC (sobre valor vendido dos últimos 12 meses, não vitalício)
     # ==========================================
-    df_met["VALOR_VENDIDO"] = pd.to_numeric(df_met["VALOR_VENDIDO"], errors="coerce").fillna(0)
-    df_met = df_met.sort_values("VALOR_VENDIDO", ascending=False).reset_index(drop=True)
+    df_met["VALOR_VENDIDO_12M"] = pd.to_numeric(df_met["VALOR_VENDIDO_12M"], errors="coerce").fillna(0)
+    df_met = df_met.sort_values("VALOR_VENDIDO_12M", ascending=False).reset_index(drop=True)
 
-    total_valor = df_met["VALOR_VENDIDO"].sum()
-    df_met["PCT_ACUM_VALOR"] = (df_met["VALOR_VENDIDO"].cumsum() / total_valor * 100) if total_valor > 0 else 0
+    total_valor = df_met["VALOR_VENDIDO_12M"].sum()
+    df_met["PCT_ACUM_VALOR"] = (df_met["VALOR_VENDIDO_12M"].cumsum() / total_valor * 100) if total_valor > 0 else 0
 
     def classificar_abc(pct):
         if pct <= 70:
@@ -824,6 +1322,22 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             return "D"
 
     df_met["CURVA_ABC"] = df_met["PCT_ACUM_VALOR"].apply(classificar_abc)
+
+    # ==========================================
+    # Classe XYZ (previsibilidade da demanda pelo coeficiente de variação)
+    #   X = previsível | Y = média | Z = errática
+    # ==========================================
+    def classificar_xyz(cv):
+        if pd.isna(cv) or cv <= XYZ_LIMIAR_X:
+            return "X"
+        elif cv <= XYZ_LIMIAR_Y:
+            return "Y"
+        else:
+            return "Z"
+
+    df_met["CLASSE_XYZ"] = df_met["CV_DEMANDA"].apply(classificar_xyz)
+    # Item sem demanda recente não tem previsibilidade definida (não é "X").
+    df_met.loc[pd.to_numeric(df_met["DEM_DIA_REAL"], errors="coerce").fillna(0) <= 0, "CLASSE_XYZ"] = None
 
     # ==========================================
     # Categoria estocagem
@@ -843,71 +1357,75 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     df_met["CATEGORIA_ESTOCAGEM"] = df_met["TEMPO_MEDIO_ESTOQUE"].apply(cat_estocagem)
 
     # ==========================================
-    # Min/Max base e ajustado
+    # SAZONALIDADE (índice por subgrupo) + PADRÃO DE DEMANDA (SBC)
     # ==========================================
-    LEAD_TIME = 17
+    print("Calculando sazonalidade por subgrupo e padrão de demanda...")
+    indices_saz = calcular_indices_sazonais(df_sai_fifo, df_saldo_produto, hoje,
+                                            vendas_mensais_extra=vendas_mensais_extra)
+    n_saz_ok = sum(1 for v in indices_saz.values() if v.get("confiavel"))
+    print(f"  - Subgrupos sazonais confiáveis: {n_saz_ok} de {len(indices_saz)}")
 
-    regras_dias = {
-        "default": {
-            "A": (20, 60),
-            "B": (30, 90),
-            "C": (45, 120),
-            "D": (0, 45),
-        },
-        154: {
-            "A": (45, 120),
-            "B": (60, 180),
-            "C": (90, 240),
-            "D": (0, 120),
-        }
-    }
+    horizonte_saz = LEAD_TIME_DIAS + 60
+    def _fator_saz(sgr):
+        try:
+            key = int(sgr)
+        except (TypeError, ValueError):
+            return 1.0
+        return _fator_sazonal_forward(indices_saz.get(key), hoje, horizonte_saz)
+
+    df_met["FATOR_SAZONAL"] = df_met["SGR_CODIGO"].apply(_fator_saz)
+    df_met["DEMANDA_PLANEJAMENTO_DIA"] = (
+        pd.to_numeric(df_met["DEMANDA_MEDIA_DIA_AJUSTADA"], errors="coerce").fillna(0.0)
+        * df_met["FATOR_SAZONAL"]
+    )
+
+    def _padrao_demanda(row):
+        dem = row.get("DEMANDA_MEDIA_DIA_AJUSTADA", 0) or 0
+        if dem <= 0:
+            return "Sem_Giro"
+        try:
+            adi = float(row.get("ADI", 9999)); cv2 = float(row.get("CV2_TAMANHO", 0))
+        except (TypeError, ValueError):
+            return "Suave"
+        if adi < SBC_ADI and cv2 < SBC_CV2:
+            return "Suave"
+        if adi < SBC_ADI and cv2 >= SBC_CV2:
+            return "Erratico"
+        if adi >= SBC_ADI and cv2 < SBC_CV2:
+            return "Intermitente"
+        return "Grumoso"
+
+    df_met["PADRAO_DEMANDA"] = df_met.apply(_padrao_demanda, axis=1)
+    df_met["METODO_REPOSICAO"] = df_met["PADRAO_DEMANDA"].map({
+        "Suave": "Normal (Z·σ·√LT)",
+        "Erratico": "Normal (Z·σ·√LT)",
+        "Intermitente": "Croston+Poisson",
+        "Grumoso": "Croston+Binomial Neg",
+        "Sem_Giro": "—",
+    }).fillna("Normal (Z·σ·√LT)")
+
+    # ==========================================
+    # Min/Max base
+    #   A camada "ajustado" (multiplicador por fator de tendência) foi REMOVIDA:
+    #   a sazonalidade forward já está embutida em DEMANDA_PLANEJAMENTO_DIA, então
+    #   o SUGERIDO parte direto da BASE (sem dupla contagem).
+    # ==========================================
+    LEAD_TIME = LEAD_TIME_DIAS
+
+    regras_dias = REGRAS_DIAS  # alias da tabela do módulo (usada em montar_descricao)
 
     def calc_min_max_base(row):
-        curva = row["CURVA_ABC"]
-        dem = row["DEMANDA_MEDIA_DIA_AJUSTADA"]
-        sgr = row.get("SGR_CODIGO", None)
-        data_max = row["DATA_MAX_VENDA"]
-
-        regra_selecionada = regras_dias.get(sgr, regras_dias["default"])
-
-        if pd.isna(dem) or dem <= 0 or curva not in regra_selecionada:
-            return pd.Series({"ESTOQUE_MIN_BASE": 0, "ESTOQUE_MAX_BASE": 0})
-
-        dias_min_regra, dias_max_regra = regra_selecionada[curva]
-        dias_min_final = dias_min_regra + LEAD_TIME
-        dias_max_final = dias_max_regra + LEAD_TIME
-
-        val_min = dem * dias_min_final
-        val_max = dem * dias_max_final
-
-        est_min = int(np.ceil(val_min))
-        est_max = int(np.ceil(val_max))
-
-        dias_corte = 365 if sgr == 154 else 240
-
-        if not pd.isna(data_max):
-            dias_sem_venda = (hoje - data_max).days
-            if dias_sem_venda > dias_corte:
-                est_min = 0
-                est_max = max(1, int(np.ceil(dem * 15)))
-
-        return pd.Series({"ESTOQUE_MIN_BASE": est_min, "ESTOQUE_MAX_BASE": est_max})
+        return pd.Series(calcular_min_max(
+            row["CURVA_ABC"], row.get("DEMANDA_PLANEJAMENTO_DIA", 0.0),
+            row.get("SIGMA_DEMANDA_DIA", 0.0), row.get("PADRAO_DEMANDA", "Suave"),
+            row.get("SGR_CODIGO", None), row["DATA_MAX_VENDA"],
+            row.get("CV2_TAMANHO", 0.0), row.get("MEAN_SIZE_MES", 0.0), hoje))
 
     base_minmax = df_met.apply(calc_min_max_base, axis=1)
     df_met = pd.concat([df_met, base_minmax], axis=1)
 
-    def fator_ajuste_tendencia(f):
-        if pd.isna(f):
-            return 1.0
-        return max(0.5, min(2.0, f))
-
-    df_met["FATOR_AJUSTE_TENDENCIA"] = df_met["FATOR_TENDENCIA"].apply(fator_ajuste_tendencia)
-
-    df_met["ESTOQUE_MIN_AJUSTADO"] = (df_met["ESTOQUE_MIN_BASE"] * df_met["FATOR_AJUSTE_TENDENCIA"]).apply(lambda x: int(np.ceil(x)))
-    df_met["ESTOQUE_MAX_AJUSTADO"] = (df_met["ESTOQUE_MAX_BASE"] * df_met["FATOR_AJUSTE_TENDENCIA"]).apply(lambda x: int(np.ceil(x)))
-
     # ==========================================
-    # Pouco histórico / Sob demanda / Normal -> SUGERIDO
+    # Pouco histórico / Sob demanda / Normal -> SUGERIDO (= BASE)
     # ==========================================
     def ajustar_pouco_historico(row):
         num_vendas = row["NUM_VENDAS"]
@@ -915,8 +1433,8 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
 
         if num_vendas is None or num_vendas <= 0:
             return pd.Series({
-                "ESTOQUE_MIN_SUGERIDO": row["ESTOQUE_MIN_AJUSTADO"],
-                "ESTOQUE_MAX_SUGERIDO": row["ESTOQUE_MAX_AJUSTADO"],
+                "ESTOQUE_MIN_SUGERIDO": row["ESTOQUE_MIN_BASE"],
+                "ESTOQUE_MAX_SUGERIDO": row["ESTOQUE_MAX_BASE"],
                 "TIPO_PLANEJAMENTO": "Sem_Historico",
             })
 
@@ -939,13 +1457,47 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             })
 
         return pd.Series({
-            "ESTOQUE_MIN_SUGERIDO": row["ESTOQUE_MIN_AJUSTADO"],
-            "ESTOQUE_MAX_SUGERIDO": row["ESTOQUE_MAX_AJUSTADO"],
+            "ESTOQUE_MIN_SUGERIDO": row["ESTOQUE_MIN_BASE"],
+            "ESTOQUE_MAX_SUGERIDO": row["ESTOQUE_MAX_BASE"],
             "TIPO_PLANEJAMENTO": "Normal",
         })
 
     ajuste_hist = df_met.apply(ajustar_pouco_historico, axis=1)
     df_met = pd.concat([df_met, ajuste_hist], axis=1)
+
+    # ==========================================
+    # PRODUTOS ORIGINAIS (encomenda) + CÁLCULO CONSOLIDADO POR GRUPO (descrição)
+    #  - originais (montadora/genuíno): viram "Sob Encomenda", sem min/máx estocado
+    #  - demais: agrupados por descrição, demanda consolidada entre marcas (pooling)
+    # ==========================================
+    print("Aplicando regra de originais e cálculo consolidado por grupo...")
+    if "MAR_DESCRICAO" in df_met.columns:
+        df_met["SOB_ENCOMENDA"] = df_met["MAR_DESCRICAO"].apply(marca_eh_original)
+    else:
+        df_met["SOB_ENCOMENDA"] = False
+    df_met["GRUPO_CHAVE"] = np.where(
+        df_met["SOB_ENCOMENDA"],
+        None,
+        df_met["PRO_DESCRICAO"].astype(str).str.strip() if "PRO_DESCRICAO" in df_met.columns else None,
+    )
+    mask_orig = df_met["SOB_ENCOMENDA"] == True  # noqa: E712
+    for col in ["ESTOQUE_MIN_SUGERIDO", "ESTOQUE_MAX_SUGERIDO", "ESTOQUE_SEGURANCA",
+                "ESTOQUE_MIN_BASE", "ESTOQUE_MAX_BASE"]:
+        if col in df_met.columns:
+            df_met.loc[mask_orig, col] = 0
+    df_met.loc[mask_orig, "TIPO_PLANEJAMENTO"] = "Sob_Encomenda"
+    df_met.loc[mask_orig, "METODO_REPOSICAO"] = "Sob Encomenda"
+    print(f"  - Produtos originais (Sob Encomenda): {int(mask_orig.sum())}")
+
+    try:
+        df_grp = calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz)
+        if df_grp is not None and not df_grp.empty:
+            print(f"  - Grupos de produto (consolidados): {len(df_grp)}")
+            df_met = df_met.merge(df_grp, left_on="GRUPO_CHAVE", right_on="GRUPO", how="left")
+            if "GRUPO" in df_met.columns:
+                df_met = df_met.drop(columns=["GRUPO"])
+    except Exception as e:
+        print(f"  - AVISO: falha no cálculo por grupo ({e}). Seguindo sem consolidado.")
 
     # ==========================================
     # AGORA SIM: AGRUPAMENTO (no lugar correto)
@@ -965,15 +1517,6 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     df_met = df_met.loc[~mask_velho_sem_estoque].copy()
 
     # ==========================================
-    # Alerta tendência alta
-    # ==========================================
-    df_met["ALERTA_TENDENCIA_ALTA"] = np.where(
-        (df_met["TENDENCIA_LABEL"] == "Subindo") & (df_met["FATOR_TENDENCIA"] >= 1.2),
-        "Sim",
-        "Não"
-    )
-
-    # ==========================================
     # Descrição (por último, já com grupo pronto)
     # ==========================================
     def montar_descricao(row):
@@ -982,14 +1525,9 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
         tipo = row["TIPO_PLANEJAMENTO"]
         dem_orig = row["DEMANDA_MEDIA_DIA"]
         dem_ajus = row["DEMANDA_MEDIA_DIA_AJUSTADA"]
-        dias_rup = row["DIAS_RUPTURA"]
         num_vendas = row["NUM_VENDAS"]
-        fator_tend = row["FATOR_TENDENCIA"]
-        tend_label = row["TENDENCIA_LABEL"]
         est_min_base = row["ESTOQUE_MIN_BASE"]
         est_max_base = row["ESTOQUE_MAX_BASE"]
-        est_min_aj = row["ESTOQUE_MIN_AJUSTADO"]
-        est_max_aj = row["ESTOQUE_MAX_AJUSTADO"]
         est_min_final = row["ESTOQUE_MIN_SUGERIDO"]
         est_max_final = row["ESTOQUE_MAX_SUGERIDO"]
         est_atual = row["ESTOQUE_DISPONIVEL"]
@@ -1006,10 +1544,10 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                 f"Produto curva {curva}, categoria '{cat}', com {num_vendas} vendas no período."
             )
 
-        if dias_rup > 0:
+        vp12 = row.get("VENDA_PERDIDA_12M", 0) or 0
+        if vp12 > 0:
             partes.append(
-                f"Houve {dias_rup:.0f} dias de ruptura estimados nos últimos 2 anos. "
-                f"A demanda foi ajustada para {dem_ajus:.3f} un/dia."
+                f"Demanda real (vendas + {float(vp12):.0f} un de venda perdida em 12m) = {dem_ajus:.3f} un/dia."
             )
 
         sgr = row.get("SGR_CODIGO", None)
@@ -1017,25 +1555,26 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
 
         if curva in regra_selecionada:
             dias_min, dias_max = regra_selecionada[curva]
-            dias_min_total = dias_min + LEAD_TIME
-            dias_max_total = dias_max + LEAD_TIME
+            dias_ciclo = max(dias_max - dias_min, 1)
+            ss = row.get("ESTOQUE_SEGURANCA", 0)
+            z = row.get("NIVEL_SERVICO_Z", 0)
+            xyz = row.get("CLASSE_XYZ", "")
             partes.append(
-                f"Regra base curva {curva} considera {dias_min}-{dias_max} dias + {LEAD_TIME} lead time "
-                f"(cobertura {dias_min_total}-{dias_max_total} dias), gerando base {est_min_base}-{est_max_base} un."
+                f"Mínimo (ponto de pedido) = demanda x {LEAD_TIME}d de lead time + estoque de segurança "
+                f"({ss} un; classe {curva}/{xyz}, Z={z}); máximo cobre +{dias_ciclo}d de ciclo. "
+                f"Base {est_min_base}-{est_max_base} un."
             )
-
-        if not pd.isna(fator_tend):
-            partes.append(
-                f"Tendência 12m: '{tend_label}' (fator ≈ {fator_tend:.2f})."
-            )
-        else:
-            partes.append("Sem histórico suficiente para tendência 12m.")
+            metodo = row.get("METODO_REPOSICAO", "")
+            fs = row.get("FATOR_SAZONAL", 1.0) or 1.0
+            extra = f"Método de reposição: {metodo}."
+            try:
+                if abs(float(fs) - 1.0) >= 0.05:
+                    extra += f" Ajuste sazonal do próximo período: x{float(fs):.2f}."
+            except (TypeError, ValueError):
+                pass
+            partes.append(extra)
 
         if tipo == "Normal":
-            if est_min_base != est_min_aj or est_max_base != est_max_aj:
-                partes.append(
-                    f"Ajuste de tendência aplicado: mínimo {est_min_aj} e máximo {est_max_aj}."
-                )
             partes.append(
                 f"Planejamento 'Normal': sugerido final {est_min_final}-{est_max_final} un."
             )
@@ -1043,9 +1582,6 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             partes.append("Planejamento 'Sob Demanda' por poucas vendas e giro muito rápido.")
         elif tipo == "Pouco_Historico":
             partes.append("Planejamento 'Pouco Histórico' por baixa quantidade de vendas.")
-
-        if row["ALERTA_TENDENCIA_ALTA"] == "Sim":
-            partes.append("Atenção: forte tendência de alta nos últimos 12 meses.")
 
         if not pd.isna(est_atual):
             partes.append(f"Estoque atual: {est_atual:.0f} un.")
@@ -1532,6 +2068,31 @@ def salvar_metricas_postgres(df_metricas):
         'TEMPO_MEDIO_SALDO_ATUAL': 'tempo_medio_saldo_atual',
         'CATEGORIA_SALDO_ATUAL': 'categoria_saldo_atual',
         'PRO_REFERENCIA': 'pro_referencia',
+        'DEM_DIA_REAL': 'demanda_real_dia',
+        'SIGMA_DEMANDA_DIA': 'sigma_demanda_dia',
+        'CV_DEMANDA': 'cv_demanda',
+        'CLASSE_XYZ': 'classe_xyz',
+        'ESTOQUE_SEGURANCA': 'estoque_seguranca',
+        'NIVEL_SERVICO_Z': 'nivel_servico_z',
+        'LEAD_TIME_DIAS': 'lead_time_dias',
+        'VENDA_PERDIDA_12M': 'venda_perdida_12m',
+        'VALOR_VENDIDO_12M': 'valor_vendido_12m',
+        'PADRAO_DEMANDA': 'padrao_demanda',
+        'METODO_REPOSICAO': 'metodo_reposicao',
+        'FATOR_SAZONAL': 'fator_sazonal',
+        'DEMANDA_PLANEJAMENTO_DIA': 'demanda_planejamento_dia',
+        'SOB_ENCOMENDA': 'sob_encomenda',
+        'GRUPO_CHAVE': 'grupo_chave',
+        'GRUPO_QTD_ITENS': 'grupo_qtd_itens',
+        'GRUPO_ESTOQUE_DISPONIVEL': 'grupo_estoque_disponivel',
+        'GRUPO_DEMANDA_DIA': 'grupo_demanda_dia',
+        'GRUPO_FATOR_SAZONAL': 'grupo_fator_sazonal',
+        'GRUPO_CURVA': 'grupo_curva',
+        'GRUPO_PADRAO': 'grupo_padrao',
+        'GRUPO_METODO': 'grupo_metodo',
+        'GRUPO_ESTOQUE_MIN': 'grupo_estoque_min',
+        'GRUPO_ESTOQUE_MAX': 'grupo_estoque_max',
+        'GRUPO_ESTOQUE_SEGURANCA': 'grupo_estoque_seguranca',
         'dados_alteracao_json': 'dados_alteracao_json'
     }
     
@@ -1556,6 +2117,13 @@ def salvar_metricas_postgres(df_metricas):
         'grp_estoque_max_sugerido', 'grp_demanda_media_dia', 'rateio_prop_grupo',
         'tempo_medio_saldo_atual', 'categoria_saldo_atual',
         'pro_referencia',
+        'demanda_real_dia', 'sigma_demanda_dia', 'cv_demanda', 'classe_xyz',
+        'estoque_seguranca', 'nivel_servico_z', 'lead_time_dias',
+        'venda_perdida_12m', 'valor_vendido_12m',
+        'padrao_demanda', 'metodo_reposicao', 'fator_sazonal', 'demanda_planejamento_dia',
+        'sob_encomenda', 'grupo_chave', 'grupo_qtd_itens', 'grupo_estoque_disponivel',
+        'grupo_demanda_dia', 'grupo_fator_sazonal', 'grupo_curva', 'grupo_padrao',
+        'grupo_metodo', 'grupo_estoque_min', 'grupo_estoque_max', 'grupo_estoque_seguranca',
         'dados_alteracao_json'
     ]
     
@@ -1687,9 +2255,38 @@ def salvar_distribuicao_fifo_postgres(df_long):
 
 def run_job():
     print(f"\n=== INICIANDO JOB DE ANÁLISE FIFO: {datetime.datetime.now()} ===")
-    
-    # 1) Carregar dados
-    df_saidas, df_ent, df_dev, df_saldo_produto = carregar_dados_do_banco()
+
+    import empacotamento as emp
+    hoje_ts = pd.Timestamp.today().normalize()
+
+    # === MODO EMPACOTAMENTO (Fase 2, gated por EMPAC_ENABLED) ===
+    emp_on = os.getenv("EMPAC_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    pack_store = None
+    packs_docs = {}        # {pro_codigo: {corte, camadas, vendas_mensais}}
+    packs_cam = {}         # {pro_codigo: [{data_compra, qtd}]}  -> semeia o motor FIFO
+    corte_pack = None
+    modo_incremental = False
+    if emp_on:
+        try:
+            pack_store = emp.MongoPackStore()
+            meta_pack = pack_store.meta()
+            if meta_pack.get("corte"):
+                modo_incremental = True
+                corte_pack = meta_pack["corte"]
+                packs_docs = pack_store.carregar()
+                packs_cam = {c: emp._cam_from_doc(d.get("camadas", []))
+                             for c, d in packs_docs.items()}
+                print(f"  [EMPAC] modo INCREMENTAL — corte={corte_pack}, "
+                      f"{len(packs_docs)} produtos no pacote (janela {emp.JANELA_MESES}m)")
+            else:
+                print("  [EMPAC] habilitado, pacote vazio -> BACKFILL (carga completa desta vez)")
+        except Exception as e:
+            print(f"  [EMPAC] AVISO: store indisponível ({e}). Caindo para carga completa.")
+            emp_on = False; pack_store = None; modo_incremental = False
+
+    # 1) Carregar dados (janela no modo incremental; completa caso contrário)
+    df_saidas, df_ent, df_dev, df_saldo_produto, df_vp = carregar_dados_do_banco(
+        corte=corte_pack if modo_incremental else None)
     
     # === CORREÇÃO DE TIPOS: Garantir que PRO_CODIGO seja string em todos os DataFrames ===
     df_saidas["PRO_CODIGO"] = df_saidas["PRO_CODIGO"].astype(str).str.strip()
@@ -1737,52 +2334,27 @@ def run_job():
     df_ent_valid["QTD_ENTRADA_ACUMULADA"] = df_ent_valid.groupby("PRO_CODIGO")["QUANTIDADE"].cumsum()
     
     
-    # 3) FIFO Core
-    print("Processando FIFO...")
+    # 3) FIFO Core — MOTOR ÚNICO por camadas (semeado pelo pacote no modo incremental).
+    #    Produz, num só passe: DATA_COMPRA por venda (data média ponderada) e as
+    #    camadas residuais do estoque atual (df_long), reconciliadas ao saldo do ERP.
+    print("Processando FIFO (motor por camadas)...")
     df_sai_fifo = df_sai_valid.copy()
-    df_ent_fifo = df_ent_valid.copy()
-    
-    # ... Logica FIFO do script anterior ...
-    # Para brevidade, assumindo que a func calculate_fifo pode ser chamada ou reimplementada.
-    # Vou reimplementar o loop rápido:
-    df_sai_fifo = df_sai_fifo.sort_values(["PRO_CODIGO", "QTD_ACUMULADA"])
-    df_ent_fifo = df_ent_fifo.sort_values(["PRO_CODIGO", "QTD_ENTRADA_ACUMULADA", "DATA"])
-    
-    data_compra = pd.Series(index=df_sai_fifo.index, dtype="datetime64[ns]")
-    
-    for cod, grupo_sai in df_sai_fifo.groupby("PRO_CODIGO"):
-        grupo_ent = df_ent_fifo[df_ent_fifo["PRO_CODIGO"] == cod]
-        if grupo_ent.empty: continue
-        
-        arr_ent_cum = grupo_ent["QTD_ENTRADA_ACUMULADA"].to_numpy()
-        arr_ent_datas = pd.to_datetime(grupo_ent["DATA"]).to_numpy(dtype="datetime64[ns]")
-        
-        result_datas = []
-        for idx, row in grupo_sai.iterrows():
-            pos = row["QTD_ACUMULADA"]
-            dt_s = row["DATA"]
-            # Busca binaria simples
-            k = np.searchsorted(arr_ent_datas, np.datetime64(dt_s), side="right") - 1
-            if k < 0: 
-                result_datas.append(pd.NaT)
-                continue
-            
-            if arr_ent_cum[k] < pos:
-                result_datas.append(pd.NaT)
-                continue
-                
-            idx_fifo = np.searchsorted(arr_ent_cum[:k+1], pos, side="left")
-            result_datas.append(arr_ent_datas[idx_fifo])
-            
-        data_compra.loc[grupo_sai.index] = result_datas
-        
+    data_compra, df_long, df_div = emp.fifo_por_camadas(
+        df_ent_valid, df_sai_fifo, df_saldo_produto,
+        packs=packs_cam if modo_incremental else None, hoje=hoje_ts)
     df_sai_fifo["DATA_COMPRA"] = data_compra
-    
+    df_wide = pd.DataFrame()
+    if not df_div.empty:
+        print(f"  [FIFO] {len(df_div)} produtos com ajuste de inventário (saldo x movimento) reconciliados.")
+
+    # Sazonalidade: no modo incremental, traz os meses congelados do pacote.
+    vendas_mensais_extra = (emp.vendas_mensais_subgrupo(packs_docs, df_saldo_produto)
+                            if modo_incremental else None)
+
     # 4) Metricas
-    df_metricas = calcular_metricas_e_classificar(df_sai_fifo, df_ent_valid, df_saldo_produto)
-    
-    # 5) FIFO Atual
-    df_long, df_wide, df_div = calcular_fifo_saldo_atual(df_ent_valid, df_sai_fifo, df_saldo_produto)
+    df_metricas = calcular_metricas_e_classificar(
+        df_sai_fifo, df_ent_valid, df_saldo_produto, df_vp,
+        vendas_mensais_extra=vendas_mensais_extra)
     
     # === ETAPA NOVA: Calcular Idade Média do Saldo Atual e Classificar ===
     # Agrupar df_long por produto para calcular weighted average age
@@ -1838,6 +2410,30 @@ def run_job():
     except Exception as e:
         print(f"Erro ao salvar no PostgreSQL: {e}")
         return
+
+    # 7b) EMPACOTAMENTO: backfill (1ª vez) ou fold incremental do corte -> grava no Mongo
+    if emp_on and pack_store is not None:
+        try:
+            if modo_incremental:
+                novo_corte = emp.corte_da_janela(hoje_ts.date())
+                if pd.Timestamp(novo_corte) > pd.Timestamp(corte_pack):
+                    docs_novos = emp.avancar_corte(packs_docs, df_ent_valid, df_sai_valid,
+                                                   corte_pack, novo_corte)
+                    pack_store.salvar(docs_novos, {"corte": novo_corte.strftime(emp._FMT),
+                                                   "janela_meses": emp.JANELA_MESES,
+                                                   "atualizado_em": str(hoje_ts.date())})
+                    print(f"  [EMPAC] corte avançado {corte_pack} -> {novo_corte} "
+                          f"({len(docs_novos)} produtos)")
+                else:
+                    print(f"  [EMPAC] corte inalterado ({corte_pack}); nada a avançar.")
+            else:
+                docs, T = emp.computar_pack(df_ent_valid, df_sai_valid, hoje_ts.date())
+                pack_store.salvar(docs, {"corte": T.strftime(emp._FMT),
+                                         "janela_meses": emp.JANELA_MESES,
+                                         "atualizado_em": str(hoje_ts.date())})
+                print(f"  [EMPAC] BACKFILL gravado no Mongo: {len(docs)} produtos, corte={T}")
+        except Exception as e:
+            print(f"  [EMPAC] AVISO: falha ao gravar pacote: {e}")
 
     # 8) Opcional: Ainda salvar Excel para backup/compatibilidade
     print(f"Salvando backup em Excel: {ARQUIVO_SAIDA}")
