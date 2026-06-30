@@ -1729,6 +1729,51 @@ def get_all_realtime_stocks():
     return m
 
 
+import time as _time
+_HIST_CACHE = {"ts": 0.0, "data": None}
+_HIST_TTL_S = int(os.getenv("COMPRAS_HIST_TTL_S", 21600))  # 6h
+SEM_HIST_COMPRA = "SEM HISTÓRICO DE COMPRA"
+
+
+def get_compras_historico(force=False):
+    """
+    Histórico de COMPRA por produto -> fornecedores de quem JÁ COMPRAMOS, a partir
+    das NF-e de entrada (nfe_itens + nf_entrada + fornecedores). Substitui o uso de
+    fornecedor1/2/3 do cadastro do produto. Exclui o DEPÓSITO interno ('(DEPOSITO)')
+    e notas canceladas. Cacheado por TTL (consulta pesada no ERP).
+
+    Retorna: {pro_codigo: [(for_nome, qtd_comprada), ...] ordenado por qtd desc}.
+    """
+    now = _time.time()
+    cached = _HIST_CACHE.get("data")
+    if not force and cached is not None and (now - _HIST_CACHE["ts"]) < _HIST_TTL_S:
+        return cached
+    inner = ("SELECT i.pro_codigo, f.for_nome, SUM(i.quantidade) AS qtd "
+             "FROM nfe_itens i "
+             "JOIN nf_entrada e ON e.empresa = i.empresa AND e.nfe = i.nfe "
+             "JOIN fornecedores f ON f.empresa = e.empresa AND f.for_codigo = e.for_codigo "
+             "WHERE i.empresa = 3 AND e.dt_cancelamento IS NULL "
+             "AND f.for_nome NOT LIKE '%(DEPOSITO)%' "
+             "GROUP BY i.pro_codigo, f.for_nome")
+    query = f"SELECT * FROM OPENQUERY(CONSULTA, '{inner.replace(chr(39), chr(39) * 2)}')"
+    conn = get_sql_connection()
+    hist = {}
+    try:
+        cur = conn.cursor()
+        cur.execute(query)
+        for cod, nome, qtd in cur.fetchall():
+            if cod is None:
+                continue
+            hist.setdefault(str(cod).strip(), []).append((str(nome).strip(), float(qtd or 0)))
+    finally:
+        conn.close()
+    for c in hist:
+        hist[c].sort(key=lambda x: -x[1])
+    _HIST_CACHE["ts"] = now
+    _HIST_CACHE["data"] = hist
+    return hist
+
+
 def _sug_norm(s):
     return (str(s).strip() if s is not None else "")
 
@@ -1752,8 +1797,9 @@ def _sug_posicao(it, stock_map, usar_rt):
     return cod, estoque, transito
 
 
-def montar_sugestao_compra(items, stock_map, *, consolidar_grupo=True, usar_estoque_realtime=True,
-                           fornecedor=None, curva=None, apenas_zerados=False):
+def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo=True,
+                           usar_estoque_realtime=True, fornecedor=None, curva=None,
+                           apenas_zerados=False):
     """
     Transforma as linhas de com_fifo_completo (1 por produto/marca) na sugestão de
     compra agrupada por fornecedor. FUNÇÃO PURA — usada pelo endpoint e pela validação.
@@ -1774,9 +1820,14 @@ def montar_sugestao_compra(items, stock_map, *, consolidar_grupo=True, usar_esto
     from collections import defaultdict
 
     usar_rt = usar_estoque_realtime and bool(stock_map)
+    historico = historico or {}
     curvas_filtro = [c.strip().upper() for c in curva.split(",")] if curva else None
     ordem_curva = {"A": 0, "B": 1, "C": 2, "D": 3}
     grupos = {}  # fornecedor -> [rec]
+
+    def _forns_hist(cod):
+        """[(for_nome, qtd)] desc — de quem JÁ COMPRAMOS este produto."""
+        return historico.get(_sug_norm(cod), [])
 
     def _passa_filtros_comuns(curva_item, estoque_total):
         if curvas_filtro and (curva_item or "").upper() not in curvas_filtro:
@@ -1803,10 +1854,19 @@ def montar_sugestao_compra(items, stock_map, *, consolidar_grupo=True, usar_esto
         curva_item = _sug_norm(it.get("curva_abc"))
         if not _passa_filtros_comuns(curva_item, estoque):
             return
-        forn = _sug_norm(it.get("fornecedor1")) or "SEM FORNECEDOR"
-        if fornecedor and fornecedor.lower() not in forn.lower():
-            return
-        _registrar(forn, {
+        # Fornecedor vem do HISTÓRICO de compra (não do cadastro fornecedor1/2/3).
+        h = _forns_hist(cod)
+        all_forns = [n for n, _ in h]
+        top = all_forns[0] if all_forns else SEM_HIST_COMPRA
+        if fornecedor:
+            # filtro casa se o termo está em QUALQUER fornecedor já comprado do item
+            casado = next((n for n in all_forns if fornecedor.lower() in n.lower()), None)
+            if not casado:
+                return
+            bucket = casado
+        else:
+            bucket = top
+        _registrar(bucket, {
             "tipo": "individual",
             "grupo_chave": None,
             "pro_codigo": cod,
@@ -1819,7 +1879,7 @@ def montar_sugestao_compra(items, stock_map, *, consolidar_grupo=True, usar_esto
             "metodo_reposicao": it.get("metodo_reposicao"),
             "qtd_itens_grupo": 1,
             "marcas": [it.get("mar_descricao")] if it.get("mar_descricao") else [],
-            "fornecedores": [forn],
+            "fornecedores": all_forns or [SEM_HIST_COMPRA],
             "estoque_atual": round(estoque, 2),
             "em_transito": round(transito, 2),
             "posicao": round(posicao, 2),
@@ -1857,14 +1917,20 @@ def montar_sugestao_compra(items, stock_map, *, consolidar_grupo=True, usar_esto
 
             estoque_total = transito_total = 0.0
             membros_det = []
+            sup_qty = defaultdict(float)   # fornecedor -> qtd comprada (grupo todo)
             for m in mem:
                 cod, est, tr = _sug_posicao(m, stock_map, usar_rt)
                 estoque_total += est
                 transito_total += tr
+                h = _forns_hist(cod)
+                for n, qq in h:
+                    sup_qty[n] += qq
                 membros_det.append({
                     "pro_codigo": cod,
                     "marca": m.get("mar_descricao"),
-                    "fornecedor": _sug_norm(m.get("fornecedor1")) or "SEM FORNECEDOR",
+                    # de quem MAIS COMPRAMOS essa marca (histórico); todos abaixo
+                    "fornecedor": (h[0][0] if h else SEM_HIST_COMPRA),
+                    "fornecedores_hist": [n for n, _ in h],
                     "estoque_atual": round(est, 2),
                     "em_transito": round(tr, 2),
                     "valor_vendido_12m": _sug_float(m.get("valor_vendido_12m")),
@@ -1884,23 +1950,26 @@ def montar_sugestao_compra(items, stock_map, *, consolidar_grupo=True, usar_esto
             if not _passa_filtros_comuns(curva_item, estoque_total):
                 continue
 
-            # ordena membros por relevância (vendas) p/ escolher fornecedor/marca primários
+            # ordena membros por relevância (vendas) p/ marca primária
             membros_det.sort(key=lambda x: (-x["valor_vendido_12m"], -x["demanda_media_dia_ajustada"],
                                             -x["estoque_atual"]))
+            # fornecedores exibidos = quem mais nos vendeu de CADA marca (distinto)
             forns_ord, seen_f = [], set()
             marcas_ord, seen_m = [], set()
             for d in membros_det:
                 f = d["fornecedor"]
-                if f not in seen_f:
+                if f and f not in seen_f:
                     seen_f.add(f); forns_ord.append(f)
                 mk = d.get("marca")
                 if mk and mk not in seen_m:
                     seen_m.add(mk); marcas_ord.append(mk)
-            primario = forns_ord[0] if forns_ord else "SEM FORNECEDOR"
+            # bucket padrão = fornecedor de quem MAIS COMPRAMOS no grupo inteiro
+            primario = max(sup_qty.items(), key=lambda kv: kv[1])[0] if sup_qty else SEM_HIST_COMPRA
+            todos_forns_grupo = set(sup_qty.keys())  # p/ filtro: tudo já comprado no grupo
 
-            # filtro/bucket por fornecedor: se filtrado, joga no fornecedor casado
+            # filtro/bucket: se filtrado, casa contra TUDO que já compramos do grupo
             if fornecedor:
-                casado = next((f for f in forns_ord if fornecedor.lower() in f.lower()), None)
+                casado = next((n for n in sorted(todos_forns_grupo) if fornecedor.lower() in n.lower()), None)
                 if not casado:
                     continue
                 bucket = casado
@@ -2039,8 +2108,15 @@ def sugestao_compra(
         except Exception as e:
             print(f"AVISO: estoque realtime indisponível, usando snapshot. {e}")
 
+    historico = {}
+    try:
+        historico = get_compras_historico()
+    except Exception as e:
+        print(f"AVISO: histórico de compra indisponível (usando vazio). {e}")
+
     return montar_sugestao_compra(
         items, stock_map,
+        historico=historico,
         consolidar_grupo=consolidar_grupo,
         usar_estoque_realtime=usar_estoque_realtime,
         fornecedor=fornecedor,
