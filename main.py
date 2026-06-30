@@ -1195,9 +1195,9 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
         # a tendência/sazonalidade do passado foi removida (sazonalidade forward
         # já ajusta a demanda do próximo período).
         data_12m_ini = hoje - pd.DateOffset(months=12)
-        vendas_ult_12m = grp_valid[
-            (grp_valid["DATA"] >= data_12m_ini) & (grp_valid["DATA"] <= hoje)
-        ]["QUANTIDADE_AJUSTADA"].sum()
+        mask_12m = (grp_valid["DATA"] >= data_12m_ini) & (grp_valid["DATA"] <= hoje)
+        vendas_ult_12m = grp_valid.loc[mask_12m, "QUANTIDADE_AJUSTADA"].sum()
+        num_vendas_12m = int(mask_12m.sum())
 
         metricas.append({
             "PRO_CODIGO": cod,
@@ -1207,6 +1207,7 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             "DATA_MAX_VENDA": data_max,
             "NUM_VENDAS": num_vendas,
             "VENDAS_ULT_12M": vendas_ult_12m,
+            "NUM_VENDAS_12M": num_vendas_12m,
         })
 
     df_met = pd.DataFrame(metricas)
@@ -1244,6 +1245,7 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                     "DATA_MAX_VENDA": pd.NaT,
                     "NUM_VENDAS": 0,
                     "VENDAS_ULT_12M": 0,
+                    "NUM_VENDAS_12M": 0,
                 })
             
             # Adicionar ao DataFrame de métricas
@@ -1428,9 +1430,15 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     # Pouco histórico / Sob demanda / Normal -> SUGERIDO (= BASE)
     # ==========================================
     def ajustar_pouco_historico(row):
+        # num_vendas vitalício = portão de esparsidade (mantém o modelo SS para
+        # quem tem histórico). A MÉDIA do pouco-histórico e o "sem giro" passam a
+        # olhar a JANELA de 12m, para que lançamentos atípicos antigos (ex.: estorno
+        # de entrada errada) não inflem o máximo. Ver produto 8130.
         num_vendas = row["NUM_VENDAS"]
-        qtd_vendida = row["QTD_VENDIDA"]
+        num_vendas_12m = int(row.get("NUM_VENDAS_12M", 0) or 0)
+        qtd_12m = float(row.get("VENDAS_ULT_12M", 0) or 0)
 
+        # Nunca vendeu -> base
         if num_vendas is None or num_vendas <= 0:
             return pd.Series({
                 "ESTOQUE_MIN_SUGERIDO": row["ESTOQUE_MIN_BASE"],
@@ -1438,8 +1446,18 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                 "TIPO_PLANEJAMENTO": "Sem_Historico",
             })
 
+        # Tem histórico, mas SEM venda nos últimos 12m -> usa a base (≈0), não a
+        # média vitalícia (que pode estar contaminada por evento antigo).
+        if num_vendas_12m <= 0:
+            return pd.Series({
+                "ESTOQUE_MIN_SUGERIDO": row["ESTOQUE_MIN_BASE"],
+                "ESTOQUE_MAX_SUGERIDO": row["ESTOQUE_MAX_BASE"],
+                "TIPO_PLANEJAMENTO": "Sem_Giro_Recente",
+            })
+
         if num_vendas <= 10:
-            qtd_media_venda = qtd_vendida / num_vendas if num_vendas > 0 else 0
+            # média da venda na JANELA de 12m (não vitalícia)
+            qtd_media_venda = qtd_12m / num_vendas_12m if num_vendas_12m > 0 else 0
 
             if not pd.isna(row["TEMPO_MEDIO_ESTOQUE"]) and row["TEMPO_MEDIO_ESTOQUE"] <= 5:
                 min_sug = 0
