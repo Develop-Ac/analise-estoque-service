@@ -2271,6 +2271,42 @@ def salvar_distribuicao_fifo_postgres(df_long):
 # EXECUÇÃO DO JOB
 # ==========================================
 
+def atualizar_compras_fornecedor_mongo():
+    """
+    Agrega no ERP a lista PRODUTO -> FORNECEDORES de quem JÁ COMPRAMOS
+    (nfe_itens + nf_entrada + fornecedores), exclui o DEPÓSITO interno e notas
+    canceladas, e grava no Mongo (coleção compras_fornecedor). A tela "Comprar
+    agora" lê disso (rápido), em vez de rodar essa consulta pesada a cada request.
+    """
+    print("Atualizando lista produto x fornecedor (histórico de compra) no Mongo...")
+    inner = ("SELECT i.pro_codigo, f.for_nome, SUM(i.quantidade) AS qtd "
+             "FROM nfe_itens i "
+             "JOIN nf_entrada e ON e.empresa = i.empresa AND e.nfe = i.nfe "
+             "JOIN fornecedores f ON f.empresa = e.empresa AND f.for_codigo = e.for_codigo "
+             "WHERE i.empresa = 3 AND e.dt_cancelamento IS NULL "
+             "AND f.for_nome NOT LIKE '%(DEPOSITO)%' "
+             "GROUP BY i.pro_codigo, f.for_nome")
+    query = f"SELECT * FROM OPENQUERY(CONSULTA, '{inner.replace(chr(39), chr(39) * 2)}')"
+    conn = get_connection()
+    try:
+        df = pd.read_sql(query, conn)
+    finally:
+        conn.close()
+    df.columns = [str(c).upper() for c in df.columns]  # OPENQUERY devolve MAIÚSCULAS
+    mapa = {}
+    for cod, nome, qtd in zip(df["PRO_CODIGO"], df["FOR_NOME"], df["QTD"]):
+        if cod is None:
+            continue
+        mapa.setdefault(str(cod).strip(), []).append((str(nome).strip(), float(qtd or 0)))
+    for c in mapa:
+        mapa[c].sort(key=lambda x: -x[1])
+
+    import empacotamento as emp
+    n = emp.salvar_compras_fornecedor(mapa)
+    print(f"  - {n} produtos x fornecedor gravados (fonte: {len(df)} pares).")
+    return n
+
+
 def run_job():
     print(f"\n=== INICIANDO JOB DE ANÁLISE FIFO: {datetime.datetime.now()} ===")
 
@@ -2479,6 +2515,12 @@ def run_job():
     
     # 11) Auto-Agrupamento Similares
     agrupar_similares_automaticamente()
+
+    # 12) Lista produto x fornecedor (histórico de compra) -> Mongo (tela Comprar agora)
+    try:
+        atualizar_compras_fornecedor_mongo()
+    except Exception as e:
+        print(f"AVISO: falha ao atualizar compras x fornecedor no Mongo: {e}")
     
     print("Job finalizado com sucesso.")
 
@@ -2671,5 +2713,8 @@ if __name__ == "__main__":
         # Cria apenas a tabela
         criar_tabela_postgres()
         print("Tabela criada/verificada com sucesso!")
+    elif len(sys.argv) > 1 and sys.argv[1] == "compras-hist":
+        # Atualiza só a lista produto x fornecedor no Mongo (sem a análise completa)
+        atualizar_compras_fornecedor_mongo()
     else:
         start_service()

@@ -1711,8 +1711,17 @@ def _get_stock_batches(pro_codes):
 # ==========================================
 # SUGESTÃO DE COMPRA (ponto de pedido)
 # ==========================================
-def get_all_realtime_stocks():
-    """Estoque atual de TODOS os produtos ativos (empresa 3) numa query só."""
+import time as _time_rt
+_STOCK_CACHE = {"ts": 0.0, "data": None}
+_STOCK_TTL_S = int(os.getenv("STOCK_RT_TTL_S", 120))  # 2 min
+
+
+def get_all_realtime_stocks(force=False):
+    """Estoque atual de TODOS os produtos ativos (empresa 3) numa query só.
+    Cacheado por processo (TTL curto) p/ toggles de filtro não baterem no ERP a cada request."""
+    now = _time_rt.time()
+    if not force and _STOCK_CACHE["data"] is not None and (now - _STOCK_CACHE["ts"]) < _STOCK_TTL_S:
+        return _STOCK_CACHE["data"]
     inner = ("SELECT pro_codigo, estoque_disponivel FROM produtos "
              "WHERE empresa = 3 AND UPPER(inativo) = 'N' AND UPPER(comercializavel) = 'S'")
     query = f"SELECT * FROM OPENQUERY(CONSULTA, '{inner.replace(chr(39), chr(39)*2)}')"
@@ -1726,6 +1735,8 @@ def get_all_realtime_stocks():
                 m[str(row[0]).strip()] = float(row[1]) if row[1] is not None else 0.0
     finally:
         conn.close()
+    _STOCK_CACHE["ts"] = now
+    _STOCK_CACHE["data"] = m
     return m
 
 
@@ -1737,10 +1748,11 @@ SEM_HIST_COMPRA = "SEM HISTÓRICO DE COMPRA"
 
 def get_compras_historico(force=False):
     """
-    Histórico de COMPRA por produto -> fornecedores de quem JÁ COMPRAMOS, a partir
-    das NF-e de entrada (nfe_itens + nf_entrada + fornecedores). Substitui o uso de
-    fornecedor1/2/3 do cadastro do produto. Exclui o DEPÓSITO interno ('(DEPOSITO)')
-    e notas canceladas. Cacheado por TTL (consulta pesada no ERP).
+    Lista PRODUTO -> fornecedores de quem JÁ COMPRAMOS, LIDA DO MONGO (coleção
+    compras_fornecedor), empacotada pelo batch (main.atualizar_compras_fornecedor_mongo).
+    NÃO toca no ERP no caminho do request — leitura rápida + cache por processo.
+    Se o Mongo estiver vazio/indisponível, retorna {} (a tela carrega, sem
+    agrupamento por fornecedor, até o batch popular).
 
     Retorna: {pro_codigo: [(for_nome, qtd_comprada), ...] ordenado por qtd desc}.
     """
@@ -1748,27 +1760,13 @@ def get_compras_historico(force=False):
     cached = _HIST_CACHE.get("data")
     if not force and cached is not None and (now - _HIST_CACHE["ts"]) < _HIST_TTL_S:
         return cached
-    inner = ("SELECT i.pro_codigo, f.for_nome, SUM(i.quantidade) AS qtd "
-             "FROM nfe_itens i "
-             "JOIN nf_entrada e ON e.empresa = i.empresa AND e.nfe = i.nfe "
-             "JOIN fornecedores f ON f.empresa = e.empresa AND f.for_codigo = e.for_codigo "
-             "WHERE i.empresa = 3 AND e.dt_cancelamento IS NULL "
-             "AND f.for_nome NOT LIKE '%(DEPOSITO)%' "
-             "GROUP BY i.pro_codigo, f.for_nome")
-    query = f"SELECT * FROM OPENQUERY(CONSULTA, '{inner.replace(chr(39), chr(39) * 2)}')"
-    conn = get_sql_connection()
     hist = {}
     try:
-        cur = conn.cursor()
-        cur.execute(query)
-        for cod, nome, qtd in cur.fetchall():
-            if cod is None:
-                continue
-            hist.setdefault(str(cod).strip(), []).append((str(nome).strip(), float(qtd or 0)))
-    finally:
-        conn.close()
-    for c in hist:
-        hist[c].sort(key=lambda x: -x[1])
+        import empacotamento as emp
+        hist = emp.carregar_compras_fornecedor()
+    except Exception as e:
+        print(f"AVISO: lista compras x fornecedor (Mongo) indisponível: {e}")
+        hist = {}
     _HIST_CACHE["ts"] = now
     _HIST_CACHE["data"] = hist
     return hist

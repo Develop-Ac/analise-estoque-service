@@ -330,6 +330,49 @@ def to_entradas_sinteticas(docs):
     return pd.DataFrame(rows, columns=cols)
 
 
+# ----------------------------------------------------------------------
+# Lista produto -> fornecedores (histórico de compra) no Mongo
+# ----------------------------------------------------------------------
+COMPRAS_COL = os.getenv("MONGO_COMPRAS_COL", "compras_fornecedor")
+COMPRAS_FILE = os.getenv("COMPRAS_HIST_FILE")  # se setado, usa arquivo JSON (dev/teste)
+
+
+def salvar_compras_fornecedor(mapa):
+    """
+    Grava {pro_codigo: [(for_nome, qtd), ...]} (já ordenado desc) no Mongo
+    (coleção compras_fornecedor), 1 doc por produto. Substitui tudo.
+    Em dev, se COMPRAS_HIST_FILE estiver setado, grava num JSON.
+    Retorna a quantidade de produtos gravados.
+    """
+    if COMPRAS_FILE:
+        with open(COMPRAS_FILE, "w", encoding="utf-8") as f:
+            json.dump({c: [[n, round(float(q), 2)] for n, q in lst] for c, lst in mapa.items()},
+                      f, ensure_ascii=False)
+        return len(mapa)
+    import pymongo
+    cli = pymongo.MongoClient(MONGO_URL, serverSelectionTimeoutMS=8000)
+    col = cli[MONGO_DB][COMPRAS_COL]
+    col.delete_many({})
+    docs = [{"_id": str(cod), "f": [[n, round(float(q), 2)] for n, q in lst]}
+            for cod, lst in mapa.items() if lst]
+    if docs:
+        for i in range(0, len(docs), 5000):
+            col.insert_many(docs[i:i + 5000], ordered=False)
+    return len(docs)
+
+
+def carregar_compras_fornecedor():
+    """Lê o mapa produto -> [(for_nome, qtd), ...] do Mongo (ou do JSON em dev)."""
+    if COMPRAS_FILE and os.path.exists(COMPRAS_FILE):
+        with open(COMPRAS_FILE, encoding="utf-8") as f:
+            raw = json.load(f)
+        return {str(c): [(x[0], float(x[1])) for x in lst] for c, lst in raw.items()}
+    import pymongo
+    cli = pymongo.MongoClient(MONGO_URL, serverSelectionTimeoutMS=8000)
+    col = cli[MONGO_DB][COMPRAS_COL]
+    return {d["_id"]: [(x[0], float(x[1])) for x in d.get("f", [])] for d in col.find({})}
+
+
 def fifo_por_camadas(df_ent, df_sai, df_saldo, packs=None, hoje=None):
     """
     MOTOR FIFO ÚNICO (layer model). Substitui o loop de DATA_COMPRA do run_job e o
