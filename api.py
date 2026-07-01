@@ -1874,6 +1874,9 @@ def _sug_posicao(it, stock_map, usar_rt):
 
 # Z (nível de serviço) por curva — espelha Z_POR_CURVA do main.py.
 _Z_POR_CURVA = {"A": 2.054, "B": 1.645, "C": 1.282, "D": 1.036}
+# Nível de serviço (probabilidade) por curva — espelha NS_POR_CURVA do main.py.
+_NS_POR_CURVA = {"A": 0.98, "B": 0.95, "C": 0.90, "D": 0.85}
+_ALPHA_CROSTON = 0.1
 
 # Cobertura por classe (dias de ciclo) — espelha REGRAS_DIAS do main.py.
 _REGRAS_DIAS = {
@@ -1924,6 +1927,40 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
                     "Máximo = Mínimo + demanda × dias de ciclo."),
         "componentes": comp,
     }
+
+    # ----- Derivação do MÉTODO DE DEMANDA (passo a passo, com números reais) -----
+    lt = _sug_float(lead_time)
+    dem = _sug_float(demanda_dia)
+    ss_v = _sug_float(ss)
+    mmin = int(_sug_float(minimo))
+    mmax = int(_sug_float(maximo))
+    met = metodo or "Normal (Z·σ·√LT)"
+    intermit = any(k in met for k in ("Croston", "Poisson", "Binomial"))
+    passos = []
+    if intermit:
+        ns = _NS_POR_CURVA.get(_sug_norm(curva).upper(), 0.90)
+        dem_c = dem * (1 - _ALPHA_CROSTON / 2.0)
+        lam = dem_c * lt
+        dist = "Binomial Negativa" if "Binomial" in met else "Poisson"
+        passos = [
+            f"Demanda intermitente/grumosa → Croston + {dist} composta (não usa a Normal).",
+            f"Demanda corrigida (Croston, 1−α/2) = {round(dem, 4)} × {round(1 - _ALPHA_CROSTON / 2.0, 3)} = {round(dem_c, 4)} un/dia.",
+            f"λ (esperado no lead time) = demanda corrigida × lead time = {round(dem_c, 4)} × {int(lt)} = {round(lam, 2)} un.",
+            f"Ponto de pedido (mín) = quantil {int(ns * 100)}% da {dist} da demanda no lead time = {mmin} un.",
+            f"Estoque de segurança = ponto de pedido − λ = {mmin} − {round(lam, 2)} = {int(ss_v)} un.",
+            f"Máximo = quantil {int(ns * 100)}% no horizonte (lead time + dias de ciclo) = {mmax} un.",
+        ]
+    else:
+        z_v = _sug_float(z)
+        sig = _sug_float(sigma_dia)
+        if sig > 0 and z_v > 0:
+            passos.append(f"Estoque de segurança = Z × σ × √(lead time) = {round(z_v, 3)} × {round(sig, 4)} × √{int(lt)} = {int(ss_v)} un.")
+        else:
+            passos.append(f"Estoque de segurança (Z·σ·√lead time) = {int(ss_v)} un.")
+        passos.append(f"Ponto de pedido (mín) = demanda × lead time + SS = {round(dem, 4)} × {int(lt)} + {int(ss_v)} = {mmin} un.")
+        passos.append(f"Máximo = mín + demanda × dias de ciclo = {mmin} + {round(dem, 4)} × {ciclo} = {mmax} un.")
+    mem["metodo_calculo"] = {"tipo": met, "passos": passos}
+
     if membros:
         mem["membros"] = membros
     return mem
