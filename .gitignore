@@ -14,3 +14,4 @@ venv.bak/
 *.json
 *.log
 .DS_Store
+sql/

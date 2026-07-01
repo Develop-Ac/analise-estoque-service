@@ -116,6 +116,23 @@ NS_POR_CURVA = {
     "D": float(os.getenv("NS_CURVA_D") or 0.85),
 }
 
+# ---- Nível de serviço ECONÔMICO (razão crítica / newsvendor) — MODO SOMBRA ----
+# p* = margem / (margem + custo de manter).  Cu = margem unitária perdida na ruptura;
+# Co = custo de carregar 1 un pelo ciclo = custo × taxa_anual × (dias_ciclo/365).
+# Calculado EM PARALELO ao nível da curva: preenche colunas *_custo para comparação,
+# mas NÃO altera a sugestão oficial (estoque_min/max_sugerido seguem pela curva).
+# Vira oficial só quando NS_MODO=custo (rollout futuro). Fontes: Silver-Pyke-Peterson;
+# razão crítica de Arrow-Harris-Marschak (newsvendor). Ver manual, cap. 2.
+HOLDING_RATE_ANUAL = float(os.getenv("HOLDING_RATE_ANUAL") or 0.25)   # custo de manter (20-30%/ano típico)
+NS_MODO = (os.getenv("NS_MODO") or "sombra").strip().lower()          # 'sombra' | 'custo'
+# Faixa (piso, teto) do nível de serviço por curva: o custo escolhe o ponto, a ABC dá os limites.
+NS_FAIXA_CURVA = {
+    "A": (float(os.getenv("NS_PISO_A") or 0.90), float(os.getenv("NS_TETO_A") or 0.99)),
+    "B": (float(os.getenv("NS_PISO_B") or 0.85), float(os.getenv("NS_TETO_B") or 0.98)),
+    "C": (float(os.getenv("NS_PISO_C") or 0.80), float(os.getenv("NS_TETO_C") or 0.96)),
+    "D": (float(os.getenv("NS_PISO_D") or 0.75), float(os.getenv("NS_TETO_D") or 0.94)),
+}
+
 # Croston/SBA: constante de suavização (a correção de viés usa 1 - alpha/2).
 ALPHA_CROSTON = float(os.getenv("ALPHA_CROSTON") or 0.1)
 
@@ -367,6 +384,45 @@ def criar_tabela_postgres():
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='valor_vendido_12m') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN valor_vendido_12m DECIMAL(15,4);
+        END IF;
+
+        -- ===== Nível de serviço ECONÔMICO (razão crítica / newsvendor) — MODO SOMBRA =====
+        -- Colunas paralelas p/ comparar com o nível da curva; NÃO alteram a sugestão oficial.
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='custo_unitario') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN custo_unitario DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='margem_unitaria') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN margem_unitaria DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='margem_pct') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN margem_pct DECIMAL(8,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='nivel_servico_custo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN nivel_servico_custo DECIMAL(6,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='z_custo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN z_custo DECIMAL(6,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='estoque_min_custo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN estoque_min_custo INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='estoque_max_custo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN estoque_max_custo INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='estoque_seg_custo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN estoque_seg_custo INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_nivel_servico_custo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_nivel_servico_custo DECIMAL(6,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_estoque_min_custo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_estoque_min_custo INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_estoque_max_custo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_estoque_max_custo INTEGER;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_margem_pct') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_margem_pct DECIMAL(8,4);
         END IF;
 
         -- ===== Padrão de demanda (Croston/Poisson) + sazonalidade =====
@@ -826,6 +882,52 @@ def _quantil_demanda(media, var, p, z):
     return k
 
 
+def _norm_ppf(p):
+    """Inversa da CDF Normal padrão (algoritmo de Acklam) — evita depender de scipy.
+    Converte um nível de serviço (probabilidade) no fator Z correspondente."""
+    try: p = float(p)
+    except (TypeError, ValueError): return 0.0
+    if p <= 0.0: return -8.0
+    if p >= 1.0: return 8.0
+    a = [-3.969683028665376e+01, 2.209460984245205e+02, -2.759285104469687e+02,
+         1.383577518672690e+02, -3.066479806614716e+01, 2.506628277459239e+00]
+    b = [-5.447609879822406e+01, 1.615858368580409e+02, -1.556989798598866e+02,
+         6.680131188771972e+01, -1.328068155288572e+01]
+    c = [-7.784894002430293e-03, -3.223964580411365e-01, -2.400758277161838e+00,
+         -2.549732539343734e+00, 4.374664141464968e+00, 2.938163982698783e+00]
+    d = [7.784695709041462e-03, 3.224671290700398e-01, 2.445134137142996e+00,
+         3.754408661907416e+00]
+    plow, phigh = 0.02425, 1 - 0.02425
+    if p < plow:
+        q = math.sqrt(-2 * math.log(p))
+        return (((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    if p > phigh:
+        q = math.sqrt(-2 * math.log(1 - p))
+        return -(((((c[0]*q+c[1])*q+c[2])*q+c[3])*q+c[4])*q+c[5]) / ((((d[0]*q+d[1])*q+d[2])*q+d[3])*q+1)
+    q = p - 0.5; r = q * q
+    return (((((a[0]*r+a[1])*r+a[2])*r+a[3])*r+a[4])*r+a[5])*q / (((((b[0]*r+b[1])*r+b[2])*r+b[3])*r+b[4])*r+1)
+
+
+def _nivel_servico_custo(curva, margem_unit, custo_unit, dias_ciclo):
+    """Nível de serviço econômico pela razão crítica (newsvendor): p* = Cu/(Cu+Co).
+    Cu = margem unitária (lucro perdido na ruptura); Co = custo de carregar 1 un pelo
+    ciclo = custo × HOLDING_RATE_ANUAL × (dias_ciclo/365). Aplica a faixa da curva ABC.
+    Retorna (p, z) ou (None, None) quando faltam dados (→ cai no nível da curva)."""
+    try:
+        m = float(margem_unit); c = float(custo_unit); dc = float(dias_ciclo)
+    except (TypeError, ValueError):
+        return None, None
+    if pd.isna(m) or pd.isna(c) or not (m > 0 and c > 0) or dc <= 0:
+        return None, None
+    co = c * HOLDING_RATE_ANUAL * (dc / 365.0)
+    if co <= 0:
+        return None, None
+    p = m / (m + co)
+    piso, teto = NS_FAIXA_CURVA.get(curva, (0.75, 0.99))
+    p = min(max(p, piso), teto)
+    return p, _norm_ppf(p)
+
+
 def calcular_indices_sazonais(df_sai_fifo: pd.DataFrame,
                               df_saldo_produto: pd.DataFrame,
                               hoje: pd.Timestamp,
@@ -943,11 +1045,25 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
         s["TOTAL_LIQUIDO"] = pd.to_numeric(df_sai_fifo["TOTAL_LIQUIDO"], errors="coerce").fillna(0).values
     else:
         s["TOTAL_LIQUIDO"] = 0.0
+    # Custo unitário da linha (preco_custo, vindo do ERP) — base do COGS e da margem.
+    if "PRECO_CUSTO" in df_sai_fifo.columns:
+        s["PRECO_CUSTO"] = pd.to_numeric(df_sai_fifo["PRECO_CUSTO"], errors="coerce").fillna(0).values
+    else:
+        s["PRECO_CUSTO"] = np.nan
     s = s[(s["DATA"] >= data_ini) & (s["DATA"] <= hoje)]
     s["MES"] = s["DATA"].dt.to_period("M")
 
     vendas_mes = s.groupby(["PRO_CODIGO", "MES"])["QUANTIDADE_AJUSTADA"].sum()
     valor_12m = s.groupby("PRO_CODIGO")["TOTAL_LIQUIDO"].sum()
+
+    # ---------- Custo unitário e margem (para o nível de serviço econômico) ----------
+    # COGS = Σ(preco_custo × qtd); custo_unit e preço_unit sobre a MESMA qtd → margem coerente.
+    s["_COGS"] = s["PRECO_CUSTO"] * s["QUANTIDADE_AJUSTADA"]
+    qtd_12m = s.groupby("PRO_CODIGO")["QUANTIDADE_AJUSTADA"].sum()
+    cogs_12m = s.groupby("PRO_CODIGO")["_COGS"].sum(min_count=1)  # NaN se nunca houve preco_custo
+    custo_unit = (cogs_12m / qtd_12m.replace(0, np.nan))
+    preco_unit = (valor_12m / qtd_12m.replace(0, np.nan))
+    margem_unit = (preco_unit - custo_unit)
 
     # venda média por evento (linha de venda) — usada como referência do cap da VP
     linhas = s.groupby("PRO_CODIGO")["QUANTIDADE_AJUSTADA"].agg(["sum", "count"])
@@ -987,7 +1103,8 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
         return pd.DataFrame(columns=["PRO_CODIGO", "DEM_DIA_VENDAS", "DEM_DIA_REAL",
                                      "SIGMA_DEMANDA_DIA", "CV_DEMANDA",
                                      "VENDA_PERDIDA_12M", "VALOR_VENDIDO_12M",
-                                     "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES"])
+                                     "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES",
+                                     "CUSTO_UNIT", "MARGEM_UNIT", "MARGEM_PCT"])
 
     mat = demanda_mes.unstack(fill_value=0).reindex(columns=meses, fill_value=0)
     vendas_mat = (vendas_mes.unstack(fill_value=0).reindex(columns=meses, fill_value=0)
@@ -1015,6 +1132,10 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
     res["MEAN_SIZE_MES"] = mean_size.fillna(0.0)
     res["VENDA_PERDIDA_12M"] = vp_total.reindex(mat.index).fillna(0) if not vp_total.empty else 0.0
     res["VALOR_VENDIDO_12M"] = valor_12m.reindex(mat.index).fillna(0)
+    # Custo/margem unitários (NaN quando não há preco_custo → nível de serviço cai na curva)
+    res["CUSTO_UNIT"] = custo_unit.reindex(mat.index)
+    res["MARGEM_UNIT"] = margem_unit.reindex(mat.index)
+    res["MARGEM_PCT"] = (margem_unit / preco_unit).reindex(mat.index)
     if not vendas_mat.empty:
         res["DEM_DIA_VENDAS"] = vendas_mat.reindex(index=mat.index).fillna(0).sum(axis=1) / dias_janela
     else:
@@ -1048,42 +1169,68 @@ def _classificar_padrao(dem, adi, cv2):
         return "Intermitente"
     return "Grumoso"
 
-def calcular_min_max(curva, dem, sigma_dia, padrao, sgr, data_max, cv2, msize, hoje):
+def calcular_min_max(curva, dem, sigma_dia, padrao, sgr, data_max, cv2, msize, hoje,
+                     margem_unit=None, custo_unit=None):
     """
     Min/Máx (s,S) escolhendo o método pelo padrão de demanda:
       - Suave/Errático -> Normal: SS=Z·σ·√LT (teto N ciclos); min=d·LT+SS; max=min+d·ciclo
       - Intermitente/Grumoso -> Poisson composta: quantil da distribuição discreta
-    `dem` já deve vir sazonalizada. Retorna dict (min, max, ss, z).
+    `dem` já deve vir sazonalizada.
+
+    Calcula DOIS conjuntos com o mesmo motor: o OFICIAL (nível de serviço da curva) e,
+    quando há margem/custo, o de SOMBRA (nível econômico newsvendor). O oficial não muda —
+    o de sombra vai em colunas *_CUSTO só para comparação (ver NS_MODO/rollout).
     """
     regra = REGRAS_DIAS.get(sgr, REGRAS_DIAS["default"])
-    z = Z_POR_CURVA.get(curva, Z_POR_CURVA["C"])
     try: sigma_dia = float(sigma_dia) if not pd.isna(sigma_dia) else 0.0
     except (TypeError, ValueError): sigma_dia = 0.0
     try: dem = float(dem) if not pd.isna(dem) else 0.0
     except (TypeError, ValueError): dem = 0.0
+    vazio = {"ESTOQUE_MIN_BASE": 0, "ESTOQUE_MAX_BASE": 0, "ESTOQUE_SEGURANCA": 0, "NIVEL_SERVICO_Z": 0.0,
+             "NIVEL_SERVICO_CUSTO": None, "Z_CUSTO": None,
+             "ESTOQUE_MIN_CUSTO": 0, "ESTOQUE_MAX_CUSTO": 0, "ESTOQUE_SEG_CUSTO": 0}
     if dem <= 0 or curva not in regra:
-        return {"ESTOQUE_MIN_BASE": 0, "ESTOQUE_MAX_BASE": 0, "ESTOQUE_SEGURANCA": 0, "NIVEL_SERVICO_Z": 0.0}
+        return vazio
     dmin, dmax = regra[curva]; dias_ciclo = max(dmax - dmin, 1)
-    if padrao in ("Intermitente", "Grumoso"):
-        dem_c = dem * (1 - ALPHA_CROSTON / 2.0); p = NS_POR_CURVA.get(curva, 0.90)
-        try: cv2 = float(cv2 or 0.0); msize = float(msize or 0.0)
-        except (TypeError, ValueError): cv2, msize = 0.0, 0.0
-        disp = max(msize * (1.0 + cv2), 1.0)
-        media_lt = dem_c * LEAD_TIME_DIAS; media_ltc = dem_c * (LEAD_TIME_DIAS + dias_ciclo)
-        rop = _quantil_demanda(media_lt, media_lt * disp, p, z)
-        S = _quantil_demanda(media_ltc, media_ltc * disp, p, z)
-        est_min = int(rop); est_max = int(max(S, rop + 1)); est_ss = int(max(rop - media_lt, 0))
-    else:
-        ss = z * sigma_dia * np.sqrt(LEAD_TIME_DIAS)
-        if SS_CAP_CICLOS and SS_CAP_CICLOS > 0:
-            ss = min(ss, dem * dias_ciclo * SS_CAP_CICLOS)
-        rop = dem * LEAD_TIME_DIAS + ss; max_nivel = rop + dem * dias_ciclo
-        est_min = int(np.ceil(rop)); est_max = int(np.ceil(max_nivel)); est_ss = int(np.ceil(ss))
+    try: cv2f = float(cv2 or 0.0); msizef = float(msize or 0.0)
+    except (TypeError, ValueError): cv2f, msizef = 0.0, 0.0
+    disp = max(msizef * (1.0 + cv2f), 1.0)
     dias_corte = 365 if sgr == 154 else 240
-    if not pd.isna(data_max) and (hoje - data_max).days > dias_corte:
-        est_min = 0; est_max = max(1, int(np.ceil(dem * 15))); est_ss = 0
-    return {"ESTOQUE_MIN_BASE": est_min, "ESTOQUE_MAX_BASE": est_max,
-            "ESTOQUE_SEGURANCA": est_ss, "NIVEL_SERVICO_Z": round(float(z), 4)}
+    velho = (not pd.isna(data_max)) and ((hoje - data_max).days > dias_corte)
+
+    def _core(z, p):
+        if padrao in ("Intermitente", "Grumoso"):
+            dem_c = dem * (1 - ALPHA_CROSTON / 2.0)
+            media_lt = dem_c * LEAD_TIME_DIAS; media_ltc = dem_c * (LEAD_TIME_DIAS + dias_ciclo)
+            rop = _quantil_demanda(media_lt, media_lt * disp, p, z)
+            S = _quantil_demanda(media_ltc, media_ltc * disp, p, z)
+            emin = int(rop); emax = int(max(S, rop + 1)); ess = int(max(rop - media_lt, 0))
+        else:
+            ss = z * sigma_dia * np.sqrt(LEAD_TIME_DIAS)
+            if SS_CAP_CICLOS and SS_CAP_CICLOS > 0:
+                ss = min(ss, dem * dias_ciclo * SS_CAP_CICLOS)
+            rop = dem * LEAD_TIME_DIAS + ss
+            emin = int(np.ceil(rop)); emax = int(np.ceil(rop + dem * dias_ciclo)); ess = int(np.ceil(ss))
+        if velho:
+            emin = 0; emax = max(1, int(np.ceil(dem * 15))); ess = 0
+        return emin, emax, ess
+
+    # OFICIAL — nível de serviço da curva (inalterado)
+    z_of = Z_POR_CURVA.get(curva, Z_POR_CURVA["C"]); p_of = NS_POR_CURVA.get(curva, 0.90)
+    emin, emax, ess = _core(z_of, p_of)
+    out = {"ESTOQUE_MIN_BASE": emin, "ESTOQUE_MAX_BASE": emax,
+           "ESTOQUE_SEGURANCA": ess, "NIVEL_SERVICO_Z": round(float(z_of), 4)}
+
+    # SOMBRA — nível econômico (razão crítica). Sem margem/custo → espelha o oficial.
+    p_c, z_c = _nivel_servico_custo(curva, margem_unit, custo_unit, dias_ciclo)
+    if p_c is not None:
+        cmin, cmax, css = _core(z_c, p_c)
+        out.update({"NIVEL_SERVICO_CUSTO": round(p_c, 4), "Z_CUSTO": round(float(z_c), 4),
+                    "ESTOQUE_MIN_CUSTO": cmin, "ESTOQUE_MAX_CUSTO": cmax, "ESTOQUE_SEG_CUSTO": css})
+    else:
+        out.update({"NIVEL_SERVICO_CUSTO": None, "Z_CUSTO": None,
+                    "ESTOQUE_MIN_CUSTO": emin, "ESTOQUE_MAX_CUSTO": emax, "ESTOQUE_SEG_CUSTO": ess})
+    return out
 
 METODO_LABEL = {"Suave": "Normal (Z·σ·√LT)", "Erratico": "Normal (Z·σ·√LT)",
                 "Intermitente": "Croston+Poisson", "Grumoso": "Croston+Binomial Neg",
@@ -1152,10 +1299,16 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
 
     res = g.apply(lambda r: calcular_min_max(r["GRUPO_CURVA"], r["GRUPO_DEMANDA_DIA"], r["SIGMA_DEMANDA_DIA"],
                   r["GRUPO_PADRAO"], r["SGR_CODIGO"], r["DATA_MAX_VENDA"], r.get("CV2_TAMANHO"),
-                  r.get("MEAN_SIZE_MES"), hoje), axis=1)
+                  r.get("MEAN_SIZE_MES"), hoje,
+                  margem_unit=r.get("MARGEM_UNIT"), custo_unit=r.get("CUSTO_UNIT")), axis=1)
     g["GRUPO_ESTOQUE_MIN"] = [x["ESTOQUE_MIN_BASE"] for x in res]
     g["GRUPO_ESTOQUE_MAX"] = [x["ESTOQUE_MAX_BASE"] for x in res]
     g["GRUPO_ESTOQUE_SEGURANCA"] = [x["ESTOQUE_SEGURANCA"] for x in res]
+    # Sombra econômica do grupo (razão crítica) — só comparação, não muda a sugestão
+    g["GRUPO_NIVEL_SERVICO_CUSTO"] = [x["NIVEL_SERVICO_CUSTO"] for x in res]
+    g["GRUPO_ESTOQUE_MIN_CUSTO"] = [x["ESTOQUE_MIN_CUSTO"] for x in res]
+    g["GRUPO_ESTOQUE_MAX_CUSTO"] = [x["ESTOQUE_MAX_CUSTO"] for x in res]
+    g["GRUPO_MARGEM_PCT"] = pd.to_numeric(g.get("MARGEM_PCT"), errors="coerce")
     g["GRUPO_METODO"] = g["GRUPO_PADRAO"].map(METODO_LABEL).fillna("Normal (Z·σ·√LT)")
 
     # tamanho médio do lote e CV² (dispersão) do GRUPO — p/ reproduzir a distribuição exata
@@ -1164,7 +1317,9 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     cols = ["GRUPO", "GRUPO_QTD_ITENS", "GRUPO_ESTOQUE_DISPONIVEL", "GRUPO_DEMANDA_DIA",
             "GRUPO_FATOR_SAZONAL", "GRUPO_CURVA", "GRUPO_PADRAO", "GRUPO_METODO",
             "GRUPO_ESTOQUE_MIN", "GRUPO_ESTOQUE_MAX", "GRUPO_ESTOQUE_SEGURANCA",
-            "GRUPO_MEAN_SIZE", "GRUPO_CV2"]
+            "GRUPO_MEAN_SIZE", "GRUPO_CV2",
+            "GRUPO_NIVEL_SERVICO_CUSTO", "GRUPO_ESTOQUE_MIN_CUSTO", "GRUPO_ESTOQUE_MAX_CUSTO",
+            "GRUPO_MARGEM_PCT"]
     return g[cols]
 
 
@@ -1285,7 +1440,8 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
 
     cols_rec = ["DEM_DIA_VENDAS", "DEM_DIA_REAL", "SIGMA_DEMANDA_DIA",
                 "CV_DEMANDA", "VENDA_PERDIDA_12M", "VALOR_VENDIDO_12M",
-                "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES"]
+                "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES",
+                "CUSTO_UNIT", "MARGEM_UNIT", "MARGEM_PCT"]
     if df_rec is not None and not df_rec.empty:
         df_rec["PRO_CODIGO"] = df_rec["PRO_CODIGO"].astype(str).str.strip()
         df_met = df_met.merge(df_rec[["PRO_CODIGO"] + cols_rec], on="PRO_CODIGO", how="left")
@@ -1439,7 +1595,8 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             row["CURVA_ABC"], row.get("DEMANDA_PLANEJAMENTO_DIA", 0.0),
             row.get("SIGMA_DEMANDA_DIA", 0.0), row.get("PADRAO_DEMANDA", "Suave"),
             row.get("SGR_CODIGO", None), row["DATA_MAX_VENDA"],
-            row.get("CV2_TAMANHO", 0.0), row.get("MEAN_SIZE_MES", 0.0), hoje))
+            row.get("CV2_TAMANHO", 0.0), row.get("MEAN_SIZE_MES", 0.0), hoje,
+            margem_unit=row.get("MARGEM_UNIT"), custo_unit=row.get("CUSTO_UNIT")))
 
     base_minmax = df_met.apply(calc_min_max_base, axis=1)
     df_met = pd.concat([df_met, base_minmax], axis=1)
@@ -2112,6 +2269,14 @@ def salvar_metricas_postgres(df_metricas):
         'CLASSE_XYZ': 'classe_xyz',
         'ESTOQUE_SEGURANCA': 'estoque_seguranca',
         'NIVEL_SERVICO_Z': 'nivel_servico_z',
+        'CUSTO_UNIT': 'custo_unitario',
+        'MARGEM_UNIT': 'margem_unitaria',
+        'MARGEM_PCT': 'margem_pct',
+        'NIVEL_SERVICO_CUSTO': 'nivel_servico_custo',
+        'Z_CUSTO': 'z_custo',
+        'ESTOQUE_MIN_CUSTO': 'estoque_min_custo',
+        'ESTOQUE_MAX_CUSTO': 'estoque_max_custo',
+        'ESTOQUE_SEG_CUSTO': 'estoque_seg_custo',
         'LEAD_TIME_DIAS': 'lead_time_dias',
         'VENDA_PERDIDA_12M': 'venda_perdida_12m',
         'VALOR_VENDIDO_12M': 'valor_vendido_12m',
@@ -2133,6 +2298,10 @@ def salvar_metricas_postgres(df_metricas):
         'GRUPO_ESTOQUE_SEGURANCA': 'grupo_estoque_seguranca',
         'GRUPO_MEAN_SIZE': 'grupo_mean_size',
         'GRUPO_CV2': 'grupo_cv2',
+        'GRUPO_NIVEL_SERVICO_CUSTO': 'grupo_nivel_servico_custo',
+        'GRUPO_ESTOQUE_MIN_CUSTO': 'grupo_estoque_min_custo',
+        'GRUPO_ESTOQUE_MAX_CUSTO': 'grupo_estoque_max_custo',
+        'GRUPO_MARGEM_PCT': 'grupo_margem_pct',
         'dados_alteracao_json': 'dados_alteracao_json'
     }
     
@@ -2159,12 +2328,15 @@ def salvar_metricas_postgres(df_metricas):
         'pro_referencia',
         'demanda_real_dia', 'sigma_demanda_dia', 'cv_demanda', 'mean_size_mes', 'cv2_tamanho', 'classe_xyz',
         'estoque_seguranca', 'nivel_servico_z', 'lead_time_dias',
+        'custo_unitario', 'margem_unitaria', 'margem_pct',
+        'nivel_servico_custo', 'z_custo', 'estoque_min_custo', 'estoque_max_custo', 'estoque_seg_custo',
         'venda_perdida_12m', 'valor_vendido_12m',
         'padrao_demanda', 'metodo_reposicao', 'fator_sazonal', 'demanda_planejamento_dia',
         'sob_encomenda', 'grupo_chave', 'grupo_qtd_itens', 'grupo_estoque_disponivel',
         'grupo_demanda_dia', 'grupo_fator_sazonal', 'grupo_curva', 'grupo_padrao',
         'grupo_metodo', 'grupo_estoque_min', 'grupo_estoque_max', 'grupo_estoque_seguranca',
         'grupo_mean_size', 'grupo_cv2',
+        'grupo_nivel_servico_custo', 'grupo_estoque_min_custo', 'grupo_estoque_max_custo', 'grupo_margem_pct',
         'dados_alteracao_json'
     ]
     

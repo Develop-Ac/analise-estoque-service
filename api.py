@@ -211,6 +211,19 @@ class AnaliseItem(BaseModel):
     grupo_curva: Optional[str] = None
     grupo_metodo: Optional[str] = None
     grupo_fator_sazonal: Optional[float] = None
+    # Nível de serviço econômico (razão crítica / newsvendor) — modo sombra
+    custo_unitario: Optional[float] = None
+    margem_unitaria: Optional[float] = None
+    margem_pct: Optional[float] = None
+    nivel_servico_custo: Optional[float] = None
+    z_custo: Optional[float] = None
+    estoque_min_custo: Optional[int] = None
+    estoque_max_custo: Optional[int] = None
+    estoque_seg_custo: Optional[int] = None
+    grupo_nivel_servico_custo: Optional[float] = None
+    grupo_estoque_min_custo: Optional[int] = None
+    grupo_estoque_max_custo: Optional[int] = None
+    grupo_margem_pct: Optional[float] = None
     memoria: Optional[dict] = None
     memoria_grupo: Optional[dict] = None
 
@@ -811,22 +824,52 @@ def trigger_auto_group():
         raise HTTPException(status_code=500, detail=f"Erro auto-agrupamento: {str(e)}")
 
 @app.get("/subgroups")
-def listar_subgrupos():
+def listar_subgrupos(
+    curva: Optional[str] = None,
+    fornecedor: Optional[str] = None,
+):
     """
     Retorna lista de subgrupos disponiveis na analise atual.
+
+    Se `curva` e/ou `fornecedor` forem informados, devolve APENAS os subgrupos
+    dos produtos que passam nesses filtros — usa a mesma lógica de candidatos da
+    sugestão de compra (`_codigos_candidatos`), para o filtro dependente na tela
+    (compras/sugestao) ficar coerente com o resultado.
     """
     try:
+        # Sem filtros dependentes → lista completa, direto do banco (rápido).
+        if not (curva or fornecedor):
+            conn = get_db_connection()
+            try:
+                sql = text("SELECT DISTINCT sgr_descricao FROM com_fifo_completo WHERE sgr_descricao IS NOT NULL ORDER BY sgr_descricao")
+                rows = conn.execute(sql).fetchall()
+                return [row[0] for row in rows if row[0]]
+            finally:
+                conn.close()
+
+        # Com filtros → mesma base/lógica da sugestão, sem filtrar por subgrupo.
         conn = get_db_connection()
-        # Buscar distinct sgr_descricao que não seja nulo, ordenado
-        sql = text("SELECT DISTINCT sgr_descricao FROM com_fifo_completo WHERE sgr_descricao IS NOT NULL ORDER BY sgr_descricao")
-        rows = conn.execute(sql).fetchall()
-        
-        # Retorna lista simples de strings
-        return [row[0] for row in rows if row[0]]
+        try:
+            items = _carregar_itens_sugestao(conn)
+        finally:
+            conn.close()
+
+        historico = {}
+        try:
+            historico = get_compras_historico()
+        except Exception as e:
+            print(f"AVISO: histórico indisponível em /subgroups (usando vazio). {e}")
+
+        codes = _codigos_candidatos(items, historico, curva, None, fornecedor, consolidar_grupo=True)
+        subs = set()
+        for it in items:
+            if _sug_norm(it.get("pro_codigo")) in codes:
+                sgr = it.get("sgr_descricao")
+                if sgr:
+                    subs.add(sgr)
+        return sorted(subs)
     except Exception as e:
          raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        if 'conn' in locals(): conn.close()
 
 @app.get("/brands")
 def listar_marcas():
@@ -855,6 +898,85 @@ def listar_categorias_estocagem():
         return [row[0] for row in rows if row[0]]
     except Exception as e:
          raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if 'conn' in locals(): conn.close()
+
+@app.get("/analise/comparacao-custo")
+def comparacao_nivel_servico_custo():
+    """
+    Comparação AGREGADA entre o nível de serviço da CURVA (oficial) e o de CUSTO
+    (razão crítica / newsvendor — modo sombra). Só leitura; alimenta a tela de
+    comparação. Considera itens com nivel_servico_custo preenchido (têm margem/custo
+    confiáveis) e fora de 'sob encomenda'. Capital = ponto de pedido × custo unitário.
+    """
+    try:
+        conn = get_db_connection()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao conectar no banco: {e}")
+    try:
+        base_where = ("nivel_servico_custo IS NOT NULL "
+                      "AND COALESCE(sob_encomenda, FALSE) = FALSE")
+        rows = conn.execute(text(f"""
+            SELECT curva_abc AS curva,
+                   COUNT(*)                                                       AS itens,
+                   COALESCE(SUM(estoque_min_base), 0)                             AS min_curva,
+                   COALESCE(SUM(estoque_min_custo), 0)                            AS min_custo,
+                   COALESCE(SUM(estoque_min_base  * COALESCE(custo_unitario,0)),0) AS capital_curva,
+                   COALESCE(SUM(estoque_min_custo * COALESCE(custo_unitario,0)),0) AS capital_custo,
+                   SUM(CASE WHEN estoque_min_custo > estoque_min_base THEN 1 ELSE 0 END) AS subiram,
+                   SUM(CASE WHEN estoque_min_custo < estoque_min_base THEN 1 ELSE 0 END) AS desceram,
+                   SUM(CASE WHEN estoque_min_custo = estoque_min_base THEN 1 ELSE 0 END) AS iguais,
+                   AVG(nivel_servico_custo)                                       AS ns_custo_medio,
+                   AVG(margem_pct)                                                AS margem_media
+            FROM com_fifo_completo
+            WHERE {base_where}
+            GROUP BY curva_abc
+            ORDER BY curva_abc
+        """)).mappings().all()
+
+        def _row(r):
+            d = dict(r)
+            for k in ("itens", "min_curva", "min_custo", "subiram", "desceram", "iguais"):
+                d[k] = int(_sug_float(d.get(k)))
+            for k in ("capital_curva", "capital_custo", "ns_custo_medio", "margem_media"):
+                d[k] = round(_sug_float(d.get(k)), 4)
+            d["delta_capital"] = round(d["capital_custo"] - d["capital_curva"], 2)
+            return d
+        por_curva = [_row(r) for r in rows]
+
+        keys_i = ("itens", "min_curva", "min_custo", "subiram", "desceram", "iguais")
+        keys_f = ("capital_curva", "capital_custo")
+        totais = {k: sum(r[k] for r in por_curva) for k in keys_i}
+        for k in keys_f:
+            totais[k] = round(sum(r[k] for r in por_curva), 2)
+        totais["delta_capital"] = round(totais["capital_custo"] - totais["capital_curva"], 2)
+
+        def _movimentos(direcao):
+            return [dict(r) for r in conn.execute(text(f"""
+                SELECT pro_codigo, pro_descricao, mar_descricao, curva_abc AS curva,
+                       margem_pct, nivel_servico_custo, custo_unitario,
+                       estoque_min_base  AS min_curva,
+                       estoque_min_custo AS min_custo,
+                       (estoque_min_custo - estoque_min_base) * COALESCE(custo_unitario,0) AS delta_capital
+                FROM com_fifo_completo
+                WHERE {base_where} AND custo_unitario IS NOT NULL
+                ORDER BY (estoque_min_custo - estoque_min_base) * COALESCE(custo_unitario,0) {direcao}
+                LIMIT 15
+            """)).mappings().all()]
+
+        return {
+            "por_curva": por_curva,
+            "totais": totais,
+            "top_reducao": _movimentos("ASC"),   # maior liberação de capital
+            "top_aumento": _movimentos("DESC"),  # maior aumento de proteção
+            "params": {
+                "holding_rate_anual": float(os.getenv("HOLDING_RATE_ANUAL") or 0.25),
+                "faixa_curva": {"A": [0.90, 0.99], "B": [0.85, 0.98], "C": [0.80, 0.96], "D": [0.75, 0.94]},
+                "modo": os.getenv("NS_MODO") or "sombra",
+            },
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         if 'conn' in locals(): conn.close()
 
@@ -1067,7 +1189,10 @@ def listar_analise(
                 mean_size_mes, cv2_tamanho,
                 grupo_chave, grupo_estoque_min, grupo_estoque_max, grupo_demanda_dia,
                 grupo_estoque_seguranca, grupo_curva, grupo_metodo, grupo_fator_sazonal,
-                grupo_mean_size, grupo_cv2
+                grupo_mean_size, grupo_cv2,
+                custo_unitario, margem_unitaria, margem_pct,
+                nivel_servico_custo, z_custo, estoque_min_custo, estoque_max_custo, estoque_seg_custo,
+                grupo_nivel_servico_custo, grupo_estoque_min_custo, grupo_estoque_max_custo, grupo_margem_pct
             FROM com_fifo_completo
             WHERE {where_clause}
             ORDER BY
@@ -1117,6 +1242,10 @@ def listar_analise(
                 ss=_it.get("estoque_seguranca"), fator_sazonal=_it.get("fator_sazonal"),
                 sgr_codigo=_it.get("sgr_codigo"),
                 msize=_it.get("mean_size_mes"), cv2=_it.get("cv2_tamanho"),
+                ns_custo=_it.get("nivel_servico_custo"), z_custo=_it.get("z_custo"),
+                min_custo=_it.get("estoque_min_custo"), max_custo=_it.get("estoque_max_custo"),
+                ss_custo=_it.get("estoque_seg_custo"), margem_pct=_it.get("margem_pct"),
+                custo_unit=_it.get("custo_unitario"),
             )
             gk = _it.get("grupo_chave")
             if gk and _sug_float(_it.get("grupo_estoque_max")) > 0:
@@ -1131,6 +1260,9 @@ def listar_analise(
                     ss=_it.get("grupo_estoque_seguranca"), fator_sazonal=_it.get("grupo_fator_sazonal"),
                     sgr_codigo=_it.get("sgr_codigo"),
                     msize=_it.get("grupo_mean_size"), cv2=_it.get("grupo_cv2"),
+                    ns_custo=_it.get("grupo_nivel_servico_custo"),
+                    min_custo=_it.get("grupo_estoque_min_custo"), max_custo=_it.get("grupo_estoque_max_custo"),
+                    margem_pct=_it.get("grupo_margem_pct"),
                     membros=_grp_membros.get(gk),
                 )
 
@@ -1902,7 +2034,9 @@ def _dias_ciclo(curva, sgr_codigo):
 
 def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
                            demanda_dia, sigma_dia, z, lead_time, ss, fator_sazonal,
-                           sgr_codigo, msize=None, cv2=None, membros=None):
+                           sgr_codigo, msize=None, cv2=None, membros=None,
+                           ns_custo=None, z_custo=None, min_custo=None, max_custo=None,
+                           ss_custo=None, margem_pct=None, custo_unit=None):
     """
     Memória de cálculo do mín/máx: fórmula + valores REAIS que compuseram a
     quantidade. escopo='grupo'|'item'. `membros` (grupo) = contribuição por marca.
@@ -2021,6 +2155,26 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
     else:
         mem["graf"] = {"tipo": "serra", "maximo": mmax, "minimo": mmin, "seguranca": int(ss_v),
                        "demanda_dia": round(dem, 4), "lead_time": int(lt), "ciclo": ciclo}
+
+    # ----- Comparação com o NÍVEL DE SERVIÇO POR CUSTO (razão crítica, modo sombra) -----
+    if ns_custo is not None:
+        nsc = _sug_float(ns_custo)
+        cmin = int(_sug_float(min_custo)); cmax = int(_sug_float(max_custo))
+        ns_curva = _NS_POR_CURVA.get(_sug_norm(curva).upper(), 0.90)
+        mem["custo"] = {
+            "nivel_servico": round(nsc, 4),
+            "nivel_servico_curva": round(ns_curva, 4),
+            "z": (round(_sug_float(z_custo), 3) if z_custo is not None else None),
+            "minimo": cmin,
+            "maximo": cmax,
+            "seguranca": int(_sug_float(ss_custo)),
+            "delta_min": cmin - mmin,
+            "delta_max": cmax - mmax,
+            "margem_pct": (round(_sug_float(margem_pct), 4) if margem_pct is not None else None),
+            "custo_unit": (round(_sug_float(custo_unit), 2) if custo_unit is not None else None),
+            "delta_capital": round((cmin - mmin) * _sug_float(custo_unit), 2) if custo_unit is not None else None,
+            "formula": "p* = margem ÷ (margem + custo de manter);  limitado pela faixa da curva ABC.",
+        }
 
     if membros:
         mem["membros"] = membros
