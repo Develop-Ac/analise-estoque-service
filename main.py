@@ -420,6 +420,20 @@ def criar_tabela_postgres():
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_estoque_seguranca') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN grupo_estoque_seguranca INTEGER;
         END IF;
+
+        -- Tamanho médio do lote e CV² (dispersão) — p/ a distribuição exata do modelo
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='mean_size_mes') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN mean_size_mes DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='cv2_tamanho') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN cv2_tamanho DECIMAL(10,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_mean_size') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_mean_size DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_cv2') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_cv2 DECIMAL(10,4);
+        END IF;
     END
     $$;
 
@@ -1144,9 +1158,13 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     g["GRUPO_ESTOQUE_SEGURANCA"] = [x["ESTOQUE_SEGURANCA"] for x in res]
     g["GRUPO_METODO"] = g["GRUPO_PADRAO"].map(METODO_LABEL).fillna("Normal (Z·σ·√LT)")
 
+    # tamanho médio do lote e CV² (dispersão) do GRUPO — p/ reproduzir a distribuição exata
+    g["GRUPO_MEAN_SIZE"] = pd.to_numeric(g.get("MEAN_SIZE_MES"), errors="coerce").fillna(0.0)
+    g["GRUPO_CV2"] = pd.to_numeric(g.get("CV2_TAMANHO"), errors="coerce").fillna(0.0)
     cols = ["GRUPO", "GRUPO_QTD_ITENS", "GRUPO_ESTOQUE_DISPONIVEL", "GRUPO_DEMANDA_DIA",
             "GRUPO_FATOR_SAZONAL", "GRUPO_CURVA", "GRUPO_PADRAO", "GRUPO_METODO",
-            "GRUPO_ESTOQUE_MIN", "GRUPO_ESTOQUE_MAX", "GRUPO_ESTOQUE_SEGURANCA"]
+            "GRUPO_ESTOQUE_MIN", "GRUPO_ESTOQUE_MAX", "GRUPO_ESTOQUE_SEGURANCA",
+            "GRUPO_MEAN_SIZE", "GRUPO_CV2"]
     return g[cols]
 
 
@@ -2089,6 +2107,8 @@ def salvar_metricas_postgres(df_metricas):
         'DEM_DIA_REAL': 'demanda_real_dia',
         'SIGMA_DEMANDA_DIA': 'sigma_demanda_dia',
         'CV_DEMANDA': 'cv_demanda',
+        'MEAN_SIZE_MES': 'mean_size_mes',
+        'CV2_TAMANHO': 'cv2_tamanho',
         'CLASSE_XYZ': 'classe_xyz',
         'ESTOQUE_SEGURANCA': 'estoque_seguranca',
         'NIVEL_SERVICO_Z': 'nivel_servico_z',
@@ -2111,6 +2131,8 @@ def salvar_metricas_postgres(df_metricas):
         'GRUPO_ESTOQUE_MIN': 'grupo_estoque_min',
         'GRUPO_ESTOQUE_MAX': 'grupo_estoque_max',
         'GRUPO_ESTOQUE_SEGURANCA': 'grupo_estoque_seguranca',
+        'GRUPO_MEAN_SIZE': 'grupo_mean_size',
+        'GRUPO_CV2': 'grupo_cv2',
         'dados_alteracao_json': 'dados_alteracao_json'
     }
     
@@ -2135,13 +2157,14 @@ def salvar_metricas_postgres(df_metricas):
         'grp_estoque_max_sugerido', 'grp_demanda_media_dia', 'rateio_prop_grupo',
         'tempo_medio_saldo_atual', 'categoria_saldo_atual',
         'pro_referencia',
-        'demanda_real_dia', 'sigma_demanda_dia', 'cv_demanda', 'classe_xyz',
+        'demanda_real_dia', 'sigma_demanda_dia', 'cv_demanda', 'mean_size_mes', 'cv2_tamanho', 'classe_xyz',
         'estoque_seguranca', 'nivel_servico_z', 'lead_time_dias',
         'venda_perdida_12m', 'valor_vendido_12m',
         'padrao_demanda', 'metodo_reposicao', 'fator_sazonal', 'demanda_planejamento_dia',
         'sob_encomenda', 'grupo_chave', 'grupo_qtd_itens', 'grupo_estoque_disponivel',
         'grupo_demanda_dia', 'grupo_fator_sazonal', 'grupo_curva', 'grupo_padrao',
         'grupo_metodo', 'grupo_estoque_min', 'grupo_estoque_max', 'grupo_estoque_seguranca',
+        'grupo_mean_size', 'grupo_cv2',
         'dados_alteracao_json'
     ]
     

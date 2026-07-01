@@ -1064,8 +1064,10 @@ def listar_analise(
                 estoque_seguranca, nivel_servico_z, lead_time_dias,
                 venda_perdida_12m, valor_vendido_12m,
                 padrao_demanda, metodo_reposicao, fator_sazonal, demanda_planejamento_dia,
+                mean_size_mes, cv2_tamanho,
                 grupo_chave, grupo_estoque_min, grupo_estoque_max, grupo_demanda_dia,
-                grupo_estoque_seguranca, grupo_curva, grupo_metodo, grupo_fator_sazonal
+                grupo_estoque_seguranca, grupo_curva, grupo_metodo, grupo_fator_sazonal,
+                grupo_mean_size, grupo_cv2
             FROM com_fifo_completo
             WHERE {where_clause}
             ORDER BY
@@ -1114,6 +1116,7 @@ def listar_analise(
                 lead_time=(_it.get("lead_time_dias") or 17),
                 ss=_it.get("estoque_seguranca"), fator_sazonal=_it.get("fator_sazonal"),
                 sgr_codigo=_it.get("sgr_codigo"),
+                msize=_it.get("mean_size_mes"), cv2=_it.get("cv2_tamanho"),
             )
             gk = _it.get("grupo_chave")
             if gk and _sug_float(_it.get("grupo_estoque_max")) > 0:
@@ -1126,7 +1129,9 @@ def listar_analise(
                     z=_Z_POR_CURVA.get(_sug_norm(_gcv).upper()),
                     lead_time=(_it.get("lead_time_dias") or 17),
                     ss=_it.get("grupo_estoque_seguranca"), fator_sazonal=_it.get("grupo_fator_sazonal"),
-                    sgr_codigo=_it.get("sgr_codigo"), membros=_grp_membros.get(gk),
+                    sgr_codigo=_it.get("sgr_codigo"),
+                    msize=_it.get("grupo_mean_size"), cv2=_it.get("grupo_cv2"),
+                    membros=_grp_membros.get(gk),
                 )
 
         # ---------------------------------------------------------------------
@@ -1897,7 +1902,7 @@ def _dias_ciclo(curva, sgr_codigo):
 
 def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
                            demanda_dia, sigma_dia, z, lead_time, ss, fator_sazonal,
-                           sgr_codigo, membros=None):
+                           sgr_codigo, msize=None, cv2=None, membros=None):
     """
     Memória de cálculo do mín/máx: fórmula + valores REAIS que compuseram a
     quantidade. escopo='grupo'|'item'. `membros` (grupo) = contribuição por marca.
@@ -1960,6 +1965,62 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
         passos.append(f"Ponto de pedido (mín) = demanda × lead time + SS = {round(dem, 4)} × {int(lt)} + {int(ss_v)} = {mmin} un.")
         passos.append(f"Máximo = mín + demanda × dias de ciclo = {mmin} + {round(dem, 4)} × {ciclo} = {mmax} un.")
     mem["metodo_calculo"] = {"tipo": met, "passos": passos}
+
+    # ----- Dados para o GRÁFICO (igual ao manual) -----
+    import math as _math
+    if intermit:
+        ns = _NS_POR_CURVA.get(_sug_norm(curva).upper(), 0.90)
+        lam = _sug_float(demanda_dia) * (1 - _ALPHA_CROSTON / 2.0) * lt
+        kmax = max(mmin + 5, 8)
+
+        def _cdf_arr(mean, var):
+            """CDF[0..kmax] de Poisson (var≈mean) ou Binomial Negativa (var>mean).
+            Espelha _quantil_demanda do main.py (var≥média; limiar Poisson 1.10)."""
+            out = []; acc = 0.0
+            if mean <= 0:
+                return [1.0] * (kmax + 1)
+            var = max(var, mean)
+            if var <= mean * 1.10:
+                pmf = _math.exp(-mean)
+                for k in range(kmax + 1):
+                    acc += pmf; out.append(min(acc, 1.0)); pmf = pmf * mean / (k + 1)
+            else:
+                r = mean * mean / (var - mean); pr = r / (r + mean); pmf = pr ** r
+                for k in range(kmax + 1):
+                    acc += pmf; out.append(min(acc, 1.0)); pmf = pmf * (k + r) / (k + 1) * (1 - pr)
+            return out
+
+        msize_v = _sug_float(msize)
+        cv2_v = _sug_float(cv2)
+        if msize_v > 0:
+            # EXATO: mesma dispersão do modelo (disp = tam médio × (1+CV²); var = λ·disp)
+            disp = max(msize_v * (1.0 + cv2_v), 1.0)
+            var = lam * disp
+            exato = True
+        else:
+            # Fallback (dados sem mean_size/cv2): ajusta var p/ o quantil NS = ponto de pedido
+            lo, hi, var = lam, max(lam * 40, lam + 1.0), lam
+            if mmin > 0 and lam > 0:
+                for _ in range(40):
+                    mid = (lo + hi) / 2.0
+                    cdf = _cdf_arr(lam, mid)
+                    q = next((k for k in range(len(cdf)) if cdf[k] >= ns), kmax)
+                    if q >= mmin:
+                        hi = mid; var = mid
+                    else:
+                        lo = mid
+            exato = False
+        cdf = _cdf_arr(lam, var)
+        barras = []; prev = 0.0
+        for k in range(kmax + 1):
+            pmf = max(cdf[k] - prev, 0.0); prev = cdf[k]
+            barras.append({"k": k, "pmf": round(pmf, 4), "cdf": round(cdf[k], 4)})
+        mem["graf"] = {"tipo": "distribuicao", "dist": ("Binomial Negativa" if var > lam * 1.05 else "Poisson"),
+                       "nivel_servico": ns, "ponto_pedido": mmin, "lambda": round(lam, 2),
+                       "exato": exato, "barras": barras}
+    else:
+        mem["graf"] = {"tipo": "serra", "maximo": mmax, "minimo": mmin, "seguranca": int(ss_v),
+                       "demanda_dia": round(dem, 4), "lead_time": int(lt), "ciclo": ciclo}
 
     if membros:
         mem["membros"] = membros
@@ -2056,6 +2117,7 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             ss=it.get("estoque_seguranca"),
             fator_sazonal=it.get("fator_sazonal"),
             sgr_codigo=it.get("sgr_codigo"),
+            msize=it.get("mean_size_mes"), cv2=it.get("cv2_tamanho"),
         )
         _registrar(bucket, {
             "tipo": "individual",
@@ -2191,6 +2253,8 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 ss=next((m.get("grupo_estoque_seguranca") for m in mem if m.get("grupo_estoque_seguranca") is not None), None),
                 fator_sazonal=next((m.get("grupo_fator_sazonal") for m in mem if m.get("grupo_fator_sazonal") is not None), None),
                 sgr_codigo=next((m.get("sgr_codigo") for m in mem if m.get("sgr_codigo") is not None), None),
+                msize=next((m.get("grupo_mean_size") for m in mem if m.get("grupo_mean_size") is not None), None),
+                cv2=next((m.get("grupo_cv2") for m in mem if m.get("grupo_cv2") is not None), None),
                 membros=[{"marca": d["marca"], "pro_codigo": d["pro_codigo"],
                           "demanda_dia": round(d["demanda_real_dia"], 4),
                           "min_ind": d["min_ind"], "max_ind": d["max_ind"]}
@@ -2266,10 +2330,12 @@ def _carregar_itens_sugestao(conn):
                    {opt('demanda_planejamento_dia')}, {opt('demanda_real_dia')},
                    {opt('sigma_demanda_dia')}, {opt('nivel_servico_z')}, {opt('lead_time_dias')},
                    {opt('estoque_seguranca')}, {opt('fator_sazonal')},
+                   {opt('mean_size_mes')}, {opt('cv2_tamanho')},
                    {opt('sob_encomenda')}, {opt('grupo_chave')},
                    {opt('grupo_estoque_min')}, {opt('grupo_estoque_max')},
                    {opt('grupo_curva')}, {opt('grupo_padrao')}, {opt('grupo_metodo')},
-                   {opt('grupo_demanda_dia')}, {opt('grupo_estoque_seguranca')}, {opt('grupo_fator_sazonal')}
+                   {opt('grupo_demanda_dia')}, {opt('grupo_estoque_seguranca')}, {opt('grupo_fator_sazonal')},
+                   {opt('grupo_mean_size')}, {opt('grupo_cv2')}
             FROM com_fifo_completo
             WHERE data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)
         ),
@@ -2430,3 +2496,52 @@ def sugestao_compra(
         apenas_zerados=apenas_zerados,
         incluir_sem_historico=incluir_sem_historico,
     )
+
+
+@app.get("/produto/vendas-mensais")
+def produto_vendas_mensais(codigos: str, meses: int = 18):
+    """
+    Vendas (saídas) por mês de um ou mais produtos (SOMA — p/ o grupo consolidado),
+    nos últimos `meses` meses. Consulta leve no ERP, usada ao abrir a memória.
+    """
+    import datetime as _dt
+    codes = [c.strip().replace("'", "") for c in (codigos or "").split(",") if c.strip()]
+    if not codes:
+        return {"meses": []}
+    codes = codes[:300]
+    hoje = _dt.date.today()
+    ini = (hoje.replace(day=1) - _dt.timedelta(days=int(meses) * 31)).replace(day=1)
+    in_list = ", ".join(f"'{c}'" for c in codes)
+    inner = ("SELECT EXTRACT(YEAR FROM LE.data) AS ano, EXTRACT(MONTH FROM LE.data) AS mes, "
+             "SUM(LE.quantidade) AS qtd FROM lanctos_estoque LE "
+             "WHERE LE.empresa = 3 AND LE.origem IN ('NFS','EVF','EFD') "
+             f"AND LE.pro_codigo IN ({in_list}) AND LE.data >= '{ini.isoformat()}' "
+             "GROUP BY EXTRACT(YEAR FROM LE.data), EXTRACT(MONTH FROM LE.data)")
+    query = f"SELECT * FROM OPENQUERY(CONSULTA, '{inner.replace(chr(39), chr(39) * 2)}')"
+    mapa = {}
+    try:
+        conn = get_sql_connection()
+        try:
+            conn.timeout = int(os.getenv("VENDAS_MENSAIS_TIMEOUT_S", 20))
+        except Exception:
+            pass
+        try:
+            cur = conn.cursor()
+            cur.execute(query)
+            for ano, mes, qtd in cur.fetchall():
+                mapa[(int(ano), int(mes))] = float(qtd or 0)
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"AVISO: vendas-mensais indisponível: {e}")
+        return {"meses": [], "erro": True}
+
+    # série contínua dos últimos `meses` meses (preenche zeros)
+    out = []
+    y, mth = ini.year, ini.month
+    while (y, mth) <= (hoje.year, hoje.month):
+        out.append({"mes": f"{y:04d}-{mth:02d}", "qtd": round(mapa.get((y, mth), 0.0), 2)})
+        mth += 1
+        if mth > 12:
+            mth = 1; y += 1
+    return {"meses": out}
