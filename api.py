@@ -202,6 +202,18 @@ class AnaliseItem(BaseModel):
     fator_sazonal: Optional[float] = None
     demanda_planejamento_dia: Optional[float] = None
 
+    # Consolidação por grupo (descrição) + memória de cálculo
+    grupo_chave: Optional[str] = None
+    grupo_estoque_min: Optional[int] = None
+    grupo_estoque_max: Optional[int] = None
+    grupo_demanda_dia: Optional[float] = None
+    grupo_estoque_seguranca: Optional[int] = None
+    grupo_curva: Optional[str] = None
+    grupo_metodo: Optional[str] = None
+    grupo_fator_sazonal: Optional[float] = None
+    memoria: Optional[dict] = None
+    memoria_grupo: Optional[dict] = None
+
     # Detailed Stock Info
     estoque_obsoleto: Optional[float] = 0
     lotes_estoque: Optional[List[LoteEstoque]] = []
@@ -1051,7 +1063,9 @@ def listar_analise(
                 demanda_real_dia, sigma_demanda_dia, cv_demanda, classe_xyz,
                 estoque_seguranca, nivel_servico_z, lead_time_dias,
                 venda_perdida_12m, valor_vendido_12m,
-                padrao_demanda, metodo_reposicao, fator_sazonal, demanda_planejamento_dia
+                padrao_demanda, metodo_reposicao, fator_sazonal, demanda_planejamento_dia,
+                grupo_chave, grupo_estoque_min, grupo_estoque_max, grupo_demanda_dia,
+                grupo_estoque_seguranca, grupo_curva, grupo_metodo, grupo_fator_sazonal
             FROM com_fifo_completo
             WHERE {where_clause}
             ORDER BY
@@ -1071,7 +1085,50 @@ def listar_analise(
         
         result = conn.execute(data_sql, params).mappings().all()
         data_list = [dict(row) for row in result]
-        
+
+        # ---------------------------------------------------------------------
+        # MEMÓRIA DE CÁLCULO (mín/máx): individual e do GRUPO consolidado (pooled)
+        # ---------------------------------------------------------------------
+        _grp_membros = {}
+        for _it in data_list:
+            gk = _it.get("grupo_chave")
+            if gk:
+                _grp_membros.setdefault(gk, []).append({
+                    "marca": _it.get("mar_descricao"),
+                    "pro_codigo": _it.get("pro_codigo"),
+                    "demanda_dia": round(_sug_float(_it.get("demanda_real_dia")), 4),
+                    "min_ind": int(_sug_float(_it.get("estoque_min_sugerido"))),
+                    "max_ind": int(_sug_float(_it.get("estoque_max_sugerido"))),
+                })
+        for _it in data_list:
+            _cv = _it.get("curva_abc")
+            _it["memoria"] = montar_memoria_calculo(
+                escopo="item",
+                minimo=_it.get("estoque_min_sugerido"), maximo=_it.get("estoque_max_sugerido"),
+                curva=_cv, classe=_it.get("classe_xyz"), metodo=_it.get("metodo_reposicao"),
+                demanda_dia=(_it.get("demanda_planejamento_dia") if _it.get("demanda_planejamento_dia") is not None
+                             else _it.get("demanda_media_dia_ajustada")),
+                sigma_dia=_it.get("sigma_demanda_dia"),
+                z=(_it.get("nivel_servico_z") if _it.get("nivel_servico_z") is not None
+                   else _Z_POR_CURVA.get(_sug_norm(_cv).upper())),
+                lead_time=(_it.get("lead_time_dias") or 17),
+                ss=_it.get("estoque_seguranca"), fator_sazonal=_it.get("fator_sazonal"),
+                sgr_codigo=_it.get("sgr_codigo"),
+            )
+            gk = _it.get("grupo_chave")
+            if gk and _sug_float(_it.get("grupo_estoque_max")) > 0:
+                _gcv = _it.get("grupo_curva") or _cv
+                _it["memoria_grupo"] = montar_memoria_calculo(
+                    escopo="grupo",
+                    minimo=_it.get("grupo_estoque_min"), maximo=_it.get("grupo_estoque_max"),
+                    curva=_gcv, classe=_it.get("classe_xyz"), metodo=_it.get("grupo_metodo"),
+                    demanda_dia=_it.get("grupo_demanda_dia"), sigma_dia=None,
+                    z=_Z_POR_CURVA.get(_sug_norm(_gcv).upper()),
+                    lead_time=(_it.get("lead_time_dias") or 17),
+                    ss=_it.get("grupo_estoque_seguranca"), fator_sazonal=_it.get("grupo_fator_sazonal"),
+                    sgr_codigo=_it.get("sgr_codigo"), membros=_grp_membros.get(gk),
+                )
+
         # ---------------------------------------------------------------------
         # OBS: Realtime Stock fetch moved down to include group members
         # ---------------------------------------------------------------------
@@ -1815,6 +1872,63 @@ def _sug_posicao(it, stock_map, usar_rt):
     return cod, estoque, transito
 
 
+# Z (nível de serviço) por curva — espelha Z_POR_CURVA do main.py.
+_Z_POR_CURVA = {"A": 2.054, "B": 1.645, "C": 1.282, "D": 1.036}
+
+# Cobertura por classe (dias de ciclo) — espelha REGRAS_DIAS do main.py.
+_REGRAS_DIAS = {
+    "default": {"A": (20, 60), "B": (30, 90), "C": (45, 120), "D": (0, 45)},
+    154:       {"A": (45, 120), "B": (60, 180), "C": (90, 240), "D": (0, 120)},
+}
+
+
+def _dias_ciclo(curva, sgr_codigo):
+    try:
+        sgr = int(sgr_codigo)
+    except (TypeError, ValueError):
+        sgr = None
+    regra = _REGRAS_DIAS.get(sgr, _REGRAS_DIAS["default"])
+    dmin, dmax = regra.get(_sug_norm(curva).upper(), regra.get("C", (45, 120)))
+    return max(dmax - dmin, 1), dmin, dmax
+
+
+def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
+                           demanda_dia, sigma_dia, z, lead_time, ss, fator_sazonal,
+                           sgr_codigo, membros=None):
+    """
+    Memória de cálculo do mín/máx: fórmula + valores REAIS que compuseram a
+    quantidade. escopo='grupo'|'item'. `membros` (grupo) = contribuição por marca.
+    """
+    ciclo, _dmin, _dmax = _dias_ciclo(curva, sgr_codigo)
+    comp = [
+        {"rotulo": "Demanda planejada", "valor": round(_sug_float(demanda_dia), 4), "unid": "un/dia"},
+        {"rotulo": "Lead time (reposição)", "valor": int(_sug_float(lead_time)), "unid": "dias"},
+        {"rotulo": "Estoque de segurança", "valor": int(_sug_float(ss)), "unid": "un"},
+        {"rotulo": "Dias de ciclo (cobertura do máximo)", "valor": ciclo, "unid": "dias"},
+    ]
+    if _sug_float(z):
+        comp.append({"rotulo": "Nível de serviço (Z)", "valor": round(_sug_float(z), 3)})
+    if _sug_float(sigma_dia):
+        comp.append({"rotulo": "σ da demanda/dia", "valor": round(_sug_float(sigma_dia), 4)})
+    fs = _sug_float(fator_sazonal)
+    if fs and abs(fs - 1.0) >= 0.01:
+        comp.append({"rotulo": "Fator sazonal (próximo período)", "valor": round(fs, 3), "unid": "x"})
+    mem = {
+        "escopo": escopo,
+        "minimo": int(_sug_float(minimo)),
+        "maximo": int(_sug_float(maximo)),
+        "curva": curva,
+        "classe": classe,
+        "metodo": metodo or "Normal (Z·σ·√LT)",
+        "formula": ("Mínimo (ponto de pedido) = demanda × lead time + estoque de segurança.  "
+                    "Máximo = Mínimo + demanda × dias de ciclo."),
+        "componentes": comp,
+    }
+    if membros:
+        mem["membros"] = membros
+    return mem
+
+
 def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo=True,
                            usar_estoque_realtime=True, fornecedor=None, curva=None,
                            subgrupo=None, apenas_zerados=False, incluir_sem_historico=False):
@@ -1892,8 +2006,23 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             bucket = top
         if bucket == SEM_HIST_COMPRA and not incluir_sem_historico:
             return  # produto nunca comprado -> fora da lista
+        memoria_item = montar_memoria_calculo(
+            escopo="item", minimo=ponto, maximo=maximo,
+            curva=curva_item, classe=it.get("classe_xyz"), metodo=it.get("metodo_reposicao"),
+            demanda_dia=(it.get("demanda_planejamento_dia")
+                         if it.get("demanda_planejamento_dia") is not None
+                         else it.get("demanda_media_dia_ajustada")),
+            sigma_dia=it.get("sigma_demanda_dia"),
+            z=(it.get("nivel_servico_z") if it.get("nivel_servico_z") is not None
+               else _Z_POR_CURVA.get(_sug_norm(curva_item).upper())),
+            lead_time=(it.get("lead_time_dias") or 17),
+            ss=it.get("estoque_seguranca"),
+            fator_sazonal=it.get("fator_sazonal"),
+            sgr_codigo=it.get("sgr_codigo"),
+        )
         _registrar(bucket, {
             "tipo": "individual",
+            "memoria": memoria_item,
             "grupo_chave": None,
             "pro_codigo": cod,
             "pro_descricao": it.get("pro_descricao"),
@@ -1965,6 +2094,10 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                     "em_transito": round(tr, 2),
                     "valor_vendido_12m": _sug_float(m.get("valor_vendido_12m")),
                     "demanda_media_dia_ajustada": _sug_float(m.get("demanda_media_dia_ajustada")),
+                    # composição do cálculo (memória)
+                    "demanda_real_dia": _sug_float(m.get("demanda_real_dia")),
+                    "min_ind": int(_sug_float(m.get("ponto_pedido"))),
+                    "max_ind": int(_sug_float(m.get("maximo"))),
                 })
             posicao = estoque_total + transito_total
             if posicao > ponto:
@@ -2011,8 +2144,24 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 continue  # grupo sem histórico de compra -> fora da lista
 
             sgr = gsgr
+            memoria_grp = montar_memoria_calculo(
+                escopo="grupo", minimo=ponto, maximo=maximo,
+                curva=curva_item, classe=classe_grp, metodo=metodo,
+                demanda_dia=next((m.get("grupo_demanda_dia") for m in mem if m.get("grupo_demanda_dia") is not None), None),
+                sigma_dia=None,
+                z=_Z_POR_CURVA.get(_sug_norm(curva_item).upper()),
+                lead_time=next((m.get("lead_time_dias") for m in mem if m.get("lead_time_dias")), 17),
+                ss=next((m.get("grupo_estoque_seguranca") for m in mem if m.get("grupo_estoque_seguranca") is not None), None),
+                fator_sazonal=next((m.get("grupo_fator_sazonal") for m in mem if m.get("grupo_fator_sazonal") is not None), None),
+                sgr_codigo=next((m.get("sgr_codigo") for m in mem if m.get("sgr_codigo") is not None), None),
+                membros=[{"marca": d["marca"], "pro_codigo": d["pro_codigo"],
+                          "demanda_dia": round(d["demanda_real_dia"], 4),
+                          "min_ind": d["min_ind"], "max_ind": d["max_ind"]}
+                         for d in membros_det],
+            )
             _registrar(bucket, {
                 "tipo": "grupo",
+                "memoria": memoria_grp,
                 "grupo_chave": gk,
                 "pro_codigo": membros_det[0]["pro_codigo"],  # representativo (maior venda)
                 "pro_descricao": gk,
@@ -2070,16 +2219,20 @@ def _carregar_itens_sugestao(conn):
 
     sql = text(f"""
         WITH base AS (
-            SELECT pro_codigo, pro_descricao, mar_descricao, sgr_descricao, fornecedor1,
+            SELECT pro_codigo, pro_descricao, mar_descricao, sgr_descricao, sgr_codigo, fornecedor1,
                    curva_abc, {opt('classe_xyz')}, {opt('padrao_demanda')}, {opt('metodo_reposicao')},
                    COALESCE(estoque_min_sugerido,0) AS ponto_pedido,
                    COALESCE(estoque_max_sugerido,0) AS maximo,
                    COALESCE(estoque_disponivel,0)   AS estoque_snapshot,
                    demanda_media_dia_ajustada,
                    {opt('valor_vendido_12m')},
+                   {opt('demanda_planejamento_dia')}, {opt('demanda_real_dia')},
+                   {opt('sigma_demanda_dia')}, {opt('nivel_servico_z')}, {opt('lead_time_dias')},
+                   {opt('estoque_seguranca')}, {opt('fator_sazonal')},
                    {opt('sob_encomenda')}, {opt('grupo_chave')},
                    {opt('grupo_estoque_min')}, {opt('grupo_estoque_max')},
-                   {opt('grupo_curva')}, {opt('grupo_padrao')}, {opt('grupo_metodo')}
+                   {opt('grupo_curva')}, {opt('grupo_padrao')}, {opt('grupo_metodo')},
+                   {opt('grupo_demanda_dia')}, {opt('grupo_estoque_seguranca')}, {opt('grupo_fator_sazonal')}
             FROM com_fifo_completo
             WHERE data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)
         ),
