@@ -1712,8 +1712,10 @@ def _get_stock_batches(pro_codes):
 # SUGESTÃO DE COMPRA (ponto de pedido)
 # ==========================================
 import time as _time_rt
+import concurrent.futures as _futures
 _STOCK_CACHE = {"ts": 0.0, "data": None}
 _STOCK_TTL_S = int(os.getenv("STOCK_RT_TTL_S", 120))  # 2 min
+_RT_EXECUTOR = _futures.ThreadPoolExecutor(max_workers=2)  # p/ timeout rígido do realtime
 
 
 def get_all_realtime_stocks(force=False):
@@ -1726,6 +1728,11 @@ def get_all_realtime_stocks(force=False):
              "WHERE empresa = 3 AND UPPER(inativo) = 'N' AND UPPER(comercializavel) = 'S'")
     query = f"SELECT * FROM OPENQUERY(CONSULTA, '{inner.replace(chr(39), chr(39)*2)}')"
     conn = get_sql_connection()
+    # timeout de consulta: se o ERP estiver lento, estoura e o endpoint cai no snapshot
+    try:
+        conn.timeout = int(os.getenv("STOCK_RT_TIMEOUT_S", 15))
+    except Exception:
+        pass
     m = {}
     try:
         cur = conn.cursor()
@@ -2104,10 +2111,14 @@ def sugestao_compra(
 
     stock_map = {}
     if usar_estoque_realtime:
+        # timeout RÍGIDO por thread: se o ERP não responder, devolve com snapshot
+        # (a resposta HTTP nunca fica pendurada).
         try:
-            stock_map = get_all_realtime_stocks()
+            fut = _RT_EXECUTOR.submit(get_all_realtime_stocks)
+            stock_map = fut.result(timeout=int(os.getenv("STOCK_RT_HARD_TIMEOUT_S", 20)))
         except Exception as e:
-            print(f"AVISO: estoque realtime indisponível, usando snapshot. {e}")
+            print(f"AVISO: estoque realtime lento/indisponível ({type(e).__name__}), usando snapshot.")
+            stock_map = {}
 
     historico = {}
     try:
