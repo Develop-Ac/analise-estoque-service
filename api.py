@@ -1928,6 +1928,7 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 membros_det.append({
                     "pro_codigo": cod,
                     "marca": m.get("mar_descricao"),
+                    "classe_xyz": m.get("classe_xyz"),
                     # de quem MAIS COMPRAMOS essa marca (histórico); todos abaixo
                     "fornecedor": (h[0][0] if h else SEM_HIST_COMPRA),
                     "fornecedores_hist": [n for n, _ in h],
@@ -1963,6 +1964,8 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 mk = d.get("marca")
                 if mk and mk not in seen_m:
                     seen_m.add(mk); marcas_ord.append(mk)
+            # classe do grupo = a da marca principal (não há XYZ consolidado na análise)
+            classe_grp = next((d["classe_xyz"] for d in membros_det if d.get("classe_xyz")), None)
             # bucket padrão = fornecedor de quem MAIS COMPRAMOS no grupo inteiro
             primario = max(sup_qty.items(), key=lambda kv: kv[1])[0] if sup_qty else SEM_HIST_COMPRA
             todos_forns_grupo = set(sup_qty.keys())  # p/ filtro: tudo já comprado no grupo
@@ -1985,7 +1988,7 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 "marca": marcas_ord[0] if marcas_ord else None,
                 "subgrupo": sgr,
                 "curva_abc": curva_item,
-                "classe_xyz": None,
+                "classe_xyz": classe_grp,
                 "padrao_demanda": padrao,
                 "metodo_reposicao": metodo,
                 "qtd_itens_grupo": len(mem),
