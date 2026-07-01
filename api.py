@@ -1589,7 +1589,7 @@ BACKGROUND_Running = False
 # CORREÇÃO: Usar caminho absoluto relativo ao arquivo para consistência
 BASE_DIR = Path(__file__).resolve().parent
 ARQUIVO_ESTADO = BASE_DIR / "data" / "fifo_service_state.json"
-INTERVALO_DIAS = int(os.getenv('INTERVALO_DIAS', 7))
+INTERVALO_DIAS = int(os.getenv('INTERVALO_DIAS') or 7)
 
 def load_state():
     if not ARQUIVO_ESTADO.exists():
@@ -1776,7 +1776,7 @@ def _get_stock_batches(pro_codes):
 import time as _time_rt
 import concurrent.futures as _futures
 _STOCK_CACHE = {"ts": 0.0, "data": None}
-_STOCK_TTL_S = int(os.getenv("STOCK_RT_TTL_S", 120))  # 2 min
+_STOCK_TTL_S = int(os.getenv("STOCK_RT_TTL_S") or 120)  # 2 min
 _RT_EXECUTOR = _futures.ThreadPoolExecutor(max_workers=2)  # p/ timeout rígido do realtime
 
 
@@ -1792,7 +1792,7 @@ def get_all_realtime_stocks(force=False):
     conn = get_sql_connection()
     # timeout de consulta: se o ERP estiver lento, estoura e o endpoint cai no snapshot
     try:
-        conn.timeout = int(os.getenv("STOCK_RT_TIMEOUT_S", 15))
+        conn.timeout = int(os.getenv("STOCK_RT_TIMEOUT_S") or 15)
     except Exception:
         pass
     m = {}
@@ -1824,7 +1824,7 @@ def get_realtime_stocks_bulk(codes, chunk=400):
 
 import time as _time
 _HIST_CACHE = {"ts": 0.0, "data": None}
-_HIST_TTL_S = int(os.getenv("COMPRAS_HIST_TTL_S", 21600))  # 6h
+_HIST_TTL_S = int(os.getenv("COMPRAS_HIST_TTL_S") or 21600)  # 6h
 SEM_HIST_COMPRA = "SEM HISTÓRICO DE COMPRA"
 
 
@@ -2473,14 +2473,14 @@ def sugestao_compra(
             codes = _codigos_candidatos(items, historico, curva, subgrupo, fornecedor, consolidar_grupo)
             try:
                 fut = _RT_EXECUTOR.submit(get_realtime_stocks_bulk, codes)
-                stock_map = fut.result(timeout=int(os.getenv("STOCK_RT_HARD_TIMEOUT_S", 20)))
+                stock_map = fut.result(timeout=int(os.getenv("STOCK_RT_HARD_TIMEOUT_S") or 20))
             except Exception as e:
                 print(f"AVISO: estoque realtime (lote) lento/indisponível ({type(e).__name__}), usando snapshot.")
                 stock_map = {}
         else:
             try:
                 fut = _RT_EXECUTOR.submit(get_all_realtime_stocks)
-                stock_map = fut.result(timeout=int(os.getenv("STOCK_RT_HARD_TIMEOUT_S", 20)))
+                stock_map = fut.result(timeout=int(os.getenv("STOCK_RT_HARD_TIMEOUT_S") or 20))
             except Exception as e:
                 print(f"AVISO: estoque realtime lento/indisponível ({type(e).__name__}), usando snapshot.")
                 stock_map = {}
@@ -2522,7 +2522,7 @@ def produto_vendas_mensais(codigos: str, meses: int = 18):
     try:
         conn = get_sql_connection()
         try:
-            conn.timeout = int(os.getenv("VENDAS_MENSAIS_TIMEOUT_S", 20))
+            conn.timeout = int(os.getenv("VENDAS_MENSAIS_TIMEOUT_S") or 20)
         except Exception:
             pass
         try:

@@ -31,7 +31,7 @@ import pandas as pd
 # ----------------------------------------------------------------------
 # Janela raw (meses relidos do ERP a cada execução). Só meses mais antigos que
 # a janela são congelados no pacote.
-JANELA_MESES = int(os.getenv("EMPAC_JANELA_MESES", 24))
+JANELA_MESES = int(os.getenv("EMPAC_JANELA_MESES") or 24)
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://admin:admin@automacao_mongo-db:27017/?tls=false")
 MONGO_DB = os.getenv("MONGO_DB", "analise_estoque")
 MONGO_COL = os.getenv("MONGO_COL", "fifo_pack")

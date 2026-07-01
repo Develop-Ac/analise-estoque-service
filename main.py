@@ -27,7 +27,7 @@ load_dotenv()
 # ==========================================
 
 # Intervalo de execução em dias
-INTERVALO_DIAS = int(os.getenv('INTERVALO_DIAS', 7))
+INTERVALO_DIAS = int(os.getenv('INTERVALO_DIAS') or 7)
 
 # Caminhos dos arquivos
 BASE_DIR = Path(__file__).resolve().parent
@@ -38,7 +38,7 @@ ARQUIVO_ANTERIOR = BASE_DIR / "historico_analise_anterior.pkl"
 # Configurações de E-mail (PREENCHER AQUI)
 # Configurações de E-mail
 EMAIL_SMTP_SERVER = os.getenv("EMAIL_SMTP_SERVER", "email-ssl.com.br")
-EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT", 587))
+EMAIL_SMTP_PORT = int(os.getenv("EMAIL_SMTP_PORT") or 587)
 EMAIL_SENDER = os.getenv("EMAIL_SENDER", "seu_email@exemplo.com")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "sua_senha")
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER", "email_destino@exemplo.com")
@@ -52,33 +52,33 @@ TABELA_FIFO = "com_fifo_completo"
 # ==========================================
 # Janela recente usada como base da demanda e da variabilidade (substitui a
 # média desde 2005). ABC também passa a ser calculada sobre esta janela.
-JANELA_DEMANDA_MESES = int(os.getenv("JANELA_DEMANDA_MESES", 12))
+JANELA_DEMANDA_MESES = int(os.getenv("JANELA_DEMANDA_MESES") or 12)
 
 # Lead time (prazo de reposição) em dias. Não há prazo por fornecedor no ERP,
 # então usamos um valor global configurável (a regra do subgrupo 154 segue
 # valendo no ciclo, em regras_dias).
-LEAD_TIME_DIAS = int(os.getenv("LEAD_TIME_DIAS", 17))
+LEAD_TIME_DIAS = int(os.getenv("LEAD_TIME_DIAS") or 17)
 
 # Z (fator de nível de serviço) por curva — A=98%, B=95%, C=90%, D=85%.
 # Estoque de segurança = Z * sigma_demanda_dia * sqrt(lead_time)  (Silver-Pyke).
 Z_POR_CURVA = {
-    "A": float(os.getenv("Z_CURVA_A", 2.054)),  # 98%
-    "B": float(os.getenv("Z_CURVA_B", 1.645)),  # 95%
-    "C": float(os.getenv("Z_CURVA_C", 1.282)),  # 90%
-    "D": float(os.getenv("Z_CURVA_D", 1.036)),  # 85%
+    "A": float(os.getenv("Z_CURVA_A") or 2.054),  # 98%
+    "B": float(os.getenv("Z_CURVA_B") or 1.645),  # 95%
+    "C": float(os.getenv("Z_CURVA_C") or 1.282),  # 90%
+    "D": float(os.getenv("Z_CURVA_D") or 1.036),  # 85%
 }
 
 # Limiares XYZ pelo coeficiente de variação (CV) da demanda mensal.
 #   X = previsível (CV baixo) | Y = média | Z = errática (CV alto)
-XYZ_LIMIAR_X = float(os.getenv("XYZ_LIMIAR_X", 0.5))
-XYZ_LIMIAR_Y = float(os.getenv("XYZ_LIMIAR_Y", 1.0))
+XYZ_LIMIAR_X = float(os.getenv("XYZ_LIMIAR_X") or 0.5)
+XYZ_LIMIAR_Y = float(os.getenv("XYZ_LIMIAR_Y") or 1.0)
 
 # Tratamento de outliers da VENDA_PERDIDA (cap por evento). Poucos lançamentos
 # atípicos (cotações grandes / erro de digitação) concentram a maior parte da
 # quantidade, então limitamos cada apontamento.
-VP_CAP_MULT = float(os.getenv("VP_CAP_MULT", 3.0))    # x venda média por evento do item
-VP_CAP_PISO = float(os.getenv("VP_CAP_PISO", 5.0))    # teto mínimo por evento (un)
-VP_CAP_TETO = float(os.getenv("VP_CAP_TETO", 200.0))  # teto absoluto por evento (un)
+VP_CAP_MULT = float(os.getenv("VP_CAP_MULT") or 3.0)    # x venda média por evento do item
+VP_CAP_PISO = float(os.getenv("VP_CAP_PISO") or 5.0)    # teto mínimo por evento (un)
+VP_CAP_TETO = float(os.getenv("VP_CAP_TETO") or 200.0)  # teto absoluto por evento (un)
 
 # Dias médios por mês (conversão sigma mensal -> diário)
 DIAS_POR_MES = 30.44
@@ -86,7 +86,7 @@ DIAS_POR_MES = 30.44
 # Teto do estoque de segurança, em nº de ciclos de demanda da classe.
 # Evita que itens A/Z (demanda intermitente) peçam segurança exagerada, onde a
 # hipótese de normalidade do SS clássico superestima. 0 ou negativo = sem teto.
-SS_CAP_CICLOS = float(os.getenv("SS_CAP_CICLOS", 1.0))
+SS_CAP_CICLOS = float(os.getenv("SS_CAP_CICLOS") or 1.0)
 
 # ==========================================
 # AGRUPAMENTO POR PRODUTO (consolida marcas) E PRODUTOS ORIGINAIS
@@ -110,28 +110,28 @@ def marca_eh_original(mar):
 # Nível de serviço (PROBABILIDADE) por curva — usado no ponto de pedido via
 # Poisson/Binomial Negativa para itens intermitentes (espelha os Z acima).
 NS_POR_CURVA = {
-    "A": float(os.getenv("NS_CURVA_A", 0.98)),
-    "B": float(os.getenv("NS_CURVA_B", 0.95)),
-    "C": float(os.getenv("NS_CURVA_C", 0.90)),
-    "D": float(os.getenv("NS_CURVA_D", 0.85)),
+    "A": float(os.getenv("NS_CURVA_A") or 0.98),
+    "B": float(os.getenv("NS_CURVA_B") or 0.95),
+    "C": float(os.getenv("NS_CURVA_C") or 0.90),
+    "D": float(os.getenv("NS_CURVA_D") or 0.85),
 }
 
 # Croston/SBA: constante de suavização (a correção de viés usa 1 - alpha/2).
-ALPHA_CROSTON = float(os.getenv("ALPHA_CROSTON", 0.1))
+ALPHA_CROSTON = float(os.getenv("ALPHA_CROSTON") or 0.1)
 
 # Limiares Syntetos-Boylan-Croston (classificação do padrão de demanda):
 #   ADI  = intervalo médio entre vendas (esparsidade)
 #   CV²  = variabilidade do tamanho das vendas
-SBC_ADI = float(os.getenv("SBC_ADI", 1.32))
-SBC_CV2 = float(os.getenv("SBC_CV2", 0.49))
+SBC_ADI = float(os.getenv("SBC_ADI") or 1.32)
+SBC_CV2 = float(os.getenv("SBC_CV2") or 0.49)
 
 # Sazonalidade (índice por subgrupo, anos completos)
-SAZ_ANOS = int(os.getenv("SAZ_ANOS", 5))
-SAZ_AMPLITUDE_MIN = float(os.getenv("SAZ_AMPLITUDE_MIN", 1.5))  # pico/vale mínimo p/ ser "sazonal"
-SAZ_VOL_MIN = float(os.getenv("SAZ_VOL_MIN", 300))             # volume anual mínimo do subgrupo
-SAZ_CONSIST_MIN = float(os.getenv("SAZ_CONSIST_MIN", 0.6))     # consistência do trimestre de pico
-SAZ_FATOR_MIN = float(os.getenv("SAZ_FATOR_MIN", 0.5))         # trava do fator sazonal
-SAZ_FATOR_MAX = float(os.getenv("SAZ_FATOR_MAX", 2.0))
+SAZ_ANOS = int(os.getenv("SAZ_ANOS") or 5)
+SAZ_AMPLITUDE_MIN = float(os.getenv("SAZ_AMPLITUDE_MIN") or 1.5)  # pico/vale mínimo p/ ser "sazonal"
+SAZ_VOL_MIN = float(os.getenv("SAZ_VOL_MIN") or 300)             # volume anual mínimo do subgrupo
+SAZ_CONSIST_MIN = float(os.getenv("SAZ_CONSIST_MIN") or 0.6)     # consistência do trimestre de pico
+SAZ_FATOR_MIN = float(os.getenv("SAZ_FATOR_MIN") or 0.5)         # trava do fator sazonal
+SAZ_FATOR_MAX = float(os.getenv("SAZ_FATOR_MAX") or 2.0)
 
 # ==========================================
 # CONEXÃO ODBC / CARGA DE DADOS
