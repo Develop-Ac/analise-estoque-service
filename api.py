@@ -224,6 +224,7 @@ class AnaliseItem(BaseModel):
     grupo_estoque_min_custo: Optional[int] = None
     grupo_estoque_max_custo: Optional[int] = None
     grupo_margem_pct: Optional[float] = None
+    eh_original: Optional[bool] = None
     memoria: Optional[dict] = None
     memoria_grupo: Optional[dict] = None
 
@@ -1192,7 +1193,8 @@ def listar_analise(
                 grupo_mean_size, grupo_cv2,
                 custo_unitario, margem_unitaria, margem_pct,
                 nivel_servico_custo, z_custo, estoque_min_custo, estoque_max_custo, estoque_seg_custo,
-                grupo_nivel_servico_custo, grupo_estoque_min_custo, grupo_estoque_max_custo, grupo_margem_pct
+                grupo_nivel_servico_custo, grupo_estoque_min_custo, grupo_estoque_max_custo, grupo_margem_pct,
+                eh_original
             FROM com_fifo_completo
             WHERE {where_clause}
             ORDER BY
@@ -2198,7 +2200,8 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
       - omite produtos "Sob Encomenda";
       - produtos com grupo_chave usam grupo_estoque_min/max e a POSIÇÃO CONSOLIDADA
         (soma do estoque+trânsito de todas as marcas do grupo) -> 1 linha por GRUPO;
-      - produtos sem grupo_chave (avulsos não-originais) caem no cálculo individual.
+      - produtos sem grupo_chave (avulsos, incluindo ORIGINAIS planejados) caem no
+        cálculo individual, com fornecedor vindo do histórico de compra (concessionária).
     """
     import math
     from collections import defaultdict
@@ -2485,7 +2488,7 @@ def _carregar_itens_sugestao(conn):
                    {opt('sigma_demanda_dia')}, {opt('nivel_servico_z')}, {opt('lead_time_dias')},
                    {opt('estoque_seguranca')}, {opt('fator_sazonal')},
                    {opt('mean_size_mes')}, {opt('cv2_tamanho')},
-                   {opt('sob_encomenda')}, {opt('grupo_chave')},
+                   {opt('sob_encomenda')}, {opt('eh_original')}, {opt('grupo_chave')},
                    {opt('grupo_estoque_min')}, {opt('grupo_estoque_max')},
                    {opt('grupo_curva')}, {opt('grupo_padrao')}, {opt('grupo_metodo')},
                    {opt('grupo_demanda_dia')}, {opt('grupo_estoque_seguranca')}, {opt('grupo_fator_sazonal')},

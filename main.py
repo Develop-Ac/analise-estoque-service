@@ -94,16 +94,27 @@ SS_CAP_CICLOS = float(os.getenv("SS_CAP_CICLOS") or 1.0)
 # O "mesmo produto" é agrupado pela DESCRIÇÃO (a marca fica no mar_codigo), e a
 # demanda é consolidada entre as marcas (substitutos). Produtos ORIGINAIS
 # (montadora/genuíno) saem do cálculo estocado — são por encomenda.
-# Regra do original: marca contém ORIGINAL/GENUINO, MENOS as exceções abaixo
-# (marcas aftermarket que só usam "original" no nome).
+# Regra do original: a MARCA contém a palavra "ORIGINAL" (singular ou plural),
+# MENOS as exceções abaixo — marcas aftermarket que só usam "original" no nome.
+# Só estas duas são exceção; qualquer outra marca com "original" é original de verdade.
 MARCAS_ORIGINAL_EXCECOES = [s.strip().upper() for s in os.getenv(
-    "MARCAS_ORIGINAL_EXCECOES", "DECAL LINE,DRIFT,INDUSTRIA ORIGINAL,ORIGINAL PARTS"
+    "MARCAS_ORIGINAL_EXCECOES", "ORIGINAL PARTS,INDUSTRIA ORIGINAL,INDÚSTRIA ORIGINAL"
 ).split(",") if s.strip()]
 
+# Planejar produtos ORIGINAIS (OEM/genuíno) que têm demanda real, comprados de
+# concessionária. Ligado: originais COM giro entram no cálculo e na sugestão como
+# item AVULSO (não são consolidados no grupo aftermarket — fornecedor diferente);
+# originais SEM giro seguem "Sob Encomenda". Desligado (0/false): comportamento
+# antigo (todo original vira Sob Encomenda, sem min/máx).
+PLANEJAR_ORIGINAIS = (os.getenv("PLANEJAR_ORIGINAIS", "1").strip().lower()
+                      not in ("0", "false", "nao", "não", ""))
+
 def marca_eh_original(mar):
-    """True se a marca é OEM/encomenda (montadora-original ou genuíno)."""
+    """True se a MARCA indica peça original — contém a palavra 'ORIGINAL' (singular
+    ou plural), exceto as marcas aftermarket listadas em MARCAS_ORIGINAL_EXCECOES.
+    'Genuíno' sozinho NÃO conta: a regra é a marca conter 'original'."""
     m = str(mar or "").upper()
-    if not ("ORIGINAL" in m or "ORIGINAIS" in m or "GENUINO" in m):
+    if ("ORIGINAL" not in m) and ("ORIGINAIS" not in m):
         return False
     return not any(ex in m for ex in MARCAS_ORIGINAL_EXCECOES)
 
@@ -442,6 +453,9 @@ def criar_tabela_postgres():
         -- ===== Originais (encomenda) + cálculo consolidado por grupo (descrição) =====
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='sob_encomenda') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN sob_encomenda BOOLEAN DEFAULT FALSE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='eh_original') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN eh_original BOOLEAN DEFAULT FALSE;
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_chave') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN grupo_chave VARCHAR(255);
@@ -1664,23 +1678,38 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     #  - demais: agrupados por descrição, demanda consolidada entre marcas (pooling)
     # ==========================================
     print("Aplicando regra de originais e cálculo consolidado por grupo...")
+    # EH_ORIGINAL = marcador permanente (montadora/genuíno). SOB_ENCOMENDA passa a
+    # significar "não planejado" (só encomenda pontual).
     if "MAR_DESCRICAO" in df_met.columns:
-        df_met["SOB_ENCOMENDA"] = df_met["MAR_DESCRICAO"].apply(marca_eh_original)
+        df_met["EH_ORIGINAL"] = df_met["MAR_DESCRICAO"].apply(marca_eh_original)
     else:
-        df_met["SOB_ENCOMENDA"] = False
+        df_met["EH_ORIGINAL"] = False
+    mask_orig = df_met["EH_ORIGINAL"] == True  # noqa: E712
+    # Original COM giro (alvo > 0) é planejado AVULSO quando PLANEJAR_ORIGINAIS;
+    # original sem giro (ou flag desligada) continua Sob Encomenda.
+    tem_alvo = pd.to_numeric(df_met.get("ESTOQUE_MAX_SUGERIDO"), errors="coerce").fillna(0) > 0
+    if PLANEJAR_ORIGINAIS:
+        df_met["SOB_ENCOMENDA"] = mask_orig & (~tem_alvo)
+    else:
+        df_met["SOB_ENCOMENDA"] = mask_orig
+    # Originais NUNCA entram no grupo aftermarket (fornecedor = concessionária):
+    # ficam AVULSOS (GRUPO_CHAVE None), planejados como item próprio.
     df_met["GRUPO_CHAVE"] = np.where(
-        df_met["SOB_ENCOMENDA"],
+        df_met["EH_ORIGINAL"],
         None,
         df_met["PRO_DESCRICAO"].astype(str).str.strip() if "PRO_DESCRICAO" in df_met.columns else None,
     )
-    mask_orig = df_met["SOB_ENCOMENDA"] == True  # noqa: E712
+    # Zera só os NÃO planejados (Sob Encomenda de verdade); os planejados mantêm min/máx.
+    mask_naoplan = df_met["SOB_ENCOMENDA"] == True  # noqa: E712
     for col in ["ESTOQUE_MIN_SUGERIDO", "ESTOQUE_MAX_SUGERIDO", "ESTOQUE_SEGURANCA",
                 "ESTOQUE_MIN_BASE", "ESTOQUE_MAX_BASE"]:
         if col in df_met.columns:
-            df_met.loc[mask_orig, col] = 0
-    df_met.loc[mask_orig, "TIPO_PLANEJAMENTO"] = "Sob_Encomenda"
-    df_met.loc[mask_orig, "METODO_REPOSICAO"] = "Sob Encomenda"
-    print(f"  - Produtos originais (Sob Encomenda): {int(mask_orig.sum())}")
+            df_met.loc[mask_naoplan, col] = 0
+    df_met.loc[mask_naoplan, "TIPO_PLANEJAMENTO"] = "Sob_Encomenda"
+    df_met.loc[mask_naoplan, "METODO_REPOSICAO"] = "Sob Encomenda"
+    n_plan_orig = int((mask_orig & (~mask_naoplan)).sum())
+    print(f"  - Originais: {int(mask_orig.sum())} (planejados avulsos: {n_plan_orig}; "
+          f"sob encomenda: {int((mask_orig & mask_naoplan).sum())})")
 
     try:
         df_grp = calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz)
@@ -2285,6 +2314,7 @@ def salvar_metricas_postgres(df_metricas):
         'FATOR_SAZONAL': 'fator_sazonal',
         'DEMANDA_PLANEJAMENTO_DIA': 'demanda_planejamento_dia',
         'SOB_ENCOMENDA': 'sob_encomenda',
+        'EH_ORIGINAL': 'eh_original',
         'GRUPO_CHAVE': 'grupo_chave',
         'GRUPO_QTD_ITENS': 'grupo_qtd_itens',
         'GRUPO_ESTOQUE_DISPONIVEL': 'grupo_estoque_disponivel',
@@ -2332,7 +2362,7 @@ def salvar_metricas_postgres(df_metricas):
         'nivel_servico_custo', 'z_custo', 'estoque_min_custo', 'estoque_max_custo', 'estoque_seg_custo',
         'venda_perdida_12m', 'valor_vendido_12m',
         'padrao_demanda', 'metodo_reposicao', 'fator_sazonal', 'demanda_planejamento_dia',
-        'sob_encomenda', 'grupo_chave', 'grupo_qtd_itens', 'grupo_estoque_disponivel',
+        'sob_encomenda', 'eh_original', 'grupo_chave', 'grupo_qtd_itens', 'grupo_estoque_disponivel',
         'grupo_demanda_dia', 'grupo_fator_sazonal', 'grupo_curva', 'grupo_padrao',
         'grupo_metodo', 'grupo_estoque_min', 'grupo_estoque_max', 'grupo_estoque_seguranca',
         'grupo_mean_size', 'grupo_cv2',
