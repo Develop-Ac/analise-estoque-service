@@ -83,6 +83,22 @@ VP_CAP_TETO = float(os.getenv("VP_CAP_TETO") or 200.0)  # teto absoluto por even
 # Dias médios por mês (conversão sigma mensal -> diário)
 DIAS_POR_MES = 30.44
 
+# ---- Limpeza de OUTLIER de demanda (mês fora da curva) ----
+# Problema: uma venda de projeto/atacado num único mês infla a média (d), o desvio
+# (σ) e o padrão, empurrando min/máx pra cima. A venda perdida já tem cap por evento;
+# as vendas reais não tinham. Método (estatística robusta / demand cleansing):
+#   - Identificador de HAMPEL sobre os meses COM venda: fora se |x−mediana| > k·1,4826·MAD;
+#   - fallback mediana×M quando a dispersão robusta colapsa (série ~constante + 1 pico,
+#     caso em que MAD=0) — evita não-detectar OU aparar demais;
+#   - WINSORIZA (apara no limite), não apaga; só p/ itens com meses suficientes (protege
+#     intermitentes); NÃO afeta faturamento/ABC/margem (só a demanda de estocagem).
+# Fontes: Hampel identifier (Pearson/Hampel); demand cleansing p/ sazonalidade (SAP IBP).
+LIMPAR_OUTLIER_DEMANDA = (os.getenv("LIMPAR_OUTLIER_DEMANDA", "1").strip().lower()
+                          not in ("0", "false", "nao", "não", ""))
+OUTLIER_HAMPEL_K = float(os.getenv("OUTLIER_HAMPEL_K") or 3.0)      # nº de desvios robustos
+OUTLIER_MEDIANA_MULT = float(os.getenv("OUTLIER_MEDIANA_MULT") or 3.0)  # fallback (MAD=0)
+OUTLIER_MIN_MESES = int(os.getenv("OUTLIER_MIN_MESES") or 5)        # mín. de meses com venda
+
 # Teto do estoque de segurança, em nº de ciclos de demanda da classe.
 # Evita que itens A/Z (demanda intermitente) peçam segurança exagerada, onde a
 # hipótese de normalidade do SS clássico superestima. 0 ou negativo = sem teto.
@@ -395,6 +411,17 @@ def criar_tabela_postgres():
         END IF;
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='valor_vendido_12m') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN valor_vendido_12m DECIMAL(15,4);
+        END IF;
+
+        -- ===== Auditoria de OUTLIER de demanda aparado (mês fora da curva) =====
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='teve_outlier_aparado') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN teve_outlier_aparado BOOLEAN DEFAULT FALSE;
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='outlier_qtd_aparada') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN outlier_qtd_aparada DECIMAL(15,2);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='outlier_motivo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN outlier_motivo VARCHAR(255);
         END IF;
 
         -- ===== Nível de serviço ECONÔMICO (razão crítica / newsvendor) — MODO SOMBRA =====
@@ -1029,6 +1056,44 @@ def _fator_sazonal_forward(indices_sgr, hoje, horizonte_dias):
     return float(min(max(float(np.mean(vals)), SAZ_FATOR_MIN), SAZ_FATOR_MAX))
 
 
+def _winsorizar_matriz_demanda(M, k=OUTLIER_HAMPEL_K, mult=OUTLIER_MEDIANA_MULT, min_meses=OUTLIER_MIN_MESES):
+    """
+    Apara outliers de demanda por LINHA (produto), mês a mês. Identificador de HAMPEL
+    sobre os meses COM venda: limite = mediana + k·(1,4826·MAD); quando a dispersão
+    robusta colapsa (MAD≈0: série ~constante + 1 pico), usa o fallback mediana×mult.
+    Só apara para cima (spikes) e só itens com >= min_meses de venda. Retorna
+    (matriz_aparada, unidades_aparadas, n_itens_afetados). Vetorizado (nanmedian).
+    """
+    M = np.asarray(M, dtype=float)
+    vazio = {"qtd": np.zeros(len(M)), "n_meses": np.zeros(len(M), dtype=int),
+             "max_orig": np.zeros(len(M)), "fence": np.full(len(M), np.nan),
+             "metodo": np.array([""] * len(M)), "total": 0.0, "n_itens": 0}
+    if M.size == 0:
+        return M, vazio
+    Mnz = M.copy()
+    Mnz[Mnz <= 0] = np.nan                       # ignora meses sem venda no robusto
+    with np.errstate(invalid="ignore"):
+        med = np.nanmedian(Mnz, axis=1)
+        mad = np.nanmedian(np.abs(Mnz - med[:, None]), axis=1)
+    nz = np.sum(~np.isnan(Mnz), axis=1)
+    scale = 1.4826 * mad
+    fence = np.where(scale < 1e-9, med * mult, med + k * scale)   # Hampel c/ fallback
+    aplica = (nz >= min_meses) & np.isfinite(fence) & (med > 0)
+    fence_eff = np.where(aplica, fence, np.inf)[:, None]
+    over = M > fence_eff
+    Mout = np.where(over, np.broadcast_to(fence_eff, M.shape), M)
+    # ---- auditoria por item ----
+    qtd_item = np.where(over, M - fence_eff, 0.0).sum(axis=1)
+    n_meses_item = over.sum(axis=1).astype(int)
+    max_item = np.where(over, M, 0.0).max(axis=1)                 # pico original aparado
+    metodo_item = np.where(scale < 1e-9, "mediana", "hampel")
+    fence_item = np.where(aplica, fence, np.nan)
+    aud = {"qtd": qtd_item, "n_meses": n_meses_item, "max_orig": max_item,
+           "fence": fence_item, "metodo": metodo_item,
+           "total": float(qtd_item.sum()), "n_itens": int((qtd_item > 0).sum())}
+    return Mout, aud
+
+
 def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
                                              df_vp: pd.DataFrame,
                                              hoje: pd.Timestamp,
@@ -1118,11 +1183,21 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
                                      "SIGMA_DEMANDA_DIA", "CV_DEMANDA",
                                      "VENDA_PERDIDA_12M", "VALOR_VENDIDO_12M",
                                      "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES",
-                                     "CUSTO_UNIT", "MARGEM_UNIT", "MARGEM_PCT"])
+                                     "CUSTO_UNIT", "MARGEM_UNIT", "MARGEM_PCT",
+                                     "TEVE_OUTLIER_APARADO", "OUTLIER_QTD_APARADA", "OUTLIER_MOTIVO"])
 
     mat = demanda_mes.unstack(fill_value=0).reindex(columns=meses, fill_value=0)
     vendas_mat = (vendas_mes.unstack(fill_value=0).reindex(columns=meses, fill_value=0)
                   if not vendas_mes.empty else pd.DataFrame(index=mat.index))
+
+    # ---------- Limpeza de outlier de demanda (mês fora da curva) ----------
+    # Apara spikes ANTES de calcular d/σ/padrão (não toca em faturamento/ABC/margem).
+    _aud = None
+    if LIMPAR_OUTLIER_DEMANDA and mat.shape[1] > 1:
+        _clean, _aud = _winsorizar_matriz_demanda(mat.values)
+        mat = pd.DataFrame(_clean, index=mat.index, columns=mat.columns)
+        print(f"  - Outlier de demanda (Hampel k={OUTLIER_HAMPEL_K:g}): {_aud['n_itens']} itens aparados; "
+              f"{_aud['total']:.0f} un removidas do cálculo de estocagem")
 
     res = pd.DataFrame(index=mat.index)
     res["DEM_DIA_REAL"] = mat.sum(axis=1) / dias_janela
@@ -1131,6 +1206,29 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
     # variância escala com o tempo -> sigma_dia = sigma_mes / sqrt(dias por mês)
     res["SIGMA_DEMANDA_DIA"] = sigma_mes / np.sqrt(dias_janela / n_meses)
     res["CV_DEMANDA"] = np.where(media_mes > 0, sigma_mes / media_mes, 0.0)
+
+    # ---------- Auditoria do outlier aparado (por item) ----------
+    if _aud is not None and len(_aud["qtd"]) == len(mat.index):
+        qtd = _aud["qtd"]; nm = _aud["n_meses"]; mx = _aud["max_orig"]
+        fc = _aud["fence"]; mt = _aud["metodo"]
+        res["TEVE_OUTLIER_APARADO"] = qtd > 0
+        res["OUTLIER_QTD_APARADA"] = np.round(qtd, 0)
+        motivos = []
+        for j in range(len(qtd)):
+            if qtd[j] > 0:
+                lbl = (f"mediana × {OUTLIER_MEDIANA_MULT:g} (série quase constante com 1 pico)"
+                       if mt[j] == "mediana" else f"Hampel: mediana + {OUTLIER_HAMPEL_K:g}·desvio robusto")
+                plural = "meses" if nm[j] > 1 else "mês"
+                motivos.append(
+                    f"{int(nm[j])} {plural} de venda fora da curva aparado(s): pico {int(mx[j])} → "
+                    f"{int(round(fc[j]))} un/mês. Limite robusto: {lbl}.")
+            else:
+                motivos.append(None)
+        res["OUTLIER_MOTIVO"] = motivos
+    else:
+        res["TEVE_OUTLIER_APARADO"] = False
+        res["OUTLIER_QTD_APARADA"] = 0.0
+        res["OUTLIER_MOTIVO"] = None
 
     # ---------- Padrão de demanda (Syntetos-Boylan-Croston) ----------
     # ADI = nº de meses / meses com venda ; CV² = variância/média² dos tamanhos
@@ -1455,14 +1553,19 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     cols_rec = ["DEM_DIA_VENDAS", "DEM_DIA_REAL", "SIGMA_DEMANDA_DIA",
                 "CV_DEMANDA", "VENDA_PERDIDA_12M", "VALOR_VENDIDO_12M",
                 "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES",
-                "CUSTO_UNIT", "MARGEM_UNIT", "MARGEM_PCT"]
+                "CUSTO_UNIT", "MARGEM_UNIT", "MARGEM_PCT",
+                "TEVE_OUTLIER_APARADO", "OUTLIER_QTD_APARADA", "OUTLIER_MOTIVO"]
     if df_rec is not None and not df_rec.empty:
         df_rec["PRO_CODIGO"] = df_rec["PRO_CODIGO"].astype(str).str.strip()
         df_met = df_met.merge(df_rec[["PRO_CODIGO"] + cols_rec], on="PRO_CODIGO", how="left")
+    _cols_rec_texto = {"OUTLIER_MOTIVO", "TEVE_OUTLIER_APARADO"}  # não-numéricas
     for c in cols_rec:
         if c not in df_met.columns:
-            df_met[c] = 0.0
-        df_met[c] = pd.to_numeric(df_met[c], errors="coerce").fillna(0.0)
+            df_met[c] = (None if c == "OUTLIER_MOTIVO"
+                         else (False if c == "TEVE_OUTLIER_APARADO" else 0.0))
+        if c not in _cols_rec_texto:
+            df_met[c] = pd.to_numeric(df_met[c], errors="coerce").fillna(0.0)
+    df_met["TEVE_OUTLIER_APARADO"] = df_met["TEVE_OUTLIER_APARADO"].fillna(False).astype(bool)
 
     # Demanda de reposição = demanda recente (vendas-only para exibição)
     df_met["DEMANDA_MEDIA_DIA"] = df_met["DEM_DIA_VENDAS"]
@@ -2301,6 +2404,9 @@ def salvar_metricas_postgres(df_metricas):
         'CUSTO_UNIT': 'custo_unitario',
         'MARGEM_UNIT': 'margem_unitaria',
         'MARGEM_PCT': 'margem_pct',
+        'TEVE_OUTLIER_APARADO': 'teve_outlier_aparado',
+        'OUTLIER_QTD_APARADA': 'outlier_qtd_aparada',
+        'OUTLIER_MOTIVO': 'outlier_motivo',
         'NIVEL_SERVICO_CUSTO': 'nivel_servico_custo',
         'Z_CUSTO': 'z_custo',
         'ESTOQUE_MIN_CUSTO': 'estoque_min_custo',
@@ -2359,6 +2465,7 @@ def salvar_metricas_postgres(df_metricas):
         'demanda_real_dia', 'sigma_demanda_dia', 'cv_demanda', 'mean_size_mes', 'cv2_tamanho', 'classe_xyz',
         'estoque_seguranca', 'nivel_servico_z', 'lead_time_dias',
         'custo_unitario', 'margem_unitaria', 'margem_pct',
+        'teve_outlier_aparado', 'outlier_qtd_aparada', 'outlier_motivo',
         'nivel_servico_custo', 'z_custo', 'estoque_min_custo', 'estoque_max_custo', 'estoque_seg_custo',
         'venda_perdida_12m', 'valor_vendido_12m',
         'padrao_demanda', 'metodo_reposicao', 'fator_sazonal', 'demanda_planejamento_dia',

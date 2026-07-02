@@ -225,6 +225,9 @@ class AnaliseItem(BaseModel):
     grupo_estoque_max_custo: Optional[int] = None
     grupo_margem_pct: Optional[float] = None
     eh_original: Optional[bool] = None
+    teve_outlier_aparado: Optional[bool] = None
+    outlier_qtd_aparada: Optional[float] = None
+    outlier_motivo: Optional[str] = None
     memoria: Optional[dict] = None
     memoria_grupo: Optional[dict] = None
 
@@ -1194,7 +1197,7 @@ def listar_analise(
                 custo_unitario, margem_unitaria, margem_pct,
                 nivel_servico_custo, z_custo, estoque_min_custo, estoque_max_custo, estoque_seg_custo,
                 grupo_nivel_servico_custo, grupo_estoque_min_custo, grupo_estoque_max_custo, grupo_margem_pct,
-                eh_original
+                eh_original, teve_outlier_aparado, outlier_qtd_aparada, outlier_motivo
             FROM com_fifo_completo
             WHERE {where_clause}
             ORDER BY
@@ -1248,6 +1251,8 @@ def listar_analise(
                 min_custo=_it.get("estoque_min_custo"), max_custo=_it.get("estoque_max_custo"),
                 ss_custo=_it.get("estoque_seg_custo"), margem_pct=_it.get("margem_pct"),
                 custo_unit=_it.get("custo_unitario"),
+                outlier_aparado=_it.get("teve_outlier_aparado"),
+                outlier_qtd=_it.get("outlier_qtd_aparada"), outlier_motivo=_it.get("outlier_motivo"),
             )
             gk = _it.get("grupo_chave")
             if gk and _sug_float(_it.get("grupo_estoque_max")) > 0:
@@ -2038,7 +2043,8 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
                            demanda_dia, sigma_dia, z, lead_time, ss, fator_sazonal,
                            sgr_codigo, msize=None, cv2=None, membros=None,
                            ns_custo=None, z_custo=None, min_custo=None, max_custo=None,
-                           ss_custo=None, margem_pct=None, custo_unit=None):
+                           ss_custo=None, margem_pct=None, custo_unit=None,
+                           outlier_aparado=None, outlier_qtd=None, outlier_motivo=None):
     """
     Memória de cálculo do mín/máx: fórmula + valores REAIS que compuseram a
     quantidade. escopo='grupo'|'item'. `membros` (grupo) = contribuição por marca.
@@ -2178,6 +2184,14 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
             "formula": "p* = margem ÷ (margem + custo de manter);  limitado pela faixa da curva ABC.",
         }
 
+    # ----- Auditoria do outlier de demanda aparado (mês fora da curva) -----
+    if outlier_aparado:
+        mem["outlier"] = {
+            "aparado": True,
+            "qtd": int(_sug_float(outlier_qtd)),
+            "motivo": outlier_motivo or "Mês de venda fora da curva aparado no cálculo da demanda.",
+        }
+
     if membros:
         mem["membros"] = membros
     return mem
@@ -2275,6 +2289,8 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             fator_sazonal=it.get("fator_sazonal"),
             sgr_codigo=it.get("sgr_codigo"),
             msize=it.get("mean_size_mes"), cv2=it.get("cv2_tamanho"),
+            outlier_aparado=it.get("teve_outlier_aparado"),
+            outlier_qtd=it.get("outlier_qtd_aparada"), outlier_motivo=it.get("outlier_motivo"),
         )
         _registrar(bucket, {
             "tipo": "individual",
@@ -2488,7 +2504,9 @@ def _carregar_itens_sugestao(conn):
                    {opt('sigma_demanda_dia')}, {opt('nivel_servico_z')}, {opt('lead_time_dias')},
                    {opt('estoque_seguranca')}, {opt('fator_sazonal')},
                    {opt('mean_size_mes')}, {opt('cv2_tamanho')},
-                   {opt('sob_encomenda')}, {opt('eh_original')}, {opt('grupo_chave')},
+                   {opt('sob_encomenda')}, {opt('eh_original')},
+                   {opt('teve_outlier_aparado')}, {opt('outlier_qtd_aparada')}, {opt('outlier_motivo')},
+                   {opt('grupo_chave')},
                    {opt('grupo_estoque_min')}, {opt('grupo_estoque_max')},
                    {opt('grupo_curva')}, {opt('grupo_padrao')}, {opt('grupo_metodo')},
                    {opt('grupo_demanda_dia')}, {opt('grupo_estoque_seguranca')}, {opt('grupo_fator_sazonal')},
