@@ -143,15 +143,17 @@ NS_POR_CURVA = {
     "D": float(os.getenv("NS_CURVA_D") or 0.85),
 }
 
-# ---- Nível de serviço ECONÔMICO (razão crítica / newsvendor) — MODO SOMBRA ----
+# ---- Nível de serviço ECONÔMICO (razão crítica / newsvendor) — OFICIAL ----
 # p* = margem / (margem + custo de manter).  Cu = margem unitária perdida na ruptura;
 # Co = custo de carregar 1 un pelo ciclo = custo × taxa_anual × (dias_ciclo/365).
-# Calculado EM PARALELO ao nível da curva: preenche colunas *_custo para comparação,
-# mas NÃO altera a sugestão oficial (estoque_min/max_sugerido seguem pela curva).
-# Vira oficial só quando NS_MODO=custo (rollout futuro). Fontes: Silver-Pyke-Peterson;
-# razão crítica de Arrow-Harris-Marschak (newsvendor). Ver manual, cap. 2.
+# Este é o nível de serviço OFICIAL do mín/máx (NS_MODO='custo', padrão): quando há
+# margem/custo confiáveis, o ponto de pedido e o de reposição usam o alvo econômico
+# (dentro da faixa da curva ABC). Sem margem/custo → cai no nível da curva.
+# As colunas *_custo guardam o mesmo alvo econômico para auditoria/transparência.
+# Retrocompatível: NS_MODO='sombra' volta ao comportamento antigo (oficial = curva).
+# Fontes: Silver-Pyke-Peterson; razão crítica de Arrow-Harris-Marschak (newsvendor).
 HOLDING_RATE_ANUAL = float(os.getenv("HOLDING_RATE_ANUAL") or 0.25)   # custo de manter (20-30%/ano típico)
-NS_MODO = (os.getenv("NS_MODO") or "sombra").strip().lower()          # 'sombra' | 'custo'
+NS_MODO = (os.getenv("NS_MODO") or "custo").strip().lower()           # 'custo' (oficial) | 'sombra' (legado)
 # Faixa (piso, teto) do nível de serviço por curva: o custo escolhe o ponto, a ABC dá os limites.
 NS_FAIXA_CURVA = {
     "A": (float(os.getenv("NS_PISO_A") or 0.90), float(os.getenv("NS_TETO_A") or 0.99)),
@@ -1289,9 +1291,10 @@ def calcular_min_max(curva, dem, sigma_dia, padrao, sgr, data_max, cv2, msize, h
       - Intermitente/Grumoso -> Poisson composta: quantil da distribuição discreta
     `dem` já deve vir sazonalizada.
 
-    Calcula DOIS conjuntos com o mesmo motor: o OFICIAL (nível de serviço da curva) e,
-    quando há margem/custo, o de SOMBRA (nível econômico newsvendor). O oficial não muda —
-    o de sombra vai em colunas *_CUSTO só para comparação (ver NS_MODO/rollout).
+    Nível de serviço OFICIAL (ver NS_MODO): quando há margem/custo confiáveis, o mín/máx
+    usa o alvo ECONÔMICO (razão crítica / newsvendor, dentro da faixa da curva ABC); sem
+    margem/custo, cai no nível da curva. As colunas *_CUSTO registram o alvo econômico
+    para auditoria. Com NS_MODO='sombra' (legado) o oficial volta a ser o da curva.
     """
     regra = REGRAS_DIAS.get(sgr, REGRAS_DIAS["default"])
     try: sigma_dia = float(sigma_dia) if not pd.isna(sigma_dia) else 0.0
@@ -1327,14 +1330,20 @@ def calcular_min_max(curva, dem, sigma_dia, padrao, sgr, data_max, cv2, msize, h
             emin = 0; emax = max(1, int(np.ceil(dem * 15))); ess = 0
         return emin, emax, ess
 
-    # OFICIAL — nível de serviço da curva (inalterado)
-    z_of = Z_POR_CURVA.get(curva, Z_POR_CURVA["C"]); p_of = NS_POR_CURVA.get(curva, 0.90)
+    # Nível ECONÔMICO (razão crítica). Sem margem/custo → (None, None).
+    p_c, z_c = _nivel_servico_custo(curva, margem_unit, custo_unit, dias_ciclo)
+
+    # OFICIAL — usa o nível econômico quando disponível e NS_MODO='custo'; senão, a curva.
+    usar_custo = (NS_MODO == "custo") and (p_c is not None)
+    if usar_custo:
+        z_of, p_of = z_c, p_c
+    else:
+        z_of = Z_POR_CURVA.get(curva, Z_POR_CURVA["C"]); p_of = NS_POR_CURVA.get(curva, 0.90)
     emin, emax, ess = _core(z_of, p_of)
     out = {"ESTOQUE_MIN_BASE": emin, "ESTOQUE_MAX_BASE": emax,
            "ESTOQUE_SEGURANCA": ess, "NIVEL_SERVICO_Z": round(float(z_of), 4)}
 
-    # SOMBRA — nível econômico (razão crítica). Sem margem/custo → espelha o oficial.
-    p_c, z_c = _nivel_servico_custo(curva, margem_unit, custo_unit, dias_ciclo)
+    # Colunas *_CUSTO — alvo econômico (auditoria). Sem margem/custo → espelham o oficial.
     if p_c is not None:
         cmin, cmax, css = _core(z_c, p_c)
         out.update({"NIVEL_SERVICO_CUSTO": round(p_c, 4), "Z_CUSTO": round(float(z_c), 4),
@@ -1416,7 +1425,8 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     g["GRUPO_ESTOQUE_MIN"] = [x["ESTOQUE_MIN_BASE"] for x in res]
     g["GRUPO_ESTOQUE_MAX"] = [x["ESTOQUE_MAX_BASE"] for x in res]
     g["GRUPO_ESTOQUE_SEGURANCA"] = [x["ESTOQUE_SEGURANCA"] for x in res]
-    # Sombra econômica do grupo (razão crítica) — só comparação, não muda a sugestão
+    # Alvo econômico do grupo (razão crítica) — auditoria; o oficial já sai de
+    # GRUPO_ESTOQUE_MIN/MAX (ESTOQUE_*_BASE), que agora seguem o nível de custo.
     g["GRUPO_NIVEL_SERVICO_CUSTO"] = [x["NIVEL_SERVICO_CUSTO"] for x in res]
     g["GRUPO_ESTOQUE_MIN_CUSTO"] = [x["ESTOQUE_MIN_CUSTO"] for x in res]
     g["GRUPO_ESTOQUE_MAX_CUSTO"] = [x["ESTOQUE_MAX_CUSTO"] for x in res]
@@ -1884,9 +1894,15 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             ss = row.get("ESTOQUE_SEGURANCA", 0)
             z = row.get("NIVEL_SERVICO_Z", 0)
             xyz = row.get("CLASSE_XYZ", "")
+            ns_custo = row.get("NIVEL_SERVICO_CUSTO", None)
+            if NS_MODO == "custo" and ns_custo is not None and not pd.isna(ns_custo):
+                origem_ns = (f"nível de serviço econômico {float(ns_custo)*100:.0f}% "
+                             f"(margem x custo, na faixa da curva {curva})")
+            else:
+                origem_ns = f"nível de serviço da curva {curva}"
             partes.append(
                 f"Mínimo (ponto de pedido) = demanda x {LEAD_TIME}d de lead time + estoque de segurança "
-                f"({ss} un; classe {curva}/{xyz}, Z={z}); máximo cobre +{dias_ciclo}d de ciclo. "
+                f"({ss} un; classe {curva}/{xyz}, {origem_ns}, Z={z}); máximo cobre +{dias_ciclo}d de ciclo. "
                 f"Base {est_min_base}-{est_max_base} un."
             )
             metodo = row.get("METODO_REPOSICAO", "")

@@ -908,10 +908,11 @@ def listar_categorias_estocagem():
 @app.get("/analise/comparacao-custo")
 def comparacao_nivel_servico_custo():
     """
-    Comparação AGREGADA entre o nível de serviço da CURVA (oficial) e o de CUSTO
-    (razão crítica / newsvendor — modo sombra). Só leitura; alimenta a tela de
-    comparação. Considera itens com nivel_servico_custo preenchido (têm margem/custo
-    confiáveis) e fora de 'sob encomenda'. Capital = ponto de pedido × custo unitário.
+    Comparação AGREGADA entre o nível de serviço da CURVA e o de CUSTO (razão crítica /
+    newsvendor). ORFÃO: a tela de comparação foi removida e o nível de custo virou o
+    OFICIAL (NS_MODO=custo → estoque_min_base == estoque_min_custo, deltas ≈ 0). Endpoint
+    mantido como relatório de auditoria read-only; pode ser removido se ninguém consumir.
+    Considera itens com nivel_servico_custo preenchido e fora de 'sob encomenda'.
     """
     try:
         conn = get_db_connection()
@@ -2164,7 +2165,9 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
         mem["graf"] = {"tipo": "serra", "maximo": mmax, "minimo": mmin, "seguranca": int(ss_v),
                        "demanda_dia": round(dem, 4), "lead_time": int(lt), "ciclo": ciclo}
 
-    # ----- Comparação com o NÍVEL DE SERVIÇO POR CUSTO (razão crítica, modo sombra) -----
+    # ----- Nível de serviço por CUSTO (razão crítica) — agora OFICIAL (NS_MODO=custo) -----
+    # Payload legado da comparação curva×custo; a tela foi removida (o custo virou o mín/máx
+    # oficial). Mantido só p/ compatibilidade de contrato; frontend atual ignora `custo`.
     if ns_custo is not None:
         nsc = _sug_float(ns_custo)
         cmin = int(_sug_float(min_custo)); cmax = int(_sug_float(max_custo))

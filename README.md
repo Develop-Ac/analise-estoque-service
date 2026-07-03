@@ -75,7 +75,8 @@ subestima a procura). Cada apontamento de venda perdida tem **teto por evento**
 ### 2.2 Classificação
 
 - **Curva ABC** — por valor vendido em 12 meses: A (≤70% do faturamento
-  acumulado), B (≤90%), C (≤97%), D (resto). Define o **nível de serviço**.
+  acumulado), B (≤90%), C (≤97%), D (resto). Define a **faixa (piso/teto) do nível
+  de serviço** — o custo escolhe o ponto dentro dela (§2.3).
 - **Classe XYZ** — pelo coeficiente de variação (CV) da demanda mensal:
   X (≤`XYZ_LIMIAR_X`), Y (≤`XYZ_LIMIAR_Y`), Z (acima). Item sem giro fica nulo.
 - **Padrão de demanda (Syntetos-Boylan-Croston)** — por **ADI** (intervalo médio
@@ -86,10 +87,39 @@ subestima a procura). Cada apontamento de venda perdida tem **teto por evento**
   | **ADI baixo** (`<SBC_ADI`) | **Suave** | **Errático** |
   | **ADI alto** | **Intermitente** | **Grumoso** |
 
-### 2.3 Os três cálculos
+### 2.3 Nível de serviço econômico (custo x margem)
 
-Todos usam o **nível de serviço da curva** (probabilidade de não faltar):
-A=98% (Z≈2,05), B=95% (1,65), C=90% (1,28), D=85% (1,04).
+O **nível de serviço** (probabilidade de não faltar) que define o `Z` do estoque de
+segurança é **calculado pelo custo**, não fixado pela curva. Pela **razão crítica**
+(newsvendor) cada item busca seu ponto ótimo:
+
+```
+p* = margem / (margem + custo de manter)
+custo de manter (Co) = custo unitário × HOLDING_RATE_ANUAL × (dias_ciclo / 365)
+margem (Cu)          = preço unitário − custo unitário          (ambos médios em 12m)
+```
+
+Item com **margem alta e custo baixo** protege mais (p* sobe); item com **custo alto
+e margem magra** protege menos (p* desce) — o capital vai para onde rende. O p* é
+**travado na faixa da curva ABC** (a curva dá o piso/teto, o custo escolhe o ponto):
+
+| Curva | Piso | Teto |
+|---|---|---|
+| A | 90% | 99% |
+| B | 85% | 98% |
+| C | 80% | 96% |
+| D | 75% | 94% |
+
+Quando **faltam margem/custo** confiáveis (sem `preco_custo` no ERP), o item **cai no
+nível fixo da curva**: A=98% (Z≈2,05), B=95% (1,65), C=90% (1,28), D=85% (1,04). O nível
+econômico é o **oficial** (`NS_MODO=custo`, padrão) e alimenta direto o
+`estoque_min/max_sugerido`; as colunas `*_custo` guardam o alvo econômico para auditoria.
+`NS_MODO=sombra` (legado) volta a fixar o oficial pela curva.
+
+### 2.3.1 Os três cálculos
+
+Definido o `Z` (pelo custo ou pela curva), o mín/máx sai por um de três motores,
+escolhido pelo padrão de demanda:
 
 **Cálculo 1 — Normal (Silver-Pyke)** — itens Suave/Errático:
 
@@ -98,9 +128,9 @@ SS  = Z × σ × √LT
 Mín = d × LT + SS
 Máx = Mín + d × C
 ```
-`d`=demanda diária · `LT`=lead time · `σ`=desvio-padrão diário · `Z`=fator da
-curva · `C`=dias de ciclo da classe · `SS`=estoque de segurança (teto de
-`SS_CAP_CICLOS` ciclos).
+`d`=demanda diária · `LT`=lead time · `σ`=desvio-padrão diário · `Z`=fator do
+nível de serviço (§2.3) · `C`=dias de ciclo da classe · `SS`=estoque de segurança
+(teto de `SS_CAP_CICLOS` ciclos).
 
 **Cálculo 2 — Poisson composta** — itens Intermitente/Grumoso (vendem em lote):
 
@@ -158,6 +188,7 @@ mantém as 2 últimas execuções). Colunas por grupo:
 | Classificação | `curva_abc`, `classe_xyz`, `cv_demanda`, `padrao_demanda`, `metodo_reposicao`, `categoria_estocagem` |
 | Tendência/Sazonal | `fator_tendencia`, `tendencia_label`, `alerta_tendencia_alta`, `fator_sazonal` |
 | Mín/Máx (item) | `estoque_min_base/max_base`, `estoque_min_ajustado/max_ajustado`, **`estoque_min_sugerido`/`estoque_max_sugerido`**, `estoque_seguranca`, `nivel_servico_z`, `lead_time_dias`, `tipo_planejamento` |
+| Nível econômico (auditoria) | `custo_unitario`, `margem_unitaria`, `margem_pct`, `nivel_servico_custo`, `z_custo`, `estoque_min_custo/max_custo/seg_custo` (e os `grupo_*_custo`) |
 | **Grupo** | `grupo_chave`, `grupo_qtd_itens`, `grupo_estoque_disponivel`, `grupo_demanda_dia`, `grupo_fator_sazonal`, `grupo_curva`, `grupo_padrao`, `grupo_metodo`, **`grupo_estoque_min`/`grupo_estoque_max`**, `grupo_estoque_seguranca` |
 | Flags | `sob_encomenda`, `teve_alteracao_analise`, `dados_alteracao_json`, `data_processamento` |
 | FIFO saldo | `tempo_medio_saldo_atual`, `categoria_saldo_atual` |
@@ -189,8 +220,11 @@ Auxiliares:
 |---|---|---|
 | `JANELA_DEMANDA_MESES` | `12` | janela da demanda e do ABC |
 | `LEAD_TIME_DIAS` | `17` | prazo de reposição (dias) |
-| `Z_CURVA_A/B/C/D` | `2.054/1.645/1.282/1.036` | fator Z por curva (Normal) |
-| `NS_CURVA_A/B/C/D` | `0.98/0.95/0.90/0.85` | nível de serviço (Poisson) |
+| `Z_CURVA_A/B/C/D` | `2.054/1.645/1.282/1.036` | Z de fallback por curva (sem custo) |
+| `NS_CURVA_A/B/C/D` | `0.98/0.95/0.90/0.85` | nível de serviço de fallback (Poisson) |
+| `NS_MODO` | `custo` | `custo` = nível econômico oficial; `sombra` = oficial pela curva (legado) |
+| `HOLDING_RATE_ANUAL` | `0.25` | custo de manter estoque ao ano (20–30% típico) |
+| `NS_PISO_A/B/C/D` · `NS_TETO_A/B/C/D` | `0.90/0.85/0.80/0.75` · `0.99/0.98/0.96/0.94` | faixa do nível de serviço por curva (trava o p\* do custo) |
 | `SS_CAP_CICLOS` | `1.0` | teto do SS em ciclos (0 = sem teto) |
 | `XYZ_LIMIAR_X/Y` | `0.5/1.0` | limiares do CV para X/Y/Z |
 | `SBC_ADI` / `SBC_CV2` | `1.32/0.49` | limiares do padrão de demanda |
@@ -298,6 +332,7 @@ Quanto?  = Máximo − Posição
 | **Lead time (LT)** | prazo entre pedir e receber |
 | **Estoque de segurança (SS)** | colchão contra a variação da demanda |
 | **Nível de serviço** | probabilidade de não faltar (define Z / a meta) |
+| **Razão crítica (newsvendor)** | nível de serviço econômico p\*=margem/(margem+custo de manter); a curva ABC dá a faixa, o custo escolhe o ponto |
 | **Demanda censurada** | procura subestimada por falta de estoque (corrigida pela venda perdida) |
 | **ADI / CV²** | esparsidade da venda / variação do tamanho da venda |
 | **Risk pooling** | ganho de consolidar a demanda de itens substitutos |
