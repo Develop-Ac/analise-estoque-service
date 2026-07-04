@@ -1568,7 +1568,7 @@ def exportar_analise(
                 custo_unitario as "Custo Unit. (R$)",
                 ROUND(COALESCE(estoque_disponivel,0) * COALESCE(custo_unitario,0), 2) as "Valor em Estoque (R$)",
                 ROUND(COALESCE(estoque_disponivel,0) * COALESCE(custo_unitario,0)
-                      * {hold_rate} * GREATEST(COALESCE(tempo_medio_saldo_atual,0),0) / 365.0, 2) as "Custo Manter Acum. (R$)"
+                      * {hold_rate} * GREATEST(COALESCE(tempo_medio_saldo_atual,0),0) / 365.0, 2) as "CME Acum. (R$)"
              """.format(hold_rate=float(os.getenv("HOLDING_RATE_ANUAL") or 0.25))
 
         export_sql = text(f"""
