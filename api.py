@@ -1994,6 +1994,52 @@ def get_compras_historico(force=False):
     return hist
 
 
+_FORN_PARAM_CACHE = {"ts": 0.0, "data": None}
+_FORN_PARAM_TTL_S = int(os.getenv("FORN_PARAM_TTL_S") or 300)  # 5min
+
+
+def get_fornecedor_parametros(force=False):
+    """
+    Parâmetros de compra por fornecedor (com_fornecedor_parametros, preenchidos na
+    tela /compras/fornecedores). Casamento por NOME normalizado — o mesmo nome do
+    histórico de compra (Mongo). Retorna:
+      {FOR_NOME_UPPER: {"lead_time_dias", "tempo_revisao_dias", "pedido_minimo_valor"}}
+    Vazio se a tabela não existir ainda (tolerante a schema antigo).
+    """
+    now = _time.time()
+    cached = _FORN_PARAM_CACHE.get("data")
+    if not force and cached is not None and (now - _FORN_PARAM_CACHE["ts"]) < _FORN_PARAM_TTL_S:
+        return cached
+    out = {}
+    try:
+        conn = get_db_connection()
+        try:
+            rows = conn.execute(text(
+                "SELECT for_nome, lead_time_dias, tempo_revisao_dias, pedido_minimo_valor "
+                "FROM com_fornecedor_parametros"
+            )).mappings().all()
+        finally:
+            conn.close()
+        for r in rows:
+            nome = _sug_norm(r.get("for_nome")).upper()
+            if not nome:
+                continue
+            def _pos(v):
+                f = _sug_float(v)
+                return f if f > 0 else None
+            out[nome] = {
+                "lead_time_dias": _pos(r.get("lead_time_dias")),
+                "tempo_revisao_dias": _pos(r.get("tempo_revisao_dias")),
+                "pedido_minimo_valor": _pos(r.get("pedido_minimo_valor")),
+            }
+    except Exception as e:
+        print(f"AVISO: com_fornecedor_parametros indisponível ({e}).")
+        out = {}
+    _FORN_PARAM_CACHE["ts"] = now
+    _FORN_PARAM_CACHE["data"] = out
+    return out
+
+
 def _sug_norm(s):
     return (str(s).strip() if s is not None else "")
 
@@ -2045,18 +2091,27 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
                            sgr_codigo, msize=None, cv2=None, membros=None,
                            ns_custo=None, z_custo=None, min_custo=None, max_custo=None,
                            ss_custo=None, margem_pct=None, custo_unit=None,
-                           outlier_aparado=None, outlier_qtd=None, outlier_motivo=None):
+                           outlier_aparado=None, outlier_qtd=None, outlier_motivo=None,
+                           periodo_revisao=None, fornecedor_lt=None):
     """
     Memória de cálculo do mín/máx: fórmula + valores REAIS que compuseram a
     quantidade. escopo='grupo'|'item'. `membros` (grupo) = contribuição por marca.
+    `periodo_revisao` (dias) entra no período de proteção do mínimo (LT + revisão);
+    `fornecedor_lt` = nome do fornecedor de quem veio o lead time (informativo).
     """
     ciclo, _dmin, _dmax = _dias_ciclo(curva, sgr_codigo)
+    rev = _sug_float(periodo_revisao)
+    t_prot = _sug_float(lead_time) + max(rev, 0.0)  # período de proteção do mínimo
     comp = [
         {"rotulo": "Demanda planejada", "valor": round(_sug_float(demanda_dia), 4), "unid": "un/dia"},
         {"rotulo": "Lead time (reposição)", "valor": int(_sug_float(lead_time)), "unid": "dias"},
         {"rotulo": "Estoque de segurança", "valor": int(_sug_float(ss)), "unid": "un"},
         {"rotulo": "Dias de ciclo (cobertura do máximo)", "valor": ciclo, "unid": "dias"},
     ]
+    if rev > 0:
+        comp.insert(2, {"rotulo": "Período de revisão do fornecedor", "valor": int(rev), "unid": "dias"})
+    if fornecedor_lt:
+        comp.append({"rotulo": "Lead time do fornecedor", "valor": str(fornecedor_lt)})
     if _sug_float(z):
         comp.append({"rotulo": "Nível de serviço (Z)", "valor": round(_sug_float(z), 3)})
     if _sug_float(sigma_dia):
@@ -2064,6 +2119,7 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
     fs = _sug_float(fator_sazonal)
     if fs and abs(fs - 1.0) >= 0.01:
         comp.append({"rotulo": "Fator sazonal (próximo período)", "valor": round(fs, 3), "unid": "x"})
+    protecao_txt = "(lead time + revisão)" if rev > 0 else "lead time"
     mem = {
         "escopo": escopo,
         "minimo": int(_sug_float(minimo)),
@@ -2071,41 +2127,44 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
         "curva": curva,
         "classe": classe,
         "metodo": metodo or "Normal (Z·σ·√LT)",
-        "formula": ("Mínimo (ponto de pedido) = demanda × lead time + estoque de segurança.  "
+        "formula": (f"Mínimo (ponto de pedido) = demanda × {protecao_txt} + estoque de segurança.  "
                     "Máximo = Mínimo + demanda × dias de ciclo."),
         "componentes": comp,
     }
 
     # ----- Derivação do MÉTODO DE DEMANDA (passo a passo, com números reais) -----
-    lt = _sug_float(lead_time)
+    lt = t_prot  # proteção efetiva do mínimo (lead time + revisão)
     dem = _sug_float(demanda_dia)
     ss_v = _sug_float(ss)
     mmin = int(_sug_float(minimo))
     mmax = int(_sug_float(maximo))
     met = metodo or "Normal (Z·σ·√LT)"
     intermit = any(k in met for k in ("Croston", "Poisson", "Binomial"))
+    prot_lbl = "lead time + revisão" if rev > 0 else "lead time"
     passos = []
     if intermit:
         ns = _NS_POR_CURVA.get(_sug_norm(curva).upper(), 0.90)
-        dem_c = dem * (1 - _ALPHA_CROSTON / 2.0)
-        lam = dem_c * lt
+        lam = dem * lt
         dist = "Binomial Negativa" if "Binomial" in met else "Poisson"
         passos = [
-            f"Demanda intermitente/grumosa → Croston + {dist} composta (não usa a Normal).",
-            f"Demanda corrigida (Croston, 1−α/2) = {round(dem, 4)} × {round(1 - _ALPHA_CROSTON / 2.0, 3)} = {round(dem_c, 4)} un/dia.",
-            f"λ (esperado no lead time) = demanda corrigida × lead time = {round(dem_c, 4)} × {int(lt)} = {round(lam, 2)} un.",
-            f"Ponto de pedido (mín) = quantil {int(ns * 100)}% da {dist} da demanda no lead time = {mmin} un.",
+            f"Demanda intermitente/grumosa → {dist} composta (não usa a Normal).",
+            f"λ (esperado no período de proteção) = demanda × {prot_lbl} = {round(dem, 4)} × {int(lt)} = {round(lam, 2)} un.",
+            f"Ponto de pedido (mín) = quantil {int(ns * 100)}% da {dist} da demanda no período = {mmin} un.",
             f"Estoque de segurança = ponto de pedido − λ = {mmin} − {round(lam, 2)} = {int(ss_v)} un.",
-            f"Máximo = quantil {int(ns * 100)}% no horizonte (lead time + dias de ciclo) = {mmax} un.",
+            f"Máximo = quantil {int(ns * 100)}% no horizonte ({prot_lbl} + dias de ciclo) = {mmax} un.",
         ]
     else:
         z_v = _sug_float(z)
         sig = _sug_float(sigma_dia)
+        # σ sazonalizado: o worker aplica σ × fator sazonal no SS (o σ acompanha a estação)
+        sig_eff = sig * fs if (sig > 0 and fs and abs(fs - 1.0) >= 0.01) else sig
         if sig > 0 and z_v > 0:
-            passos.append(f"Estoque de segurança = Z × σ × √(lead time) = {round(z_v, 3)} × {round(sig, 4)} × √{int(lt)} = {int(ss_v)} un.")
+            sig_txt = (f"(σ {round(sig, 4)} × sazonal {round(fs, 3)}) = {round(sig_eff, 4)}"
+                       if sig_eff != sig else f"{round(sig, 4)}")
+            passos.append(f"Estoque de segurança = Z × σ × √({prot_lbl}) = {round(z_v, 3)} × {sig_txt} × √{int(lt)} = {int(ss_v)} un.")
         else:
-            passos.append(f"Estoque de segurança (Z·σ·√lead time) = {int(ss_v)} un.")
-        passos.append(f"Ponto de pedido (mín) = demanda × lead time + SS = {round(dem, 4)} × {int(lt)} + {int(ss_v)} = {mmin} un.")
+            passos.append(f"Estoque de segurança (Z·σ·√{prot_lbl}) = {int(ss_v)} un.")
+        passos.append(f"Ponto de pedido (mín) = demanda × {prot_lbl} + SS = {round(dem, 4)} × {int(lt)} + {int(ss_v)} = {mmin} un.")
         passos.append(f"Máximo = mín + demanda × dias de ciclo = {mmin} + {round(dem, 4)} × {ciclo} = {mmax} un.")
     mem["metodo_calculo"] = {"tipo": met, "passos": passos}
 
@@ -2113,7 +2172,7 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
     import math as _math
     if intermit:
         ns = _NS_POR_CURVA.get(_sug_norm(curva).upper(), 0.90)
-        lam = _sug_float(demanda_dia) * (1 - _ALPHA_CROSTON / 2.0) * lt
+        lam = _sug_float(demanda_dia) * lt  # média direta (sem a antiga correção 1−α/2)
         kmax = max(mmin + 5, 8)
 
         def _cdf_arr(mean, var):
@@ -2202,7 +2261,8 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
 
 def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo=True,
                            usar_estoque_realtime=True, fornecedor=None, curva=None,
-                           subgrupo=None, apenas_zerados=False, incluir_sem_historico=False):
+                           subgrupo=None, apenas_zerados=False, incluir_sem_historico=False,
+                           params_forn=None):
     """
     Transforma as linhas de com_fifo_completo (1 por produto/marca) na sugestão de
     compra agrupada por fornecedor. FUNÇÃO PURA — usada pelo endpoint e pela validação.
@@ -2225,6 +2285,7 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
 
     usar_rt = usar_estoque_realtime and bool(stock_map)
     historico = historico or {}
+    params_forn = params_forn or {}
     curvas_filtro = [c.strip().upper() for c in curva.split(",")] if curva else None
     subs_filtro = [s.strip().lower() for s in subgrupo.split(",")] if subgrupo else None
     ordem_curva = {"A": 0, "B": 1, "C": 2, "D": 3}
@@ -2294,7 +2355,10 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             msize=it.get("mean_size_mes"), cv2=it.get("cv2_tamanho"),
             outlier_aparado=it.get("teve_outlier_aparado"),
             outlier_qtd=it.get("outlier_qtd_aparada"), outlier_motivo=it.get("outlier_motivo"),
+            periodo_revisao=it.get("periodo_revisao_dias"),
+            fornecedor_lt=it.get("fornecedor_principal"),
         )
+        custo_u = _sug_float(it.get("custo_unitario"))
         _registrar(bucket, {
             "tipo": "individual",
             "memoria": memoria_item,
@@ -2308,6 +2372,7 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             "padrao_demanda": it.get("padrao_demanda"),
             "metodo_reposicao": it.get("metodo_reposicao"),
             "qtd_itens_grupo": 1,
+            "marca_linha": (int(it.get("marca_linha")) if it.get("marca_linha") is not None else None),
             "marcas": [it.get("mar_descricao")] if it.get("mar_descricao") else [],
             "fornecedores": all_forns or [SEM_HIST_COMPRA],
             "estoque_atual": round(estoque, 2),
@@ -2316,6 +2381,8 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             "ponto_pedido": int(ponto),
             "maximo": int(maximo),
             "qtd_sugerida": qtd,
+            "custo_unitario": round(custo_u, 4) if custo_u > 0 else None,
+            "valor_estimado": round(qtd * custo_u, 2) if custo_u > 0 else None,
             "criticidade": "Zerado" if estoque <= 0 else "Abaixo do mínimo",
             "deficit": round(ponto - posicao, 2),
             "membros": [],
@@ -2371,6 +2438,7 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                     "demanda_media_dia_ajustada": _sug_float(m.get("demanda_media_dia_ajustada")),
                     # composição do cálculo (memória)
                     "demanda_real_dia": _sug_float(m.get("demanda_real_dia")),
+                    "custo_unitario": _sug_float(m.get("custo_unitario")),
                     "min_ind": int(_sug_float(m.get("ponto_pedido"))),
                     "max_ind": int(_sug_float(m.get("maximo"))),
                 })
@@ -2419,18 +2487,29 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 continue  # grupo sem histórico de compra -> fora da lista
 
             sgr = gsgr
+            # custo unitário do grupo = média ponderada pela demanda das marcas
+            _c_num = sum(d["custo_unitario"] * max(d["demanda_media_dia_ajustada"], 0.0)
+                         for d in membros_det if d["custo_unitario"] > 0)
+            _c_den = sum(max(d["demanda_media_dia_ajustada"], 0.0)
+                         for d in membros_det if d["custo_unitario"] > 0)
+            _custos_pos = [d["custo_unitario"] for d in membros_det if d["custo_unitario"] > 0]
+            custo_grp = (_c_num / _c_den) if _c_den > 0 else (
+                sum(_custos_pos) / len(_custos_pos) if _custos_pos else 0.0)
             memoria_grp = montar_memoria_calculo(
                 escopo="grupo", minimo=ponto, maximo=maximo,
                 curva=curva_item, classe=classe_grp, metodo=metodo,
                 demanda_dia=next((m.get("grupo_demanda_dia") for m in mem if m.get("grupo_demanda_dia") is not None), None),
                 sigma_dia=None,
                 z=_Z_POR_CURVA.get(_sug_norm(curva_item).upper()),
-                lead_time=next((m.get("lead_time_dias") for m in mem if m.get("lead_time_dias")), 17),
+                lead_time=(next((m.get("grupo_lead_time_dias") for m in mem if m.get("grupo_lead_time_dias")), None)
+                           or next((m.get("lead_time_dias") for m in mem if m.get("lead_time_dias")), 17)),
                 ss=next((m.get("grupo_estoque_seguranca") for m in mem if m.get("grupo_estoque_seguranca") is not None), None),
                 fator_sazonal=next((m.get("grupo_fator_sazonal") for m in mem if m.get("grupo_fator_sazonal") is not None), None),
                 sgr_codigo=next((m.get("sgr_codigo") for m in mem if m.get("sgr_codigo") is not None), None),
                 msize=next((m.get("grupo_mean_size") for m in mem if m.get("grupo_mean_size") is not None), None),
                 cv2=next((m.get("grupo_cv2") for m in mem if m.get("grupo_cv2") is not None), None),
+                periodo_revisao=next((m.get("periodo_revisao_dias") for m in mem if m.get("periodo_revisao_dias")), None),
+                fornecedor_lt=primario if primario != SEM_HIST_COMPRA else None,
                 membros=[{"marca": d["marca"], "pro_codigo": d["pro_codigo"],
                           "demanda_dia": round(d["demanda_real_dia"], 4),
                           "min_ind": d["min_ind"], "max_ind": d["max_ind"]}
@@ -2449,6 +2528,8 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 "padrao_demanda": padrao,
                 "metodo_reposicao": metodo,
                 "qtd_itens_grupo": len(mem),
+                "marca_linha": next((int(m.get("marca_linha")) for m in mem
+                                     if m.get("marca_linha") is not None), None),
                 "marcas": marcas_ord,
                 "fornecedores": forns_ord,
                 "estoque_atual": round(estoque_total, 2),
@@ -2457,6 +2538,8 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 "ponto_pedido": int(ponto),
                 "maximo": int(maximo),
                 "qtd_sugerida": qtd,
+                "custo_unitario": round(custo_grp, 4) if custo_grp > 0 else None,
+                "valor_estimado": round(qtd * custo_grp, 2) if custo_grp > 0 else None,
                 "criticidade": "Zerado" if estoque_total <= 0 else "Abaixo do mínimo",
                 "deficit": round(ponto - posicao, 2),
                 "membros": membros_det,
@@ -2468,10 +2551,21 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
     fornecedores = []
     for f, its in grupos.items():
         its.sort(key=lambda x: (ordem_curva.get(x["curva_abc"], 9), -x["deficit"]))
+        valor_total = round(sum(x["valor_estimado"] or 0.0 for x in its), 2)
+        itens_sem_custo = sum(1 for x in its if not x.get("valor_estimado"))
+        pf = params_forn.get(_sug_norm(f).upper()) or {}
+        ped_min = pf.get("pedido_minimo_valor")
         fornecedores.append({
             "fornecedor": f,
             "qtd_itens": len(its),
             "qtd_total_sugerida": sum(x["qtd_sugerida"] for x in its),
+            "valor_total_estimado": valor_total,
+            "itens_sem_custo": itens_sem_custo,
+            "lead_time_dias": pf.get("lead_time_dias"),
+            "tempo_revisao_dias": pf.get("tempo_revisao_dias"),
+            "pedido_minimo_valor": ped_min,
+            # só alerta quando há custo para comparar (valor_total > 0)
+            "abaixo_pedido_minimo": bool(ped_min and valor_total > 0 and valor_total < ped_min),
             "itens": its,
         })
     fornecedores.sort(key=lambda x: -x["qtd_itens"])
@@ -2480,6 +2574,7 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
         "modo": "grupo" if consolidar_grupo else "individual",
         "total_itens": sum(g["qtd_itens"] for g in fornecedores),
         "total_fornecedores": len(fornecedores),
+        "valor_total_geral": round(sum(g["valor_total_estimado"] for g in fornecedores), 2),
         "estoque_realtime": usar_rt,
         "fornecedores": fornecedores,
     }
@@ -2507,13 +2602,15 @@ def _carregar_itens_sugestao(conn):
                    {opt('sigma_demanda_dia')}, {opt('nivel_servico_z')}, {opt('lead_time_dias')},
                    {opt('estoque_seguranca')}, {opt('fator_sazonal')},
                    {opt('mean_size_mes')}, {opt('cv2_tamanho')},
+                   {opt('custo_unitario')}, {opt('periodo_revisao_dias')}, {opt('fornecedor_principal')},
+                   {opt('marca_linha')},
                    {opt('sob_encomenda')}, {opt('eh_original')},
                    {opt('teve_outlier_aparado')}, {opt('outlier_qtd_aparada')}, {opt('outlier_motivo')},
                    {opt('grupo_chave')},
                    {opt('grupo_estoque_min')}, {opt('grupo_estoque_max')},
                    {opt('grupo_curva')}, {opt('grupo_padrao')}, {opt('grupo_metodo')},
                    {opt('grupo_demanda_dia')}, {opt('grupo_estoque_seguranca')}, {opt('grupo_fator_sazonal')},
-                   {opt('grupo_mean_size')}, {opt('grupo_cv2')}
+                   {opt('grupo_mean_size')}, {opt('grupo_cv2')}, {opt('grupo_lead_time_dias')}
             FROM com_fifo_completo
             WHERE data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)
         ),
@@ -2673,6 +2770,7 @@ def sugestao_compra(
         subgrupo=subgrupo,
         apenas_zerados=apenas_zerados,
         incluir_sem_historico=incluir_sem_historico,
+        params_forn=get_fornecedor_parametros(),
     )
 
 

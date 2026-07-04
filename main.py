@@ -54,10 +54,18 @@ TABELA_FIFO = "com_fifo_completo"
 # média desde 2005). ABC também passa a ser calculada sobre esta janela.
 JANELA_DEMANDA_MESES = int(os.getenv("JANELA_DEMANDA_MESES") or 12)
 
-# Lead time (prazo de reposição) em dias. Não há prazo por fornecedor no ERP,
-# então usamos um valor global configurável (a regra do subgrupo 154 segue
-# valendo no ciclo, em regras_dias).
+# Lead time (prazo de reposição) em dias. O ERP não tem prazo por fornecedor;
+# o prazo REAL vem do cadastro de parâmetros do fornecedor (tabela
+# com_fornecedor_parametros, preenchida na tela /compras/fornecedores) casado
+# pelo fornecedor primário do histórico de compra. Este valor é o FALLBACK
+# quando o fornecedor não tem lead time cadastrado.
 LEAD_TIME_DIAS = int(os.getenv("LEAD_TIME_DIAS") or 17)
+
+# Período de revisão (dias entre olhadas do comprador naquele fornecedor).
+# O mínimo protege LT + R (revisão periódica): se o compras só revisa o
+# fornecedor a cada R dias, a ruptura pode acontecer entre revisões.
+# Vem do cadastro do fornecedor (tempo_revisao_dias); este é o fallback.
+PERIODO_REVISAO_PADRAO = float(os.getenv("PERIODO_REVISAO_PADRAO") or 0.0)
 
 # Z (fator de nível de serviço) por curva — A=98%, B=95%, C=90%, D=85%.
 # Estoque de segurança = Z * sigma_demanda_dia * sqrt(lead_time)  (Silver-Pyke).
@@ -154,6 +162,10 @@ NS_POR_CURVA = {
 # Fontes: Silver-Pyke-Peterson; razão crítica de Arrow-Harris-Marschak (newsvendor).
 HOLDING_RATE_ANUAL = float(os.getenv("HOLDING_RATE_ANUAL") or 0.25)   # custo de manter (20-30%/ano típico)
 NS_MODO = (os.getenv("NS_MODO") or "custo").strip().lower()           # 'custo' (oficial) | 'sombra' (legado)
+# Sanidade da margem: margem unitária acima de N× o custo indica cadastro errado
+# (preco_custo subestimado). Nesses casos o nível econômico é descartado e o item
+# cai no nível da curva (em vez de saturar o p* no teto silenciosamente).
+NS_MARGEM_MAX_MULT = float(os.getenv("NS_MARGEM_MAX_MULT") or 10.0)
 # Faixa (piso, teto) do nível de serviço por curva: o custo escolhe o ponto, a ABC dá os limites.
 NS_FAIXA_CURVA = {
     "A": (float(os.getenv("NS_PISO_A") or 0.90), float(os.getenv("NS_TETO_A") or 0.99)),
@@ -162,7 +174,11 @@ NS_FAIXA_CURVA = {
     "D": (float(os.getenv("NS_PISO_D") or 0.75), float(os.getenv("NS_TETO_D") or 0.94)),
 }
 
-# Croston/SBA: constante de suavização (a correção de viés usa 1 - alpha/2).
+# Croston/SBA: constante de suavização. NOTA: a antiga "correção de viés"
+# (multiplicar a demanda por 1 − α/2) foi REMOVIDA do cálculo — ela corrige o
+# viés do estimador de Croston (razão de suavizações exponenciais), mas aqui a
+# taxa vem de uma média empírica simples, que não tem esse viés; aplicá-la só
+# deflacionava a demanda dos intermitentes em ~5% sem base teórica.
 ALPHA_CROSTON = float(os.getenv("ALPHA_CROSTON") or 0.1)
 
 # Limiares Syntetos-Boylan-Croston (classificação do padrão de demanda):
@@ -178,6 +194,10 @@ SAZ_VOL_MIN = float(os.getenv("SAZ_VOL_MIN") or 300)             # volume anual 
 SAZ_CONSIST_MIN = float(os.getenv("SAZ_CONSIST_MIN") or 0.6)     # consistência do trimestre de pico
 SAZ_FATOR_MIN = float(os.getenv("SAZ_FATOR_MIN") or 0.5)         # trava do fator sazonal
 SAZ_FATOR_MAX = float(os.getenv("SAZ_FATOR_MAX") or 2.0)
+# Trava EXTRA do fator sazonal para itens de cauda longa (curva C/D ou padrão
+# Intermitente/Grumoso): o objetivo é não capitalizar estoque de item lento por
+# causa de onda sazonal do subgrupo — o item lento participa pouco da onda.
+SAZ_FATOR_MAX_LENTO = float(os.getenv("SAZ_FATOR_MAX_LENTO") or 1.5)
 
 # ==========================================
 # CONEXÃO ODBC / CARGA DE DADOS
@@ -478,6 +498,23 @@ def criar_tabela_postgres():
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='demanda_planejamento_dia') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN demanda_planejamento_dia DECIMAL(15,6);
         END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='fator_sazonal_ciclo') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN fator_sazonal_ciclo DECIMAL(8,4);
+        END IF;
+
+        -- ===== Lead time / revisão por fornecedor (com_fornecedor_parametros) =====
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='fornecedor_principal') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN fornecedor_principal VARCHAR(200);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='periodo_revisao_dias') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN periodo_revisao_dias DECIMAL(6,2);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='grupo_lead_time_dias') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN grupo_lead_time_dias DECIMAL(6,2);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='marca_linha') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN marca_linha SMALLINT;
+        END IF;
 
         -- ===== Originais (encomenda) + cálculo consolidado por grupo (descrição) =====
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='sob_encomenda') THEN
@@ -564,6 +601,98 @@ def criar_tabela_postgres():
     except Exception as e:
         print(f"Erro ao criar tabela PostgreSQL: {e}")
         raise
+
+
+def carregar_parametros_fornecedor():
+    """
+    Parâmetros de compra por fornecedor (tela /compras/fornecedores →
+    tabela com_fornecedor_parametros no PostgreSQL). Casamento por NOME
+    normalizado (o histórico produto×fornecedor do Mongo usa for_nome).
+    Retorna {FOR_NOME_UPPER: {lead_time_dias, tempo_revisao_dias, pedido_minimo_valor}}.
+    """
+    try:
+        eng = get_postgres_engine()
+        df = pd.read_sql(
+            "SELECT for_nome, lead_time_dias, tempo_revisao_dias, pedido_minimo_valor "
+            "FROM com_fornecedor_parametros", eng)
+    except Exception as e:
+        print(f"  - AVISO: com_fornecedor_parametros indisponível ({e}); usando fallback global.")
+        return {}
+    out = {}
+    for _, r in df.iterrows():
+        nome = str(r.get("for_nome") or "").strip().upper()
+        if not nome:
+            continue
+        def _num(v):
+            try:
+                f = float(v)
+                return f if f == f and f > 0 else None
+            except (TypeError, ValueError):
+                return None
+        out[nome] = {
+            "lead_time_dias": _num(r.get("lead_time_dias")),
+            "tempo_revisao_dias": _num(r.get("tempo_revisao_dias")),
+            "pedido_minimo_valor": _num(r.get("pedido_minimo_valor")),
+        }
+    if out:
+        n_lt = sum(1 for v in out.values() if v["lead_time_dias"])
+        print(f"  - Parâmetros de fornecedor: {len(out)} cadastrados ({n_lt} com lead time).")
+    return out
+
+
+def carregar_mapa_compras_fornecedor():
+    """Histórico produto -> [(for_nome, qtd_comprada), ...] (Mongo compras_fornecedor),
+    ordenado por quantidade desc. Vazio se o Mongo estiver indisponível."""
+    try:
+        import empacotamento as emp
+        return emp.carregar_compras_fornecedor() or {}
+    except Exception as e:
+        print(f"  - AVISO: histórico produto×fornecedor indisponível ({e}).")
+        return {}
+
+
+def carregar_marca_linha():
+    """
+    LINHA da marca (1ª/2ª/3ª) — tabela com_marca_linha (curadoria do compras).
+    Separa o pooling do grupo: Bosch (1ª) não consolida com marca econômica (3ª),
+    para o excesso do barato não suprimir a compra do premium.
+    Retorna {MARCA_UPPER: 1|2|3}. Marca ausente = linha 2 (comportamento padrão).
+    """
+    try:
+        eng = get_postgres_engine()
+        df = pd.read_sql("SELECT mar_descricao, linha FROM com_marca_linha", eng)
+    except Exception as e:
+        print(f"  - AVISO: com_marca_linha indisponível ({e}); grupos sem separação por linha.")
+        return {}
+    out = {}
+    for _, r in df.iterrows():
+        nome = str(r.get("mar_descricao") or "").strip().upper()
+        try:
+            linha = int(r.get("linha"))
+        except (TypeError, ValueError):
+            continue
+        if nome and linha in (1, 2, 3):
+            out[nome] = linha
+    if out:
+        print(f"  - Linhas de marca: {len(out)} marcas classificadas "
+              f"(1ª: {sum(1 for v in out.values() if v == 1)}, "
+              f"3ª: {sum(1 for v in out.values() if v == 3)}).")
+    return out
+
+
+def grupo_chave_com_linha(descricao, marca, mapa_linha):
+    """
+    Chave do grupo de substitutos = descrição + LINHA da marca.
+    Linha 2 (padrão/não classificada) usa a descrição pura — retrocompatível;
+    1ª e 3ª linhas ganham sufixo legível (aparece como nome do grupo nas telas).
+    """
+    desc = str(descricao or "").strip()
+    if not desc:
+        return None
+    linha = mapa_linha.get(str(marca or "").strip().upper(), 2) if mapa_linha else 2
+    if linha == 2:
+        return desc
+    return f"{desc} • {linha}ª LINHA"
 
 
 def carregar_dados_do_banco(corte=None):
@@ -962,6 +1091,11 @@ def _nivel_servico_custo(curva, margem_unit, custo_unit, dias_ciclo):
         return None, None
     if pd.isna(m) or pd.isna(c) or not (m > 0 and c > 0) or dc <= 0:
         return None, None
+    # Sanidade: margem > N× o custo indica preco_custo errado no ERP (ex.: custo
+    # de centavos num item de dezenas de reais). Descarta o nível econômico para
+    # não saturar o p* no teto por dado ruim — cai no nível da curva.
+    if m > c * NS_MARGEM_MAX_MULT:
+        return None, None
     co = c * HOLDING_RATE_ANUAL * (dc / 365.0)
     if co <= 0:
         return None, None
@@ -1284,29 +1418,67 @@ def _classificar_padrao(dem, adi, cv2):
     return "Grumoso"
 
 def calcular_min_max(curva, dem, sigma_dia, padrao, sgr, data_max, cv2, msize, hoje,
-                     margem_unit=None, custo_unit=None):
+                     margem_unit=None, custo_unit=None, saz=None,
+                     lead_time=None, revisao_dias=None):
     """
     Min/Máx (s,S) escolhendo o método pelo padrão de demanda:
-      - Suave/Errático -> Normal: SS=Z·σ·√LT (teto N ciclos); min=d·LT+SS; max=min+d·ciclo
+      - Suave/Errático -> Normal: SS=Z·σ·√T (teto N ciclos); min=d·T+SS; max=min+d·ciclo
       - Intermitente/Grumoso -> Poisson composta: quantil da distribuição discreta
-    `dem` já deve vir sazonalizada.
+
+    `dem` deve vir SEM sazonalidade (demanda média diária da janela). A sazonalidade
+    é aplicada AQUI, com um fator por janela (`saz` = índices do subgrupo):
+      - fator de PROTEÇÃO: meses cobertos por [hoje, hoje+T] (T = lead time + revisão)
+        -> multiplica a demanda e o σ do mínimo (o σ acompanha a estação);
+      - fator de CICLO: meses cobertos por [hoje, hoje+T+ciclo]
+        -> multiplica a demanda do estoque de ciclo (máximo).
+      Janela mais longa dilui o fator (média de mais meses) — item de ciclo longo
+      não é inflado pelo pico curto. Itens de cauda longa (curva C/D ou padrão
+      Intermitente/Grumoso) têm trava extra SAZ_FATOR_MAX_LENTO para não
+      capitalizar estoque lento por onda do subgrupo.
+
+    `lead_time`/`revisao_dias`: prazo e período de revisão do FORNECEDOR primário
+    do item (cadastro com_fornecedor_parametros); fallback LEAD_TIME_DIAS /
+    PERIODO_REVISAO_PADRAO. O mínimo protege T = lead_time + revisão.
 
     Nível de serviço OFICIAL (ver NS_MODO): quando há margem/custo confiáveis, o mín/máx
     usa o alvo ECONÔMICO (razão crítica / newsvendor, dentro da faixa da curva ABC); sem
     margem/custo, cai no nível da curva. As colunas *_CUSTO registram o alvo econômico
     para auditoria. Com NS_MODO='sombra' (legado) o oficial volta a ser o da curva.
     """
+    # Normaliza o subgrupo (pode chegar float/str do banco) — mesma regra da api.
+    try:
+        sgr = int(sgr)
+    except (TypeError, ValueError):
+        sgr = None
     regra = REGRAS_DIAS.get(sgr, REGRAS_DIAS["default"])
     try: sigma_dia = float(sigma_dia) if not pd.isna(sigma_dia) else 0.0
     except (TypeError, ValueError): sigma_dia = 0.0
     try: dem = float(dem) if not pd.isna(dem) else 0.0
     except (TypeError, ValueError): dem = 0.0
+    try: lt = float(lead_time) if lead_time and float(lead_time) > 0 else float(LEAD_TIME_DIAS)
+    except (TypeError, ValueError): lt = float(LEAD_TIME_DIAS)
+    try: rev = max(float(revisao_dias), 0.0) if revisao_dias is not None and not pd.isna(revisao_dias) else PERIODO_REVISAO_PADRAO
+    except (TypeError, ValueError): rev = PERIODO_REVISAO_PADRAO
+    t_prot = lt + rev  # período de proteção do mínimo (lead time + revisão)
     vazio = {"ESTOQUE_MIN_BASE": 0, "ESTOQUE_MAX_BASE": 0, "ESTOQUE_SEGURANCA": 0, "NIVEL_SERVICO_Z": 0.0,
              "NIVEL_SERVICO_CUSTO": None, "Z_CUSTO": None,
-             "ESTOQUE_MIN_CUSTO": 0, "ESTOQUE_MAX_CUSTO": 0, "ESTOQUE_SEG_CUSTO": 0}
+             "ESTOQUE_MIN_CUSTO": 0, "ESTOQUE_MAX_CUSTO": 0, "ESTOQUE_SEG_CUSTO": 0,
+             "FATOR_SAZONAL_MIN": 1.0, "FATOR_SAZONAL_CICLO": 1.0,
+             "LEAD_TIME_APLICADO": lt, "PERIODO_REVISAO_APLICADO": rev}
     if dem <= 0 or curva not in regra:
         return vazio
     dmin, dmax = regra[curva]; dias_ciclo = max(dmax - dmin, 1)
+
+    # ---- Fatores sazonais por janela (forward) ----
+    f_prot = _fator_sazonal_forward(saz, hoje, t_prot)
+    f_cic = _fator_sazonal_forward(saz, hoje, t_prot + dias_ciclo)
+    cauda_longa = (curva in ("C", "D")) or (padrao in ("Intermitente", "Grumoso"))
+    if cauda_longa and SAZ_FATOR_MAX_LENTO and SAZ_FATOR_MAX_LENTO > 0:
+        f_prot = min(f_prot, SAZ_FATOR_MAX_LENTO)
+        f_cic = min(f_cic, SAZ_FATOR_MAX_LENTO)
+    dem_prot = dem * f_prot     # demanda/dia esperada no período de proteção
+    dem_cic = dem * f_cic       # demanda/dia esperada no horizonte do ciclo
+
     try: cv2f = float(cv2 or 0.0); msizef = float(msize or 0.0)
     except (TypeError, ValueError): cv2f, msizef = 0.0, 0.0
     disp = max(msizef * (1.0 + cv2f), 1.0)
@@ -1314,20 +1486,30 @@ def calcular_min_max(curva, dem, sigma_dia, padrao, sgr, data_max, cv2, msize, h
     velho = (not pd.isna(data_max)) and ((hoje - data_max).days > dias_corte)
 
     def _core(z, p):
+        cap_ss = dem_cic * dias_ciclo * SS_CAP_CICLOS if (SS_CAP_CICLOS and SS_CAP_CICLOS > 0) else None
         if padrao in ("Intermitente", "Grumoso"):
-            dem_c = dem * (1 - ALPHA_CROSTON / 2.0)
-            media_lt = dem_c * LEAD_TIME_DIAS; media_ltc = dem_c * (LEAD_TIME_DIAS + dias_ciclo)
+            # Taxa = média empírica direta (sem a antiga "correção" 1−α/2 de
+            # Croston, que não se aplica a média simples — só deflacionava 5%).
+            media_lt = dem_prot * t_prot
+            media_ltc = media_lt + dem_cic * dias_ciclo
             rop = _quantil_demanda(media_lt, media_lt * disp, p, z)
             S = _quantil_demanda(media_ltc, media_ltc * disp, p, z)
+            if cap_ss is not None:
+                # Teto do SS também no ramo discreto: quantil de distribuição
+                # muito sobredispersa pode pedir proteção acima de 1 ciclo.
+                rop = min(rop, int(math.ceil(media_lt + cap_ss)))
+                S = min(S, int(math.ceil(media_ltc + cap_ss)))
             emin = int(rop); emax = int(max(S, rop + 1)); ess = int(max(rop - media_lt, 0))
         else:
-            ss = z * sigma_dia * np.sqrt(LEAD_TIME_DIAS)
-            if SS_CAP_CICLOS and SS_CAP_CICLOS > 0:
-                ss = min(ss, dem * dias_ciclo * SS_CAP_CICLOS)
-            rop = dem * LEAD_TIME_DIAS + ss
-            emin = int(np.ceil(rop)); emax = int(np.ceil(rop + dem * dias_ciclo)); ess = int(np.ceil(ss))
+            # σ acompanha a estação (2.3): no pico a variabilidade cresce junto
+            # com a média; fora dele o SS encolhe (menos capital parado).
+            ss = z * (sigma_dia * f_prot) * np.sqrt(t_prot)
+            if cap_ss is not None:
+                ss = min(ss, cap_ss)
+            rop = dem_prot * t_prot + ss
+            emin = int(np.ceil(rop)); emax = int(np.ceil(rop + dem_cic * dias_ciclo)); ess = int(np.ceil(ss))
         if velho:
-            emin = 0; emax = max(1, int(np.ceil(dem * 15))); ess = 0
+            emin = 0; emax = max(1, int(np.ceil(dem_prot * 15))); ess = 0
         return emin, emax, ess
 
     # Nível ECONÔMICO (razão crítica). Sem margem/custo → (None, None).
@@ -1341,7 +1523,10 @@ def calcular_min_max(curva, dem, sigma_dia, padrao, sgr, data_max, cv2, msize, h
         z_of = Z_POR_CURVA.get(curva, Z_POR_CURVA["C"]); p_of = NS_POR_CURVA.get(curva, 0.90)
     emin, emax, ess = _core(z_of, p_of)
     out = {"ESTOQUE_MIN_BASE": emin, "ESTOQUE_MAX_BASE": emax,
-           "ESTOQUE_SEGURANCA": ess, "NIVEL_SERVICO_Z": round(float(z_of), 4)}
+           "ESTOQUE_SEGURANCA": ess, "NIVEL_SERVICO_Z": round(float(z_of), 4),
+           "FATOR_SAZONAL_MIN": round(float(f_prot), 4),
+           "FATOR_SAZONAL_CICLO": round(float(f_cic), 4),
+           "LEAD_TIME_APLICADO": lt, "PERIODO_REVISAO_APLICADO": rev}
 
     # Colunas *_CUSTO — alvo econômico (auditoria). Sem margem/custo → espelham o oficial.
     if p_c is not None:
@@ -1357,17 +1542,28 @@ METODO_LABEL = {"Suave": "Normal (Z·σ·√LT)", "Erratico": "Normal (Z·σ·�
                 "Intermitente": "Croston+Poisson", "Grumoso": "Croston+Binomial Neg",
                 "Sem_Giro": "—"}
 
-def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz):
+def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz,
+                              params_forn=None, mapa_compras=None, mapa_linha=None):
     """
-    Cálculo CONSOLIDADO por grupo de produto (= descrição), somando a demanda de
-    TODAS as marcas (substitutos), EXCLUINDO os produtos ORIGINAIS (encomenda).
-    Reaproveita o mesmo motor de demanda/variabilidade, re-chaveando por descrição.
+    Cálculo CONSOLIDADO por grupo de produto (= descrição + LINHA da marca),
+    somando a demanda das marcas SUBSTITUTAS DE VERDADE (mesma linha), EXCLUINDO
+    os produtos ORIGINAIS (encomenda). 1ª/3ª linha viram grupos separados
+    ("DESC • 1ª LINHA") — o excesso da linha econômica não suprime a compra da
+    premium. Reaproveita o mesmo motor de demanda/variabilidade, re-chaveando.
     Retorna DataFrame por GRUPO com min/máx/SS consolidados (efeito de pooling).
+    `params_forn`/`mapa_compras`: parâmetros por fornecedor e histórico
+    produto×fornecedor — o lead time/revisão do grupo vem do fornecedor de quem
+    o grupo MAIS comprou (somando as marcas).
     """
+    params_forn = params_forn or {}
+    mapa_compras = mapa_compras or {}
+    mapa_linha = mapa_linha or {}
     sp = df_saldo_produto.copy()
     sp["PRO_CODIGO"] = sp["PRO_CODIGO"].astype(str).str.strip()
     sp["IS_ORIG"] = sp["MAR_DESCRICAO"].apply(marca_eh_original) if "MAR_DESCRICAO" in sp.columns else False
-    sp["GRUPO"] = sp["PRO_DESCRICAO"].astype(str).str.strip()
+    _marcas_sp = sp["MAR_DESCRICAO"] if "MAR_DESCRICAO" in sp.columns else [None] * len(sp)
+    sp["GRUPO"] = [grupo_chave_com_linha(d, m, mapa_linha) or ""
+                   for d, m in zip(sp["PRO_DESCRICAO"], _marcas_sp)]
     nao = sp[(~sp["IS_ORIG"]) & (sp["GRUPO"] != "")].copy()
     if nao.empty:
         return pd.DataFrame()
@@ -1410,18 +1606,50 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     g["GRUPO_CURVA"] = g["_PCT"].apply(lambda p: "A" if p <= 70 else "B" if p <= 90 else "C" if p <= 97 else "D")
     g["GRUPO_PADRAO"] = g.apply(lambda r: _classificar_padrao(r["DEM_DIA_REAL"], r.get("ADI"), r.get("CV2_TAMANHO")), axis=1)
 
-    horiz = LEAD_TIME_DIAS + 60
-    def _fs(sgr):
-        try: k = int(sgr)
-        except (TypeError, ValueError): return 1.0
-        return _fator_sazonal_forward(indices_saz.get(k), hoje, horiz)
-    g["GRUPO_FATOR_SAZONAL"] = g["SGR_CODIGO"].apply(_fs)
-    g["GRUPO_DEMANDA_DIA"] = pd.to_numeric(g["DEM_DIA_REAL"], errors="coerce").fillna(0.0) * g["GRUPO_FATOR_SAZONAL"]
+    # Fornecedor primário do GRUPO = de quem o grupo (todas as marcas) mais
+    # comprou; fallback = fornecedor1 do primeiro membro. Dele saem LT/revisão.
+    grp_forn_qtd = {}
+    for pro, grpname in pro2grp.items():
+        for nome, qtd in (mapa_compras.get(str(pro).strip()) or []):
+            d = grp_forn_qtd.setdefault(grpname, {})
+            k = str(nome).strip().upper()
+            d[k] = d.get(k, 0.0) + float(qtd or 0.0)
+    grp_forn1 = (nao.groupby("GRUPO")["FORNECEDOR1"]
+                 .agg(lambda s: s.dropna().astype(str).str.strip().iloc[0]
+                      if s.dropna().size else None)
+                 if "FORNECEDOR1" in nao.columns else pd.Series(dtype=object))
 
-    res = g.apply(lambda r: calcular_min_max(r["GRUPO_CURVA"], r["GRUPO_DEMANDA_DIA"], r["SIGMA_DEMANDA_DIA"],
-                  r["GRUPO_PADRAO"], r["SGR_CODIGO"], r["DATA_MAX_VENDA"], r.get("CV2_TAMANHO"),
-                  r.get("MEAN_SIZE_MES"), hoje,
-                  margem_unit=r.get("MARGEM_UNIT"), custo_unit=r.get("CUSTO_UNIT")), axis=1)
+    def _forn_grupo(gname):
+        d = grp_forn_qtd.get(gname)
+        if d:
+            return max(d.items(), key=lambda kv: kv[1])[0]
+        f1 = grp_forn1.get(gname) if not grp_forn1.empty else None
+        return str(f1).strip().upper() if f1 else None
+
+    def _lt_rev_grupo(gname):
+        p = params_forn.get(_forn_grupo(gname) or "") or {}
+        return p.get("lead_time_dias"), p.get("tempo_revisao_dias")
+
+    def _saz_grp(sgr):
+        try:
+            return indices_saz.get(int(sgr))
+        except (TypeError, ValueError):
+            return None
+
+    def _mm_grupo(r):
+        lt_g, rev_g = _lt_rev_grupo(r["GRUPO"])
+        return calcular_min_max(r["GRUPO_CURVA"], pd.to_numeric(r["DEM_DIA_REAL"], errors="coerce"),
+                                r["SIGMA_DEMANDA_DIA"],
+                                r["GRUPO_PADRAO"], r["SGR_CODIGO"], r["DATA_MAX_VENDA"], r.get("CV2_TAMANHO"),
+                                r.get("MEAN_SIZE_MES"), hoje,
+                                margem_unit=r.get("MARGEM_UNIT"), custo_unit=r.get("CUSTO_UNIT"),
+                                saz=_saz_grp(r["SGR_CODIGO"]), lead_time=lt_g, revisao_dias=rev_g)
+
+    res = g.apply(_mm_grupo, axis=1)
+    g["GRUPO_FATOR_SAZONAL"] = [x["FATOR_SAZONAL_MIN"] for x in res]
+    g["GRUPO_DEMANDA_DIA"] = (pd.to_numeric(g["DEM_DIA_REAL"], errors="coerce").fillna(0.0)
+                              * pd.to_numeric(g["GRUPO_FATOR_SAZONAL"], errors="coerce").fillna(1.0))
+    g["GRUPO_LEAD_TIME_DIAS"] = [x["LEAD_TIME_APLICADO"] for x in res]
     g["GRUPO_ESTOQUE_MIN"] = [x["ESTOQUE_MIN_BASE"] for x in res]
     g["GRUPO_ESTOQUE_MAX"] = [x["ESTOQUE_MAX_BASE"] for x in res]
     g["GRUPO_ESTOQUE_SEGURANCA"] = [x["ESTOQUE_SEGURANCA"] for x in res]
@@ -1439,7 +1667,7 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     cols = ["GRUPO", "GRUPO_QTD_ITENS", "GRUPO_ESTOQUE_DISPONIVEL", "GRUPO_DEMANDA_DIA",
             "GRUPO_FATOR_SAZONAL", "GRUPO_CURVA", "GRUPO_PADRAO", "GRUPO_METODO",
             "GRUPO_ESTOQUE_MIN", "GRUPO_ESTOQUE_MAX", "GRUPO_ESTOQUE_SEGURANCA",
-            "GRUPO_MEAN_SIZE", "GRUPO_CV2",
+            "GRUPO_MEAN_SIZE", "GRUPO_CV2", "GRUPO_LEAD_TIME_DIAS",
             "GRUPO_NIVEL_SERVICO_CUSTO", "GRUPO_ESTOQUE_MIN_CUSTO", "GRUPO_ESTOQUE_MAX_CUSTO",
             "GRUPO_MARGEM_PCT"]
     return g[cols]
@@ -1668,19 +1896,15 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     n_saz_ok = sum(1 for v in indices_saz.values() if v.get("confiavel"))
     print(f"  - Subgrupos sazonais confiáveis: {n_saz_ok} de {len(indices_saz)}")
 
-    horizonte_saz = LEAD_TIME_DIAS + 60
-    def _fator_saz(sgr):
+    # Os índices sazonais vão DIRETO para calcular_min_max, que aplica um fator
+    # por janela: proteção (LT+revisão) no mínimo e LT+revisão+ciclo no máximo.
+    # FATOR_SAZONAL / DEMANDA_PLANEJAMENTO_DIA são preenchidos após o cálculo
+    # com os fatores efetivamente usados (auditoria/telas).
+    def _saz_sgr(sgr):
         try:
-            key = int(sgr)
+            return indices_saz.get(int(sgr))
         except (TypeError, ValueError):
-            return 1.0
-        return _fator_sazonal_forward(indices_saz.get(key), hoje, horizonte_saz)
-
-    df_met["FATOR_SAZONAL"] = df_met["SGR_CODIGO"].apply(_fator_saz)
-    df_met["DEMANDA_PLANEJAMENTO_DIA"] = (
-        pd.to_numeric(df_met["DEMANDA_MEDIA_DIA_AJUSTADA"], errors="coerce").fillna(0.0)
-        * df_met["FATOR_SAZONAL"]
-    )
+            return None
 
     def _padrao_demanda(row):
         dem = row.get("DEMANDA_MEDIA_DIA_AJUSTADA", 0) or 0
@@ -1708,10 +1932,43 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     }).fillna("Normal (Z·σ·√LT)")
 
     # ==========================================
+    # LEAD TIME / REVISÃO POR FORNECEDOR
+    #   Fornecedor primário do item = de quem MAIS compramos (histórico Mongo
+    #   compras_fornecedor); fallback = fornecedor1 do cadastro do produto.
+    #   Parâmetros (lead time, revisão) vêm de com_fornecedor_parametros
+    #   (tela /compras/fornecedores); sem cadastro → LEAD_TIME_DIAS global.
+    # ==========================================
+    params_forn = carregar_parametros_fornecedor()
+    mapa_compras = carregar_mapa_compras_fornecedor()
+
+    def _forn_do_item(row):
+        h = mapa_compras.get(str(row["PRO_CODIGO"]).strip())
+        if h:
+            return str(h[0][0]).strip().upper()
+        f1 = str(row.get("FORNECEDOR1") or "").strip()
+        return f1.upper() if f1 else None
+
+    df_met["FORNECEDOR_PRINCIPAL"] = df_met.apply(_forn_do_item, axis=1)
+
+    def _lt_do_forn(nome):
+        p = params_forn.get(nome) if nome else None
+        return (p or {}).get("lead_time_dias") or None
+
+    def _rev_do_forn(nome):
+        p = params_forn.get(nome) if nome else None
+        v = (p or {}).get("tempo_revisao_dias")
+        return v if v is not None else None
+
+    df_met["LEAD_TIME_DIAS"] = df_met["FORNECEDOR_PRINCIPAL"].map(_lt_do_forn)
+    df_met["PERIODO_REVISAO_DIAS"] = df_met["FORNECEDOR_PRINCIPAL"].map(_rev_do_forn)
+    n_lt_forn = int(df_met["LEAD_TIME_DIAS"].notna().sum())
+    print(f"  - Lead time por fornecedor aplicado em {n_lt_forn} produtos "
+          f"(fallback {LEAD_TIME_DIAS}d nos demais).")
+
+    # ==========================================
     # Min/Max base
-    #   A camada "ajustado" (multiplicador por fator de tendência) foi REMOVIDA:
-    #   a sazonalidade forward já está embutida em DEMANDA_PLANEJAMENTO_DIA, então
-    #   o SUGERIDO parte direto da BASE (sem dupla contagem).
+    #   A demanda entra CRUA (sem sazonalidade): calcular_min_max aplica o fator
+    #   sazonal por janela (proteção/ciclo) internamente — sem dupla contagem.
     # ==========================================
     LEAD_TIME = LEAD_TIME_DIAS
 
@@ -1719,14 +1976,27 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
 
     def calc_min_max_base(row):
         return pd.Series(calcular_min_max(
-            row["CURVA_ABC"], row.get("DEMANDA_PLANEJAMENTO_DIA", 0.0),
+            row["CURVA_ABC"], row.get("DEMANDA_MEDIA_DIA_AJUSTADA", 0.0),
             row.get("SIGMA_DEMANDA_DIA", 0.0), row.get("PADRAO_DEMANDA", "Suave"),
             row.get("SGR_CODIGO", None), row["DATA_MAX_VENDA"],
             row.get("CV2_TAMANHO", 0.0), row.get("MEAN_SIZE_MES", 0.0), hoje,
-            margem_unit=row.get("MARGEM_UNIT"), custo_unit=row.get("CUSTO_UNIT")))
+            margem_unit=row.get("MARGEM_UNIT"), custo_unit=row.get("CUSTO_UNIT"),
+            saz=_saz_sgr(row.get("SGR_CODIGO")),
+            lead_time=row.get("LEAD_TIME_DIAS"),
+            revisao_dias=row.get("PERIODO_REVISAO_DIAS")))
 
     base_minmax = df_met.apply(calc_min_max_base, axis=1)
     df_met = pd.concat([df_met, base_minmax], axis=1)
+
+    # Fator sazonal/lead time efetivamente aplicados (auditoria e telas)
+    df_met["FATOR_SAZONAL"] = pd.to_numeric(base_minmax["FATOR_SAZONAL_MIN"], errors="coerce").fillna(1.0)
+    df_met["FATOR_SAZONAL_CICLO"] = pd.to_numeric(base_minmax["FATOR_SAZONAL_CICLO"], errors="coerce").fillna(1.0)
+    df_met["DEMANDA_PLANEJAMENTO_DIA"] = (
+        pd.to_numeric(df_met["DEMANDA_MEDIA_DIA_AJUSTADA"], errors="coerce").fillna(0.0)
+        * df_met["FATOR_SAZONAL"]
+    )
+    df_met["LEAD_TIME_DIAS"] = pd.to_numeric(base_minmax["LEAD_TIME_APLICADO"], errors="coerce").fillna(float(LEAD_TIME_DIAS))
+    df_met["PERIODO_REVISAO_DIAS"] = pd.to_numeric(base_minmax["PERIODO_REVISAO_APLICADO"], errors="coerce").fillna(PERIODO_REVISAO_PADRAO)
 
     # ==========================================
     # Pouco histórico / Sob demanda / Normal -> SUGERIDO (= BASE)
@@ -1807,11 +2077,25 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
         df_met["SOB_ENCOMENDA"] = mask_orig
     # Originais NUNCA entram no grupo aftermarket (fornecedor = concessionária):
     # ficam AVULSOS (GRUPO_CHAVE None), planejados como item próprio.
-    df_met["GRUPO_CHAVE"] = np.where(
-        df_met["EH_ORIGINAL"],
-        None,
-        df_met["PRO_DESCRICAO"].astype(str).str.strip() if "PRO_DESCRICAO" in df_met.columns else None,
-    )
+    # O grupo separa por LINHA da marca (com_marca_linha): 1ª e 3ª linhas não
+    # consolidam com a 2ª — substitutos de verdade são só os da mesma linha.
+    mapa_linha = carregar_marca_linha()
+    if "PRO_DESCRICAO" in df_met.columns:
+        _marcas_gk = df_met["MAR_DESCRICAO"] if "MAR_DESCRICAO" in df_met.columns else None
+        df_met["MARCA_LINHA"] = (
+            _marcas_gk.astype(str).str.strip().str.upper().map(mapa_linha).fillna(2).astype(int)
+            if (_marcas_gk is not None and mapa_linha) else 2
+        )
+        df_met["GRUPO_CHAVE"] = [
+            None if orig else grupo_chave_com_linha(desc, marca, mapa_linha)
+            for orig, desc, marca in zip(
+                df_met["EH_ORIGINAL"],
+                df_met["PRO_DESCRICAO"],
+                (_marcas_gk if _marcas_gk is not None else [None] * len(df_met)))
+        ]
+    else:
+        df_met["MARCA_LINHA"] = 2
+        df_met["GRUPO_CHAVE"] = None
     # Zera só os NÃO planejados (Sob Encomenda de verdade); os planejados mantêm min/máx.
     mask_naoplan = df_met["SOB_ENCOMENDA"] == True  # noqa: E712
     for col in ["ESTOQUE_MIN_SUGERIDO", "ESTOQUE_MAX_SUGERIDO", "ESTOQUE_SEGURANCA",
@@ -1825,7 +2109,9 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
           f"sob encomenda: {int((mask_orig & mask_naoplan).sum())})")
 
     try:
-        df_grp = calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz)
+        df_grp = calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz,
+                                           params_forn=params_forn, mapa_compras=mapa_compras,
+                                           mapa_linha=mapa_linha)
         if df_grp is not None and not df_grp.empty:
             print(f"  - Grupos de produto (consolidados): {len(df_grp)}")
             df_met = df_met.merge(df_grp, left_on="GRUPO_CHAVE", right_on="GRUPO", how="left")
@@ -1900,8 +2186,21 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                              f"(margem x custo, na faixa da curva {curva})")
             else:
                 origem_ns = f"nível de serviço da curva {curva}"
+            try:
+                lt_item = float(row.get("LEAD_TIME_DIAS", LEAD_TIME) or LEAD_TIME)
+            except (TypeError, ValueError):
+                lt_item = float(LEAD_TIME)
+            try:
+                rev_item = float(row.get("PERIODO_REVISAO_DIAS", 0) or 0)
+            except (TypeError, ValueError):
+                rev_item = 0.0
+            prot_txt = (f"{lt_item:.0f}d de lead time + {rev_item:.0f}d de revisão"
+                        if rev_item > 0 else f"{lt_item:.0f}d de lead time")
+            forn_lt = row.get("FORNECEDOR_PRINCIPAL")
+            if forn_lt and str(forn_lt).strip():
+                prot_txt += f" (fornecedor {str(forn_lt).strip()})"
             partes.append(
-                f"Mínimo (ponto de pedido) = demanda x {LEAD_TIME}d de lead time + estoque de segurança "
+                f"Mínimo (ponto de pedido) = demanda x {prot_txt} + estoque de segurança "
                 f"({ss} un; classe {curva}/{xyz}, {origem_ns}, Z={z}); máximo cobre +{dias_ciclo}d de ciclo. "
                 f"Base {est_min_base}-{est_max_base} un."
             )
@@ -2434,7 +2733,12 @@ def salvar_metricas_postgres(df_metricas):
         'PADRAO_DEMANDA': 'padrao_demanda',
         'METODO_REPOSICAO': 'metodo_reposicao',
         'FATOR_SAZONAL': 'fator_sazonal',
+        'FATOR_SAZONAL_CICLO': 'fator_sazonal_ciclo',
         'DEMANDA_PLANEJAMENTO_DIA': 'demanda_planejamento_dia',
+        'FORNECEDOR_PRINCIPAL': 'fornecedor_principal',
+        'PERIODO_REVISAO_DIAS': 'periodo_revisao_dias',
+        'GRUPO_LEAD_TIME_DIAS': 'grupo_lead_time_dias',
+        'MARCA_LINHA': 'marca_linha',
         'SOB_ENCOMENDA': 'sob_encomenda',
         'EH_ORIGINAL': 'eh_original',
         'GRUPO_CHAVE': 'grupo_chave',
@@ -2484,11 +2788,13 @@ def salvar_metricas_postgres(df_metricas):
         'teve_outlier_aparado', 'outlier_qtd_aparada', 'outlier_motivo',
         'nivel_servico_custo', 'z_custo', 'estoque_min_custo', 'estoque_max_custo', 'estoque_seg_custo',
         'venda_perdida_12m', 'valor_vendido_12m',
-        'padrao_demanda', 'metodo_reposicao', 'fator_sazonal', 'demanda_planejamento_dia',
+        'padrao_demanda', 'metodo_reposicao', 'fator_sazonal', 'fator_sazonal_ciclo',
+        'demanda_planejamento_dia',
+        'fornecedor_principal', 'periodo_revisao_dias', 'marca_linha',
         'sob_encomenda', 'eh_original', 'grupo_chave', 'grupo_qtd_itens', 'grupo_estoque_disponivel',
         'grupo_demanda_dia', 'grupo_fator_sazonal', 'grupo_curva', 'grupo_padrao',
         'grupo_metodo', 'grupo_estoque_min', 'grupo_estoque_max', 'grupo_estoque_seguranca',
-        'grupo_mean_size', 'grupo_cv2',
+        'grupo_mean_size', 'grupo_cv2', 'grupo_lead_time_dias',
         'grupo_nivel_servico_custo', 'grupo_estoque_min_custo', 'grupo_estoque_max_custo', 'grupo_margem_pct',
         'dados_alteracao_json'
     ]

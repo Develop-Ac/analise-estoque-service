@@ -121,46 +121,68 @@ econômico é o **oficial** (`NS_MODO=custo`, padrão) e alimenta direto o
 Definido o `Z` (pelo custo ou pela curva), o mín/máx sai por um de três motores,
 escolhido pelo padrão de demanda:
 
+**Período de proteção T = lead time + revisão.** O lead time vem do **cadastro
+do fornecedor** (tela `/compras/fornecedores` → aba *Parâmetros de Compra*,
+tabela `com_fornecedor_parametros`), casado pelo **fornecedor primário** do item
+(de quem mais compramos, histórico Mongo; fallback `fornecedor1` do cadastro).
+Sem cadastro → `LEAD_TIME_DIAS` (17). O **tempo de revisão** do fornecedor
+(de quantos em quantos dias o compras o revisa) soma na proteção do mínimo.
+
 **Cálculo 1 — Normal (Silver-Pyke)** — itens Suave/Errático:
 
 ```
-SS  = Z × σ × √LT
-Mín = d × LT + SS
-Máx = Mín + d × C
+T   = LT + revisão                    (proteção do mínimo)
+SS  = Z × (σ × f_prot) × √T           (σ acompanha a estação)
+Mín = d × f_prot × T + SS
+Máx = Mín + d × f_cic × C
 ```
-`d`=demanda diária · `LT`=lead time · `σ`=desvio-padrão diário · `Z`=fator do
-nível de serviço (§2.3) · `C`=dias de ciclo da classe · `SS`=estoque de segurança
-(teto de `SS_CAP_CICLOS` ciclos).
+`d`=demanda diária (crua) · `σ`=desvio-padrão diário · `Z`=fator do nível de
+serviço (§2.3) · `C`=dias de ciclo da classe · `f_prot`/`f_cic`=fatores sazonais
+por janela (ver Cálculo 3) · `SS`=estoque de segurança (teto de `SS_CAP_CICLOS`
+ciclos).
 
 **Cálculo 2 — Poisson composta** — itens Intermitente/Grumoso (vendem em lote):
 
 ```
-λ          = d × dias                  (dias = LT no mínimo; LT+C no máximo)
+λ          = d × f × dias              (dias = T no mínimo; T+C no máximo)
 dispersão  = lote × (1 + CV²)          (variância ÷ média)
-Mín / Máx  = menor k com P(demanda ≤ k) ≥ nível de serviço
+Mín / Máx  = menor k com P(demanda ≤ k) ≥ nível de serviço  (teto SS_CAP_CICLOS)
 ```
-`dispersão`≈1 → **Poisson**; `dispersão`>1 → **Binomial Negativa**. A taxa usa a
-correção de viés de **Croston/SBA** (`ALPHA_CROSTON`). Isso evita o
-superdimensionamento de quando se usava a σ mensal direto.
+`dispersão`≈1 → **Poisson**; `dispersão`>1 → **Binomial Negativa**. A taxa é a
+média empírica direta — a antiga "correção" Croston/SBA `(1−α/2)` foi removida
+(ela corrige o estimador de Croston, não uma média simples; só deflacionava 5%).
 
 **Cálculo 3 — Sazonalidade** — subgrupos com onda anual confiável:
 
 ```
-índice(mês)        = venda média do mês ÷ venda média geral   (vários anos)
-demanda planejada  = d × índice (do período à frente = LT + ciclo)
+índice(mês) = venda média do mês ÷ venda média geral   (vários anos)
+f_prot      = média dos índices em [hoje, hoje+T]        → mínimo e σ
+f_cic       = média dos índices em [hoje, hoje+T+ciclo]  → estoque de ciclo (máximo)
 ```
-Só vale quando o pico se repete no mesmo trimestre (`SAZ_CONSIST_MIN`), com
-amplitude (`SAZ_AMPLITUDE_MIN`) e volume (`SAZ_VOL_MIN`) mínimos. O fator é
-travado em `[SAZ_FATOR_MIN, SAZ_FATOR_MAX]` e **multiplica a demanda antes** dos
-cálculos 1/2.
+Um fator **por janela**: o mínimo protege o período curto (pico bate cheio); o
+máximo dilui o fator na janela longa do ciclo — item de ciclo longo não é
+inflado por pico curto. Só vale quando o pico se repete no mesmo trimestre
+(`SAZ_CONSIST_MIN`), com amplitude (`SAZ_AMPLITUDE_MIN`) e volume (`SAZ_VOL_MIN`)
+mínimos. Fator travado em `[SAZ_FATOR_MIN, SAZ_FATOR_MAX]`; itens de **cauda
+longa** (curva C/D ou Intermitente/Grumoso) têm trava extra
+`SAZ_FATOR_MAX_LENTO` (1,5×) para não capitalizar estoque lento por onda do
+subgrupo.
 
-### 2.4 Consolidação por grupo (marcas) + originais
+### 2.4 Consolidação por grupo (marcas) + linhas + originais
 
-O cálculo é por **grupo de produto** = mesma **descrição** (a marca fica no
-`mar_codigo`). Como o cliente leva qualquer marca, a demanda das marcas é
-**consolidada** (substitutos): junta-se a série mensal de todas as marcas e
-roda-se o motor **uma vez por grupo**. Benefício (risk pooling + mudança de
-padrão): o ponto de pedido do grupo é bem menor que a soma dos individuais.
+O cálculo é por **grupo de produto** = mesma **descrição** + mesma **LINHA de
+marca**. Como o cliente leva qualquer marca *da mesma faixa*, a demanda das
+marcas é **consolidada** (substitutos): junta-se a série mensal e roda-se o
+motor **uma vez por grupo**. Benefício (risk pooling + mudança de padrão): o
+ponto de pedido do grupo é bem menor que a soma dos individuais.
+
+**Linha da marca (`com_marca_linha`)** — 1ª (premium: Bosch, Osram, Arteb…),
+2ª (padrão; toda marca não classificada) e 3ª (econômica: genéricos,
+Universal/Importado…). Linhas diferentes **não** se consolidam: Bosch (1ª) vira
+o grupo `"DESC • 1ª LINHA"`, separado do grupo da 2ª/3ª — o excesso da linha
+econômica acima do máximo **não** suprime mais a compra da premium. Curadoria
+via tabela `com_marca_linha` (seed proposto em
+`sql/2026-07-03_marca_linha.sql`); marca fora da tabela = linha 2.
 
 **Produtos originais** (marca montadora/genuíno) ficam **"Sob Encomenda"**:
 sem mínimo/máximo e **fora da demanda do grupo** (compra por pedido real). Regra
@@ -219,7 +241,10 @@ Auxiliares:
 | Variável | Padrão | Descrição |
 |---|---|---|
 | `JANELA_DEMANDA_MESES` | `12` | janela da demanda e do ABC |
-| `LEAD_TIME_DIAS` | `17` | prazo de reposição (dias) |
+| `LEAD_TIME_DIAS` | `17` | prazo de reposição (dias) — **fallback**; o prazo real vem de `com_fornecedor_parametros` por fornecedor |
+| `PERIODO_REVISAO_PADRAO` | `0` | período de revisão (dias) — fallback; o real vem do cadastro do fornecedor |
+| `SAZ_FATOR_MAX_LENTO` | `1.5` | trava extra do fator sazonal p/ cauda longa (curva C/D, Intermitente/Grumoso) |
+| `NS_MARGEM_MAX_MULT` | `10.0` | margem > N× custo = cadastro suspeito → nível econômico descartado (cai na curva) |
 | `Z_CURVA_A/B/C/D` | `2.054/1.645/1.282/1.036` | Z de fallback por curva (sem custo) |
 | `NS_CURVA_A/B/C/D` | `0.98/0.95/0.90/0.85` | nível de serviço de fallback (Poisson) |
 | `NS_MODO` | `custo` | `custo` = nível econômico oficial; `sombra` = oficial pela curva (legado) |
@@ -300,8 +325,22 @@ Quanto?  = Máximo − Posição
   somando `com_pedido_itens.quantidade` menos o já recebido
   (`com_pedido_nfe_vinculo_item.quantidade_alocada`, vínculo confirmado).
 - **Estoque** em tempo real (uma query única ao ERP).
+- **Valor estimado** por item (`qtd_sugerida × custo_unitario` médio 12m),
+  total por fornecedor e geral (`valor_total_estimado`, `valor_total_geral`).
+- **Pedido mínimo do fornecedor** (`com_fornecedor_parametros`): o bloco do
+  fornecedor traz `pedido_minimo_valor` e `abaixo_pedido_minimo` (alerta na tela).
 - Filtros: `fornecedor`, `curva`, `apenas_zerados`, `usar_estoque_realtime`.
 - Tolerante a schema antigo (colunas novas viram `NULL` se ainda não existem).
+
+### 7.1 Backtest (validação da política)
+
+`python backtest.py [--meses 12] [--sem-vp]` congela a política em t0 = hoje−N
+meses (só com dados anteriores), simula a demanda real dia a dia contra o (s,S)
+com venda perdida, e compara **fill rate realizado vs alvo por curva**, ciclos
+sem ruptura e capital médio. Saída: resumo no console + Excel
+(`backtest_resultado_*.xlsx`: resumo por curva, 30 piores itens, por produto).
+Use após mudanças de parâmetro: fill abaixo do alvo → subir NS/SS ou revisar o
+lead time do fornecedor; muito acima com capital alto → dá para enxugar.
 
 > Para produtos agrupados, a tela deve usar `grupo_estoque_min/max` e a posição
 > consolidada das marcas, e **omitir os `sob_encomenda`**.
