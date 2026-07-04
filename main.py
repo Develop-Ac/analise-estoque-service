@@ -821,6 +821,7 @@ def carregar_dados_do_banco(corte=None):
             subp.subgrp_descricao AS SGR_DESCRICAO,
             pro.referencia AS PRO_REFERENCIA,
             pro.estoque_disponivel,
+            pro.preco_custo AS CUSTO_CADASTRO,
             mar.mar_descricao,
             f1.for_nome AS fornecedor1,
             f2.for_nome AS fornecedor2,
@@ -892,6 +893,8 @@ def carregar_dados_do_banco(corte=None):
         "SGR_CODIGO":          "SGR_CODIGO",
         "estoque_disponivel":  "ESTOQUE_DISPONIVEL",
         "ESTOQUE_DISPONIVEL":  "ESTOQUE_DISPONIVEL",
+        "custo_cadastro":      "CUSTO_CADASTRO",
+        "CUSTO_CADASTRO":      "CUSTO_CADASTRO",
         "mar_descricao":       "MAR_DESCRICAO",
         "MAR_DESCRICAO":       "MAR_DESCRICAO",
         "subgrp_descricao":    "SGR_DESCRICAO",
@@ -1894,7 +1897,7 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     # ==========================================
     colunas_saldo = [
         "PRO_CODIGO", "PRO_DESCRICAO", "SGR_CODIGO", "SGR_DESCRICAO",
-        "ESTOQUE_DISPONIVEL", "MAR_DESCRICAO",
+        "ESTOQUE_DISPONIVEL", "MAR_DESCRICAO", "CUSTO_CADASTRO",
         "FORNECEDOR1", "FORNECEDOR2", "FORNECEDOR3",
     ]
     colunas_saldo = [c for c in colunas_saldo if c in df_saldo_produto.columns]
@@ -1903,6 +1906,21 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     df_saldo_produto["PRO_CODIGO"] = df_saldo_produto["PRO_CODIGO"].astype(str).str.strip()
 
     df_met = df_met.merge(df_saldo_produto[colunas_saldo], on="PRO_CODIGO", how="left")
+
+    # ==========================================
+    # FALLBACK DE CUSTO: item SEM venda 12m não tem custo (o CUSTO_UNIT vem do
+    # preco_custo das VENDAS) → capital/CME dele sumia do dashboard e o total
+    # não batia com o inventário fiscal (diferença medida: R$ 1,65 mi em 9,5 mil
+    # itens). Usa o preco_custo do CADASTRO do ERP nesses casos. NÃO afeta o
+    # nível de serviço econômico: a MARGEM segue nula sem venda → cai na curva.
+    # ==========================================
+    if "CUSTO_CADASTRO" in df_met.columns:
+        _cc = pd.to_numeric(df_met["CUSTO_CADASTRO"], errors="coerce")
+        _cu = pd.to_numeric(df_met["CUSTO_UNIT"], errors="coerce").fillna(0.0)
+        _usar = (_cu <= 0) & _cc.notna() & (_cc > 0)
+        df_met.loc[_usar, "CUSTO_UNIT"] = _cc[_usar]
+        print(f"  - Custo do CADASTRO aplicado a {int(_usar.sum())} itens sem venda 12m "
+              f"(capital do dashboard passa a cobrir o estoque parado).")
 
     # ==========================================
     # Curva ABC (sobre valor vendido dos últimos 12 meses, não vitalício)
