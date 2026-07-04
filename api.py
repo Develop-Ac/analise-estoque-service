@@ -2262,7 +2262,7 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
 def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo=True,
                            usar_estoque_realtime=True, fornecedor=None, curva=None,
                            subgrupo=None, apenas_zerados=False, incluir_sem_historico=False,
-                           params_forn=None):
+                           params_forn=None, marca=None):
     """
     Transforma as linhas de com_fifo_completo (1 por produto/marca) na sugestão de
     compra agrupada por fornecedor. FUNÇÃO PURA — usada pelo endpoint e pela validação.
@@ -2288,8 +2288,58 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
     params_forn = params_forn or {}
     curvas_filtro = [c.strip().upper() for c in curva.split(",")] if curva else None
     subs_filtro = [s.strip().lower() for s in subgrupo.split(",")] if subgrupo else None
+    marcas_filtro = ([m.strip().upper() for m in marca.split(",") if m.strip()]
+                     if marca else None)
     ordem_curva = {"A": 0, "B": 1, "C": 2, "D": 3}
     grupos = {}  # fornecedor -> [rec]
+
+    # Índice DESCRIÇÃO -> itens por LINHA de marca, para mostrar no detalhe as
+    # marcas do mesmo produto em OUTRAS linhas (não entram no cálculo do grupo,
+    # mas o comprador precisa ver que existem — ex.: Bosch vs linha econômica).
+    por_desc = {}
+    for _it in items:
+        if _it.get("sob_encomenda"):
+            continue
+        _d = _sug_norm(_it.get("pro_descricao")).upper()
+        if _d:
+            por_desc.setdefault(_d, []).append(_it)
+
+    def _outras_linhas(descricao, linha_propria):
+        try:
+            lp = int(linha_propria) if linha_propria is not None else 2
+        except (TypeError, ValueError):
+            lp = 2
+        out = []
+        for o in por_desc.get(_sug_norm(descricao).upper(), []):
+            try:
+                lo = int(o.get("marca_linha")) if o.get("marca_linha") is not None else 2
+            except (TypeError, ValueError):
+                lo = 2
+            if lo == lp:
+                continue
+            _, est_o, tr_o = _sug_posicao(o, stock_map, usar_rt)
+            pos_o = est_o + tr_o
+            max_o = _sug_float(o.get("maximo"))
+            if max_o > 0 and pos_o > max_o:
+                situ = "acima do máximo"
+            elif max_o > 0 and pos_o <= _sug_float(o.get("ponto_pedido")):
+                situ = "abaixo do mínimo"
+            elif max_o > 0:
+                situ = "ok"
+            else:
+                situ = "sem alvo"
+            out.append({
+                "pro_codigo": _sug_norm(o.get("pro_codigo")),
+                "marca": o.get("mar_descricao"),
+                "linha": lo,
+                "estoque_atual": round(est_o, 2),
+                "em_transito": round(tr_o, 2),
+                "posicao": round(pos_o, 2),
+                "maximo": int(max_o),
+                "situacao": situ,
+            })
+        out.sort(key=lambda x: (x["linha"], -x["posicao"]))
+        return out[:12]
 
     def _forns_hist(cod):
         """[(for_nome, qtd)] desc — de quem JÁ COMPRAMOS este produto."""
@@ -2325,6 +2375,8 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             return
         if not _sub_ok(it.get("sgr_descricao")):
             return
+        if marcas_filtro and _sug_norm(it.get("mar_descricao")).upper() not in marcas_filtro:
+            return
         # Fornecedor vem do HISTÓRICO de compra (não do cadastro fornecedor1/2/3).
         h = _forns_hist(cod)
         all_forns = [n for n, _ in h]
@@ -2359,9 +2411,15 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             fornecedor_lt=it.get("fornecedor_principal"),
         )
         custo_u = _sug_float(it.get("custo_unitario"))
+        dem_item = _sug_float(it.get("demanda_planejamento_dia")
+                              if it.get("demanda_planejamento_dia") is not None
+                              else it.get("demanda_media_dia_ajustada"))
         _registrar(bucket, {
             "tipo": "individual",
             "memoria": memoria_item,
+            "demanda_dia": round(dem_item, 4),
+            "cobertura_dias": (round(posicao / dem_item, 0) if dem_item > 0 else None),
+            "outras_linhas": _outras_linhas(it.get("pro_descricao"), it.get("marca_linha")),
             "grupo_chave": None,
             "pro_codigo": cod,
             "pro_descricao": it.get("pro_descricao"),
@@ -2455,6 +2513,9 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             metodo = next((m.get("grupo_metodo") for m in mem if m.get("grupo_metodo")), None)
             if not _passa_filtros_comuns(curva_item, estoque_total):
                 continue
+            if marcas_filtro and not any(
+                    _sug_norm(m.get("mar_descricao")).upper() in marcas_filtro for m in mem):
+                continue
 
             # ordena membros por relevância (vendas) p/ marca primária
             membros_det.sort(key=lambda x: (-x["valor_vendido_12m"], -x["demanda_media_dia_ajustada"],
@@ -2515,9 +2576,16 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                           "min_ind": d["min_ind"], "max_ind": d["max_ind"]}
                          for d in membros_det],
             )
+            dem_grp = _sug_float(next((m.get("grupo_demanda_dia") for m in mem
+                                       if m.get("grupo_demanda_dia") is not None), None))
             _registrar(bucket, {
                 "tipo": "grupo",
                 "memoria": memoria_grp,
+                "demanda_dia": round(dem_grp, 4),
+                "cobertura_dias": (round(posicao / dem_grp, 0) if dem_grp > 0 else None),
+                "outras_linhas": _outras_linhas(mem[0].get("pro_descricao"),
+                                                next((m.get("marca_linha") for m in mem
+                                                      if m.get("marca_linha") is not None), None)),
                 "grupo_chave": gk,
                 "pro_codigo": membros_det[0]["pro_codigo"],  # representativo (maior venda)
                 "pro_descricao": gk,
@@ -2640,16 +2708,44 @@ def _carregar_itens_sugestao(conn):
     return [dict(r) for r in conn.execute(sql).mappings().all()]
 
 
-def _codigos_candidatos(items, historico, curva, subgrupo, fornecedor, consolidar_grupo):
+def _codigos_candidatos(items, historico, curva, subgrupo, fornecedor, consolidar_grupo,
+                        marca=None):
     """
     Códigos de produto que passam nos filtros que NÃO dependem de estoque
-    (curva, subgrupo, fornecedor-histórico), respeitando os grupos. Usado para
-    buscar o estoque realtime SÓ desses itens (em vez dos ~45k).
+    (curva, subgrupo, fornecedor-histórico, marca), respeitando os grupos.
+    Usado para buscar o estoque realtime SÓ desses itens (em vez dos ~45k).
+    No fim, EXPANDE para os produtos de mesma descrição (outras linhas de
+    marca), para o detalhe "outras linhas" também mostrar estoque realtime.
     """
     curvas = [c.strip().upper() for c in curva.split(",")] if curva else None
     subs = [s.strip().lower() for s in subgrupo.split(",")] if subgrupo else None
     forn = fornecedor.lower() if fornecedor else None
+    marcas = ([m.strip().upper() for m in marca.split(",") if m.strip()] if marca else None)
     historico = historico or {}
+
+    def marca_ok(it):
+        return (not marcas) or (_sug_norm(it.get("mar_descricao")).upper() in marcas)
+
+    def _expandir_mesma_descricao(codes_sel):
+        """Inclui os produtos que dividem a descrição com algum selecionado."""
+        if not codes_sel:
+            return codes_sel
+        desc_de = {}
+        por_desc = {}
+        for it in items:
+            if it.get("sob_encomenda"):
+                continue
+            c = _sug_norm(it.get("pro_codigo"))
+            d = _sug_norm(it.get("pro_descricao")).upper()
+            if c and d:
+                desc_de[c] = d
+                por_desc.setdefault(d, set()).add(c)
+        extra = set()
+        for c in codes_sel:
+            d = desc_de.get(c)
+            if d:
+                extra |= por_desc[d]
+        return codes_sel | extra
 
     def forn_ok(cod):
         return (not forn) or any(forn in n.lower() for n, _ in historico.get(_sug_norm(cod), []))
@@ -2668,8 +2764,10 @@ def _codigos_candidatos(items, historico, curva, subgrupo, fornecedor, consolida
                 continue
             if not forn_ok(it.get("pro_codigo")):
                 continue
+            if not marca_ok(it):
+                continue
             codes.add(_sug_norm(it.get("pro_codigo")))
-        return codes
+        return _expandir_mesma_descricao(codes)
 
     from collections import defaultdict
     membros = defaultdict(list)
@@ -2691,6 +2789,8 @@ def _codigos_candidatos(items, historico, curva, subgrupo, fornecedor, consolida
             continue
         if forn and not any(forn_ok(m.get("pro_codigo")) for m in mem):
             continue
+        if marcas and not any(marca_ok(m) for m in mem):
+            continue
         for m in mem:
             codes.add(_sug_norm(m.get("pro_codigo")))
     for it in avulsos:
@@ -2700,8 +2800,10 @@ def _codigos_candidatos(items, historico, curva, subgrupo, fornecedor, consolida
             continue
         if not forn_ok(it.get("pro_codigo")):
             continue
+        if not marca_ok(it):
+            continue
         codes.add(_sug_norm(it.get("pro_codigo")))
-    return codes
+    return _expandir_mesma_descricao(codes)
 
 
 @app.get("/compras/sugestao")
@@ -2709,6 +2811,7 @@ def sugestao_compra(
     fornecedor: Optional[str] = None,
     curva: Optional[str] = None,
     subgrupo: Optional[str] = None,
+    marca: Optional[str] = None,
     apenas_zerados: bool = False,
     usar_estoque_realtime: bool = True,
     consolidar_grupo: bool = True,
@@ -2741,11 +2844,12 @@ def sugestao_compra(
     # ESTRATÉGIA: aplica os filtros que NÃO dependem de estoque (curva/subgrupo/
     # fornecedor) e busca o estoque realtime SÓ dos itens filtrados. Sem filtro,
     # cai no "todos" (com timeout rígido + fallback pro snapshot).
-    tem_filtro = bool(curva or subgrupo or fornecedor)
+    tem_filtro = bool(curva or subgrupo or fornecedor or marca)
     stock_map = {}
     if usar_estoque_realtime:
         if tem_filtro:
-            codes = _codigos_candidatos(items, historico, curva, subgrupo, fornecedor, consolidar_grupo)
+            codes = _codigos_candidatos(items, historico, curva, subgrupo, fornecedor,
+                                        consolidar_grupo, marca=marca)
             try:
                 fut = _RT_EXECUTOR.submit(get_realtime_stocks_bulk, codes)
                 stock_map = fut.result(timeout=int(os.getenv("STOCK_RT_HARD_TIMEOUT_S") or 20))
@@ -2771,6 +2875,7 @@ def sugestao_compra(
         apenas_zerados=apenas_zerados,
         incluir_sem_historico=incluir_sem_historico,
         params_forn=get_fornecedor_parametros(),
+        marca=marca,
     )
 
 
