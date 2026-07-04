@@ -235,6 +235,10 @@ class AnaliseItem(BaseModel):
     estoque_obsoleto: Optional[float] = 0
     lotes_estoque: Optional[List[LoteEstoque]] = []
 
+    # Capital parado e custo de carregamento acumulado do saldo atual
+    valor_estoque: Optional[float] = None            # estoque × custo unitário (R$)
+    custo_manter_acumulado: Optional[float] = None   # valor × HOLDING_RATE × idade média/365 (R$)
+
 class PaginatedResponse(BaseModel):
     data: List[AnaliseItem]
     total: int
@@ -1389,8 +1393,31 @@ def listar_analise(
                 print(f"Erro ao processar grupos/estoque: {e}")
 
         
+        # -----------------------------------------------------------------
+        # CAPITAL PARADO + CUSTO DE MANTER ACUMULADO (após o estoque realtime)
+        #   valor_estoque = estoque × custo unitário (médio 12m)
+        #   custo_manter_acumulado = valor × HOLDING_RATE_ANUAL × idade/365,
+        #   com idade = tempo_medio_saldo_atual (idade média PONDERADA do saldo
+        #   pelos lotes FIFO). Como a idade média é ponderada pela quantidade,
+        #   Σ(lote×idade) == estoque×idade_média — o acumulado é exato dado o
+        #   custo médio. É quanto esse saldo JÁ custou parado até hoje.
+        # -----------------------------------------------------------------
+        _hold = float(os.getenv("HOLDING_RATE_ANUAL") or 0.25)
+        for item in data_list:
+            try:
+                cu = float(item.get("custo_unitario") or 0)
+                est = float(item.get("estoque_disponivel") or 0)
+                idade = float(item.get("tempo_medio_saldo_atual") or 0)
+            except (TypeError, ValueError):
+                continue
+            if cu > 0:
+                va = est * cu
+                item["valor_estoque"] = round(va, 2)
+                item["custo_manter_acumulado"] = (round(va * _hold * max(idade, 0.0) / 365.0, 2)
+                                                  if idade > 0 else 0.0)
+
         total_pages = (total + limit - 1) // limit if limit > 0 else 0
-        
+
         return {
             "data": data_list,
             "total": total,
@@ -1537,8 +1564,12 @@ def exportar_analise(
                 grp_estoque_min_sugerido as "Min Grupo",
                 grp_estoque_max_sugerido as "Max Grupo",
                 tempo_medio_saldo_atual as "Idade Saldo Atual",
-                categoria_saldo_atual as "Cat. Saldo Atual"
-             """
+                categoria_saldo_atual as "Cat. Saldo Atual",
+                custo_unitario as "Custo Unit. (R$)",
+                ROUND(COALESCE(estoque_disponivel,0) * COALESCE(custo_unitario,0), 2) as "Valor em Estoque (R$)",
+                ROUND(COALESCE(estoque_disponivel,0) * COALESCE(custo_unitario,0)
+                      * {hold_rate} * GREATEST(COALESCE(tempo_medio_saldo_atual,0),0) / 365.0, 2) as "Custo Manter Acum. (R$)"
+             """.format(hold_rate=float(os.getenv("HOLDING_RATE_ANUAL") or 0.25))
 
         export_sql = text(f"""
             SELECT {query_columns}
