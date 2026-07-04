@@ -31,7 +31,11 @@ import pandas as pd
 # ----------------------------------------------------------------------
 # Janela raw (meses relidos do ERP a cada execução). Só meses mais antigos que
 # a janela são congelados no pacote.
-JANELA_MESES = int(os.getenv("EMPAC_JANELA_MESES") or 24)
+# 12 meses = período de GARANTIA contra lançamentos retroativos (para trás de
+# 12m o ERP não muda) e cobre exatamente a janela de demanda do modelo — a
+# demanda/σ/ABC/margem saem 100% do dado cru; o pacote fornece o resto
+# (camadas FIFO, sazonalidade antiga e estatísticas vitalícias).
+JANELA_MESES = int(os.getenv("EMPAC_JANELA_MESES") or 12)
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://admin:admin@automacao_mongo-db:27017/?tls=false")
 MONGO_DB = os.getenv("MONGO_DB", "analise_estoque")
 MONGO_COL = os.getenv("MONGO_COL", "fifo_pack")
@@ -195,7 +199,14 @@ class MongoPackStore(PackStore):
     def carregar(self) -> dict:
         return {d["_id"]: {"corte": d.get("corte"),
                            "camadas": d.get("camadas", []),
-                           "vendas_mensais": d.get("vendas_mensais", {})}
+                           "vendas_mensais": d.get("vendas_mensais", {}),
+                           # estatísticas vitalícias (pack v2; ausentes em pack v1 -> defaults)
+                           "n_vendas": d.get("n_vendas", 0),
+                           "qtd_vendida": d.get("qtd_vendida", 0.0),
+                           "data_min_venda": d.get("data_min_venda"),
+                           "data_max_venda": d.get("data_max_venda"),
+                           "dpm_num": d.get("dpm_num", 0.0),
+                           "dpm_den": d.get("dpm_den", 0.0)}
                 for d in self._col.find({})}
 
     def meta(self) -> dict:
@@ -242,14 +253,59 @@ def _vendas_mensais_por_produto(df_sai, ate_exclusivo):
     return out
 
 
+def _dpm_de_vendas(vendas):
+    """
+    Contribuições do "tempo em estoque" (DPM = dias entre a compra e a venda)
+    das vendas processadas pelo FIFO:
+      dpm_num = Σ sobre consumos ((data_venda − data_compra).dias × qtd_consumida)
+      dpm_den = Σ qtd_consumida
+    Equivale exatamente ao DPM médio ponderado do main.py (média das datas de
+    compra ponderada pela qtd é linear).
+    """
+    num = 0.0
+    den = 0.0
+    for v in vendas:
+        # Mesma regra do main.py: venda PARCIALMENTE atendida (faltou estoque)
+        # fica sem data_compra e NÃO entra no tempo médio.
+        if float(v.get("faltou", 0.0)) > 1e-9:
+            continue
+        dv = pd.Timestamp(v["data"])
+        for dc, q in v.get("consumos", []):
+            num += (dv - pd.Timestamp(dc)).days * float(q)
+            den += float(q)
+    return num, den
+
+
+def _stats_vendas(df_sai_prod, ate_exclusivo):
+    """Estatísticas vitalícias das vendas < corte: nº de linhas, qtd, datas min/max."""
+    if df_sai_prod is None or df_sai_prod.empty:
+        return {"n_vendas": 0, "qtd_vendida": 0.0, "data_min_venda": None, "data_max_venda": None}
+    s = df_sai_prod[df_sai_prod["DATA"] < pd.Timestamp(ate_exclusivo)]
+    if s.empty:
+        return {"n_vendas": 0, "qtd_vendida": 0.0, "data_min_venda": None, "data_max_venda": None}
+    return {
+        "n_vendas": int(len(s)),
+        "qtd_vendida": round(float(s["QUANTIDADE_AJUSTADA"].sum()), 4),
+        "data_min_venda": pd.Timestamp(s["DATA"].min()).strftime(_FMT),
+        "data_max_venda": pd.Timestamp(s["DATA"].max()).strftime(_FMT),
+    }
+
+
+_STATS_VAZIO = {"n_vendas": 0, "qtd_vendida": 0.0, "data_min_venda": None,
+                "data_max_venda": None, "dpm_num": 0.0, "dpm_den": 0.0}
+
+
 def computar_pack(df_ent, df_sai, hoje, janela_meses=JANELA_MESES):
     """
     BACKFILL: a partir da carga COMPLETA, calcula o pacote no corte T.
-      camadas abertas em T (por produto) + vendas mensais congeladas (meses < T).
-    Retorna (docs, corte) — docs = {pro_codigo: {corte, camadas, vendas_mensais}}.
+      camadas abertas em T + vendas mensais congeladas (< T) + estatísticas
+      vitalícias (nº de vendas, qtd, datas min/max, tempo médio em estoque) —
+      necessárias para o mín/máx não mudar quando a janela raw encolhe p/ 12m.
+    Retorna (docs, corte).
     """
     T = corte_da_janela(hoje, janela_meses)
     Ts = T.strftime(_FMT)
+    Tt = pd.Timestamp(T)
     de = df_ent.copy(); de["PRO_CODIGO"] = de["PRO_CODIGO"].astype(str).str.strip()
     de["DATA"] = pd.to_datetime(de["DATA"], errors="coerce")
     ds = df_sai.copy(); ds["PRO_CODIGO"] = ds["PRO_CODIGO"].astype(str).str.strip()
@@ -263,11 +319,17 @@ def computar_pack(df_ent, df_sai, hoje, janela_meses=JANELA_MESES):
 
     docs = {}
     for cod in produtos:
-        cam = camadas_no_corte(ent_por.get(cod), sai_por.get(cod), T)
+        gs = sai_por.get(cod)
+        evs = [e for e in _eventos(ent_por.get(cod), gs) if pd.Timestamp(e['data']) < Tt]
+        vendas, cam = processar_fifo([], evs)
+        dpm_num, dpm_den = _dpm_de_vendas(vendas)
         docs[cod] = {
             "corte": Ts,
             "camadas": _cam_to_doc(cam),
             "vendas_mensais": vmensais.get(cod, {}),
+            **_stats_vendas(gs, T),
+            "dpm_num": round(dpm_num, 2),
+            "dpm_den": round(dpm_den, 4),
         }
     return docs, T
 
@@ -293,20 +355,35 @@ def avancar_corte(docs, df_ent_janela, df_sai_janela, corte_antigo, corte_novo):
 
     novos = {}
     for cod in produtos:
-        doc = docs.get(cod, {"camadas": [], "vendas_mensais": {}})
+        doc = docs.get(cod, {"camadas": [], "vendas_mensais": {}, **_STATS_VAZIO})
         cam0 = _cam_from_doc(doc.get("camadas", []))
         evs = _eventos(ent_por.get(cod), sai_por.get(cod))
-        _, cam1 = processar_fifo(cam0, evs)
+        vendas, cam1 = processar_fifo(cam0, evs)
         # vendas mensais do mês congelado
         vm = dict(doc.get("vendas_mensais", {}))
         gsai = sai_por.get(cod)
+        n_v = int(doc.get("n_vendas", 0) or 0)
+        q_v = float(doc.get("qtd_vendida", 0.0) or 0.0)
+        dmin = doc.get("data_min_venda")
+        dmax = doc.get("data_max_venda")
         if gsai is not None and not gsai.empty:
             tmp = gsai.copy()
             tmp["MES"] = tmp["DATA"].dt.strftime("%Y-%m")
             for mes, v in tmp.groupby("MES")["QUANTIDADE_AJUSTADA"].sum().items():
                 vm[mes] = round(vm.get(mes, 0.0) + float(v), 4)
+            n_v += int(len(tmp))
+            q_v += float(tmp["QUANTIDADE_AJUSTADA"].sum())
+            f_min = pd.Timestamp(tmp["DATA"].min()).strftime(_FMT)
+            f_max = pd.Timestamp(tmp["DATA"].max()).strftime(_FMT)
+            dmin = min(dmin, f_min) if dmin else f_min
+            dmax = max(dmax, f_max) if dmax else f_max
+        d_num, d_den = _dpm_de_vendas(vendas)
         novos[cod] = {"corte": Tn.strftime(_FMT), "camadas": _cam_to_doc(cam1),
-                      "vendas_mensais": vm}
+                      "vendas_mensais": vm,
+                      "n_vendas": n_v, "qtd_vendida": round(q_v, 4),
+                      "data_min_venda": dmin, "data_max_venda": dmax,
+                      "dpm_num": round(float(doc.get("dpm_num", 0.0) or 0.0) + d_num, 2),
+                      "dpm_den": round(float(doc.get("dpm_den", 0.0) or 0.0) + d_den, 4)}
     return novos
 
 
@@ -469,6 +546,31 @@ def fifo_por_camadas(df_ent, df_sai, df_saldo, packs=None, hoje=None):
                                                "ESTOQUE_DISPONIVEL"])
     df_div = pd.DataFrame(div_rows, columns=["PRO_CODIGO", "DIVERGENCIA"])
     return data_compra, df_long, df_div
+
+
+def stats_por_produto(docs):
+    """
+    Estatísticas vitalícias CONGELADAS do pacote, por produto, para o
+    calcular_metricas_e_classificar combinar com a janela raw:
+      PACK_N_VENDAS, PACK_QTD_VENDIDA, PACK_DATA_MIN, PACK_DATA_MAX,
+      PACK_DPM_NUM, PACK_DPM_DEN.
+    Pacotes v1 (sem os campos) rendem zeros — o resultado degrada para o
+    comportamento antigo até o corte avançar uma vez (fold grava v2).
+    """
+    rows = []
+    for cod, doc in docs.items():
+        rows.append({
+            "PRO_CODIGO": str(cod).strip(),
+            "PACK_N_VENDAS": int(doc.get("n_vendas", 0) or 0),
+            "PACK_QTD_VENDIDA": float(doc.get("qtd_vendida", 0.0) or 0.0),
+            "PACK_DATA_MIN": pd.to_datetime(doc.get("data_min_venda"), errors="coerce"),
+            "PACK_DATA_MAX": pd.to_datetime(doc.get("data_max_venda"), errors="coerce"),
+            "PACK_DPM_NUM": float(doc.get("dpm_num", 0.0) or 0.0),
+            "PACK_DPM_DEN": float(doc.get("dpm_den", 0.0) or 0.0),
+        })
+    return pd.DataFrame(rows, columns=["PRO_CODIGO", "PACK_N_VENDAS", "PACK_QTD_VENDIDA",
+                                       "PACK_DATA_MIN", "PACK_DATA_MAX",
+                                       "PACK_DPM_NUM", "PACK_DPM_DEN"])
 
 
 def vendas_mensais_subgrupo(docs, df_saldo_produto):

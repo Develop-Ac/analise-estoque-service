@@ -712,9 +712,15 @@ def carregar_dados_do_banco(corte=None):
     data_ini = str(corte) if corte else "2005-01-01"
 
     # >>>>>>>>>>>>> SQLs <<<<<<<<<<<<
+    # Saídas/entradas aceitam um teto opcional (`fim`, exclusivo) para a carga
+    # completa poder ser FATIADA por ano: transferir ~1 milhão de linhas numa
+    # única OPENQUERY trava/derruba o linked server; em fatias anuais cada
+    # leitura fica pequena. O NOT EXISTS do cancelamento (CNS) usa só o piso da
+    # fatia — o CNS é sempre posterior à venda, então a semântica é a mesma.
 
-    # Saídas a partir de `data_ini` (OPENQUERY no Linked Server CONSULTA).
-    sql_saidas_geral = f"""
+    def _sql_saidas(ini, fim=None):
+        teto = f"AND LE.data < ''{fim}''" if fim else ""
+        return f"""
     SELECT * FROM OPENQUERY(CONSULTA, '
         SELECT
             LE.pro_codigo,
@@ -727,7 +733,8 @@ def carregar_dados_do_banco(corte=None):
             LE.origem,
             LE.quantidade
         FROM lanctos_estoque LE
-        WHERE LE.data    >= ''{data_ini}''
+        WHERE LE.data    >= ''{ini}''
+          {teto}
           AND LE.empresa = 3
           AND LE.origem IN (''NFS'',''EVF'', ''EFD'')
           AND NOT EXISTS (
@@ -736,7 +743,7 @@ def carregar_dados_do_banco(corte=None):
                 WHERE C.empresa = LE.empresa
                   AND C.nfs     = LE.nfs
                   AND C.origem  = ''CNS''
-                  AND C.data    >= ''{data_ini}''
+                  AND C.data    >= ''{ini}''
             )
         ORDER BY
             LE.pro_codigo ASC,
@@ -745,7 +752,9 @@ def carregar_dados_do_banco(corte=None):
     ')
     """
 
-    sql_entradas = f"""
+    def _sql_entradas(ini, fim=None):
+        teto = f"AND LE.data < ''{fim}''" if fim else ""
+        return f"""
     SELECT * FROM OPENQUERY(CONSULTA, '
         SELECT
             LE.pro_codigo,
@@ -756,18 +765,10 @@ def carregar_dados_do_banco(corte=None):
             LE.total_liquido,
             LE.data,
             LE.origem,
-            LE.quantidade,
-            ROW_NUMBER() OVER (
-                PARTITION BY LE.pro_codigo
-                ORDER BY LE.data ASC, LE.lancto ASC
-            ) AS indice,
-            SUM(LE.quantidade) OVER (
-                PARTITION BY LE.pro_codigo
-                ORDER BY LE.data ASC, LE.lancto ASC
-                ROWS UNBOUNDED PRECEDING
-            ) AS qtd_acumulada
+            LE.quantidade
         FROM lanctos_estoque LE
-        WHERE LE.data >= ''{data_ini}''
+        WHERE LE.data >= ''{ini}''
+          {teto}
           AND LE.origem IN (''NFE'',''CNE'',''LIA'',''CAD'',''CDE'')
           AND LE.empresa = 3
         ORDER BY
@@ -776,6 +777,9 @@ def carregar_dados_do_banco(corte=None):
             LE.lancto ASC
     ')
     """
+
+    sql_saidas_geral = _sql_saidas(data_ini)
+    sql_entradas = _sql_entradas(data_ini)
 
     sql_devolucoes = """
     SELECT * FROM OPENQUERY(CONSULTA, '
@@ -840,8 +844,24 @@ def carregar_dados_do_banco(corte=None):
 
     print("\nLendo dados do banco via ODBC...")
 
-    df_saidas      = pd.read_sql(sql_saidas_geral,  conn)
-    df_ent         = pd.read_sql(sql_entradas,      conn)
+    if corte:
+        df_saidas = pd.read_sql(sql_saidas_geral, conn)
+        df_ent = pd.read_sql(sql_entradas, conn)
+    else:
+        # Carga completa (backfill do pacote): FATIADA por ano para não travar.
+        ano_fim = datetime.date.today().year
+        partes_s, partes_e = [], []
+        for ano in range(2005, ano_fim + 1):
+            ini = f"{ano}-01-01"
+            fim = f"{ano + 1}-01-01" if ano < ano_fim else None
+            ps = pd.read_sql(_sql_saidas(ini, fim), conn)
+            pe = pd.read_sql(_sql_entradas(ini, fim), conn)
+            partes_s.append(ps)
+            partes_e.append(pe)
+            print(f"  - fatia {ano}: {len(ps)} saídas, {len(pe)} entradas")
+        df_saidas = pd.concat(partes_s, ignore_index=True)
+        df_ent = pd.concat(partes_e, ignore_index=True)
+
     df_dev         = pd.read_sql(sql_devolucoes,    conn)
     df_saldo_produto = pd.read_sql(sql_saldo_produto, conn)
     try:
@@ -1677,11 +1697,17 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                                     df_ent_valid: pd.DataFrame,
                                     df_saldo_produto: pd.DataFrame,
                                     df_vp: pd.DataFrame = None,
-                                    vendas_mensais_extra: pd.DataFrame = None) -> pd.DataFrame:
+                                    vendas_mensais_extra: pd.DataFrame = None,
+                                    pack_stats: pd.DataFrame = None) -> pd.DataFrame:
     """
     Calcula métricas (demanda 12m + venda perdida), ABC/XYZ, padrão de demanda,
     sazonalidade e min/máx. `vendas_mensais_extra` (modo incremental) traz os meses
-    congelados do pacote para a sazonalidade.
+    congelados do pacote para a sazonalidade; `pack_stats` traz as estatísticas
+    VITALÍCIAS congeladas (nº de vendas, qtd, datas min/max, tempo em estoque) —
+    com a janela raw de 12 meses, o histórico anterior ao corte vem do pacote,
+    para o portão de pouco-histórico e a regra de produto velho não mudarem.
+    A demanda/σ/ABC/margem NÃO precisam do pacote: a janela de 12m fica inteira
+    dentro do dado cru.
     """
     df = df_sai_fifo.copy()
     df["DATA"] = pd.to_datetime(df["DATA"], errors="coerce")
@@ -1703,8 +1729,11 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
         grp_dpm = grp_valid.dropna(subset=["DPM"])
         if grp_dpm.empty:
             tempo_medio = np.nan
+            dpm_num = dpm_den = 0.0
         else:
-            tempo_medio = np.average(grp_dpm["DPM"], weights=grp_dpm["QUANTIDADE_AJUSTADA"])
+            dpm_den = float(grp_dpm["QUANTIDADE_AJUSTADA"].sum())
+            dpm_num = float((grp_dpm["DPM"] * grp_dpm["QUANTIDADE_AJUSTADA"]).sum())
+            tempo_medio = dpm_num / dpm_den if dpm_den > 0 else np.nan
 
         qtd_vendida = grp_valid["QUANTIDADE_AJUSTADA"].sum()
 
@@ -1731,9 +1760,45 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
             "NUM_VENDAS": num_vendas,
             "VENDAS_ULT_12M": vendas_ult_12m,
             "NUM_VENDAS_12M": num_vendas_12m,
+            "DPM_NUM": dpm_num,
+            "DPM_DEN": dpm_den,
         })
 
     df_met = pd.DataFrame(metricas)
+
+    # ==========================================
+    # COMBINA COM AS ESTATÍSTICAS CONGELADAS DO PACOTE (janela raw = 12m)
+    #   vitalícias = raw (>= corte) + pacote (< corte). Produtos com venda só
+    #   no pacote (sem giro na janela) entram aqui e caem nas regras de
+    #   Sem_Giro_Recente / produto velho com a DATA_MAX correta.
+    # ==========================================
+    if pack_stats is not None and not pack_stats.empty:
+        ps = pack_stats.copy()
+        ps["PRO_CODIGO"] = ps["PRO_CODIGO"].astype(str).str.strip()
+        ps = ps[(ps["PACK_N_VENDAS"] > 0) | ps["PACK_DATA_MAX"].notna()]
+        if df_met.empty:
+            df_met = pd.DataFrame(columns=["PRO_CODIGO", "TEMPO_MEDIO_ESTOQUE", "QTD_VENDIDA",
+                                           "DATA_MIN_VENDA", "DATA_MAX_VENDA", "NUM_VENDAS",
+                                           "VENDAS_ULT_12M", "NUM_VENDAS_12M", "DPM_NUM", "DPM_DEN"])
+        df_met["PRO_CODIGO"] = df_met["PRO_CODIGO"].astype(str).str.strip()
+        n_antes = len(df_met)
+        df_met = df_met.merge(ps, on="PRO_CODIGO", how="outer")
+        for c in ["NUM_VENDAS", "QTD_VENDIDA", "VENDAS_ULT_12M", "NUM_VENDAS_12M",
+                  "DPM_NUM", "DPM_DEN", "PACK_N_VENDAS", "PACK_QTD_VENDIDA",
+                  "PACK_DPM_NUM", "PACK_DPM_DEN"]:
+            df_met[c] = pd.to_numeric(df_met.get(c), errors="coerce").fillna(0.0)
+        df_met["NUM_VENDAS"] = (df_met["NUM_VENDAS"] + df_met["PACK_N_VENDAS"]).astype(int)
+        df_met["QTD_VENDIDA"] = df_met["QTD_VENDIDA"] + df_met["PACK_QTD_VENDIDA"]
+        df_met["DATA_MIN_VENDA"] = pd.to_datetime(df_met["DATA_MIN_VENDA"], errors="coerce")
+        df_met["DATA_MAX_VENDA"] = pd.to_datetime(df_met["DATA_MAX_VENDA"], errors="coerce")
+        df_met["DATA_MIN_VENDA"] = df_met[["DATA_MIN_VENDA", "PACK_DATA_MIN"]].min(axis=1)
+        df_met["DATA_MAX_VENDA"] = df_met[["DATA_MAX_VENDA", "PACK_DATA_MAX"]].max(axis=1)
+        _num = df_met["DPM_NUM"] + df_met["PACK_DPM_NUM"]
+        _den = df_met["DPM_DEN"] + df_met["PACK_DPM_DEN"]
+        df_met["TEMPO_MEDIO_ESTOQUE"] = np.where(_den > 0, _num / _den.replace(0, np.nan), np.nan)
+        df_met = df_met.drop(columns=[c for c in df_met.columns if c.startswith("PACK_")])
+        print(f"  - Estatísticas do pacote combinadas: {len(df_met) - n_antes} produtos "
+              f"só com histórico congelado (sem venda na janela raw).")
     
     # ==========================================
     # ADICIONAR PRODUTOS QUE SÓ TÊM ENTRADAS (SEM VENDAS)
@@ -2967,8 +3032,12 @@ def run_job():
     import empacotamento as emp
     hoje_ts = pd.Timestamp.today().normalize()
 
-    # === MODO EMPACOTAMENTO (Fase 2, gated por EMPAC_ENABLED) ===
-    emp_on = os.getenv("EMPAC_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    # === MODO EMPACOTAMENTO (Fase 2) — LIGADO por padrão ===
+    # Corte rolante de 12 meses (EMPAC_JANELA_MESES): o ERP só é lido na janela
+    # de garantia contra retroativos; o resto vem do pacote no Mongo.
+    # 1ª execução (pacote vazio) = BACKFILL: carga completa FATIADA por ano,
+    # uma única vez; depois toda execução lê só ~12 meses.
+    emp_on = os.getenv("EMPAC_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
     pack_store = None
     packs_docs = {}        # {pro_codigo: {corte, camadas, vendas_mensais}}
     packs_cam = {}         # {pro_codigo: [{data_compra, qtd}]}  -> semeia o motor FIFO
@@ -3058,11 +3127,14 @@ def run_job():
     # Sazonalidade: no modo incremental, traz os meses congelados do pacote.
     vendas_mensais_extra = (emp.vendas_mensais_subgrupo(packs_docs, df_saldo_produto)
                             if modo_incremental else None)
+    # Estatísticas vitalícias congeladas (nº vendas, datas, tempo em estoque)
+    pack_stats = (emp.stats_por_produto(packs_docs) if modo_incremental else None)
 
     # 4) Metricas
     df_metricas = calcular_metricas_e_classificar(
         df_sai_fifo, df_ent_valid, df_saldo_produto, df_vp,
-        vendas_mensais_extra=vendas_mensais_extra)
+        vendas_mensais_extra=vendas_mensais_extra,
+        pack_stats=pack_stats)
     
     # === ETAPA NOVA: Calcular Idade Média do Saldo Atual e Classificar ===
     # Agrupar df_long por produto para calcular weighted average age

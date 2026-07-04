@@ -59,6 +59,30 @@ flowchart LR
 > ⚠️ A nuvem não alcança a intranet diretamente; o worker roda onde alcança o
 > SQL Server. A conexão Postgres normaliza `postgres://` → `postgresql://`.
 
+### 1.1 Empacotamento (ligado por padrão)
+
+O ERP tem ~1 milhão de linhas de saída desde 2005 — reler tudo a cada execução
+trava o linked server. O worker então usa **corte rolante de 12 meses**
+(`EMPAC_JANELA_MESES`): tudo anterior ao corte fica **congelado no Mongo**
+(pacote) e só a janela de 12m é relida do ERP (~80 mil linhas). 12 meses é o
+período de garantia contra lançamentos retroativos — para trás disso o ERP não
+muda — e cobre exatamente a janela de demanda do modelo, então **demanda, σ,
+ABC, margem e padrão SBC saem 100% do dado cru** (resultado idêntico ao da
+carga completa; equivalência testada).
+
+O pacote guarda, por produto:
+- **camadas FIFO** abertas no corte (viram o estado inicial do motor);
+- **vendas mensais congeladas** (alimentam a sazonalidade de 5 anos por subgrupo);
+- **estatísticas vitalícias**: nº de vendas, quantidade, datas primeira/última
+  venda e tempo médio em estoque — combinadas com a janela para o portão de
+  pouco-histórico (>10 vendas), a regra de produto velho (>240d) e a categoria
+  de estocagem não mudarem com a janela curta.
+
+**1ª execução (pacote vazio) = BACKFILL**: carga completa **fatiada por ano**
+(cada fatia ~50 mil linhas, sem travar), grava o pacote e nunca mais relê o
+histórico. A cada run o corte avança sozinho (fold dos meses que saíram da
+janela). `EMPAC_ENABLED=0` desliga (volta à carga completa fatiada).
+
 ---
 
 ## 2. Metodologia de cálculo
