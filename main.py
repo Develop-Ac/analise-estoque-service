@@ -778,8 +778,27 @@ def carregar_dados_do_banco(corte=None):
     ')
     """
 
-    sql_saidas_geral = _sql_saidas(data_ini)
-    sql_entradas = _sql_entradas(data_ini)
+    def _ler_fatiado(builder, nome, ini_str, passo_meses):
+        """
+        Lê saídas/entradas em FATIAS de `passo_meses`. Medido no ambiente real:
+        uma fatia de ~20k linhas transfere em ~1,5s; a janela inteira numa única
+        OPENQUERY passa de 10 minutos (o linked server engasga com resultset
+        grande). A 1ª fatia paga ~1-2min de aquecimento do linked server.
+        """
+        ini_ts = pd.Timestamp(ini_str)
+        hoje_ts = pd.Timestamp.today().normalize()
+        marcos = [ini_ts]
+        while marcos[-1] < hoje_ts:
+            marcos.append(marcos[-1] + pd.DateOffset(months=passo_meses))
+        partes = []
+        for a, b in zip(marcos[:-1], marcos[1:]):
+            fim = b.strftime("%Y-%m-%d") if b < hoje_ts else None
+            p = pd.read_sql(builder(a.strftime("%Y-%m-%d"), fim), conn)
+            partes.append(p)
+            print(f"  - {nome} {a.date()}..{fim or 'hoje'}: {len(p)} linhas")
+        if not partes:
+            return pd.DataFrame()
+        return pd.concat(partes, ignore_index=True)
 
     sql_devolucoes = """
     SELECT * FROM OPENQUERY(CONSULTA, '
@@ -842,25 +861,12 @@ def carregar_dados_do_banco(corte=None):
     ')
     """
 
-    print("\nLendo dados do banco via ODBC...")
+    print("\nLendo dados do banco via ODBC (fatiado)...")
 
-    if corte:
-        df_saidas = pd.read_sql(sql_saidas_geral, conn)
-        df_ent = pd.read_sql(sql_entradas, conn)
-    else:
-        # Carga completa (backfill do pacote): FATIADA por ano para não travar.
-        ano_fim = datetime.date.today().year
-        partes_s, partes_e = [], []
-        for ano in range(2005, ano_fim + 1):
-            ini = f"{ano}-01-01"
-            fim = f"{ano + 1}-01-01" if ano < ano_fim else None
-            ps = pd.read_sql(_sql_saidas(ini, fim), conn)
-            pe = pd.read_sql(_sql_entradas(ini, fim), conn)
-            partes_s.append(ps)
-            partes_e.append(pe)
-            print(f"  - fatia {ano}: {len(ps)} saídas, {len(pe)} entradas")
-        df_saidas = pd.concat(partes_s, ignore_index=True)
-        df_ent = pd.concat(partes_e, ignore_index=True)
+    # TODA carga é fatiada: janela incremental em trimestres, backfill em anos.
+    passo = 3 if corte else 12
+    df_saidas = _ler_fatiado(_sql_saidas, "saídas", data_ini, passo)
+    df_ent = _ler_fatiado(_sql_entradas, "entradas", data_ini, passo)
 
     df_dev         = pd.read_sql(sql_devolucoes,    conn)
     df_saldo_produto = pd.read_sql(sql_saldo_produto, conn)
