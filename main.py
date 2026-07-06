@@ -516,6 +516,14 @@ def criar_tabela_postgres():
             ALTER TABLE com_fifo_completo ADD COLUMN marca_linha SMALLINT;
         END IF;
 
+        -- ===== Preços de venda do cadastro (tabela 1 = varejo, tabela 2 = atacado especial) =====
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='preco_venda_1') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN preco_venda_1 DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='preco_venda_2') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN preco_venda_2 DECIMAL(15,4);
+        END IF;
+
         -- ===== Originais (encomenda) + cálculo consolidado por grupo (descrição) =====
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='sob_encomenda') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN sob_encomenda BOOLEAN DEFAULT FALSE;
@@ -822,6 +830,8 @@ def carregar_dados_do_banco(corte=None):
             pro.referencia AS PRO_REFERENCIA,
             pro.estoque_disponivel,
             pro.preco_custo AS CUSTO_CADASTRO,
+            pro.preco_venda AS PRECO_VENDA_1,   -- tabela 1 = varejo (PRECO1 do ERP fica vazio; o varejo mora em PRECO_VENDA)
+            pro.preco2 AS PRECO_VENDA_2,        -- tabela 2 = atacado especial
             mar.mar_descricao,
             f1.for_nome AS fornecedor1,
             f2.for_nome AS fornecedor2,
@@ -895,6 +905,10 @@ def carregar_dados_do_banco(corte=None):
         "ESTOQUE_DISPONIVEL":  "ESTOQUE_DISPONIVEL",
         "custo_cadastro":      "CUSTO_CADASTRO",
         "CUSTO_CADASTRO":      "CUSTO_CADASTRO",
+        "preco_venda_1":       "PRECO_VENDA_1",
+        "PRECO_VENDA_1":       "PRECO_VENDA_1",
+        "preco_venda_2":       "PRECO_VENDA_2",
+        "PRECO_VENDA_2":       "PRECO_VENDA_2",
         "mar_descricao":       "MAR_DESCRICAO",
         "MAR_DESCRICAO":       "MAR_DESCRICAO",
         "subgrp_descricao":    "SGR_DESCRICAO",
@@ -1898,6 +1912,7 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     colunas_saldo = [
         "PRO_CODIGO", "PRO_DESCRICAO", "SGR_CODIGO", "SGR_DESCRICAO",
         "ESTOQUE_DISPONIVEL", "MAR_DESCRICAO", "CUSTO_CADASTRO",
+        "PRECO_VENDA_1", "PRECO_VENDA_2",
         "FORNECEDOR1", "FORNECEDOR2", "FORNECEDOR3",
     ]
     colunas_saldo = [c for c in colunas_saldo if c in df_saldo_produto.columns]
@@ -2806,6 +2821,8 @@ def salvar_metricas_postgres(df_metricas):
         'ESTOQUE_SEGURANCA': 'estoque_seguranca',
         'NIVEL_SERVICO_Z': 'nivel_servico_z',
         'CUSTO_UNIT': 'custo_unitario',
+        'PRECO_VENDA_1': 'preco_venda_1',
+        'PRECO_VENDA_2': 'preco_venda_2',
         'MARGEM_UNIT': 'margem_unitaria',
         'MARGEM_PCT': 'margem_pct',
         'TEVE_OUTLIER_APARADO': 'teve_outlier_aparado',
@@ -2873,7 +2890,7 @@ def salvar_metricas_postgres(df_metricas):
         'pro_referencia',
         'demanda_real_dia', 'sigma_demanda_dia', 'cv_demanda', 'mean_size_mes', 'cv2_tamanho', 'classe_xyz',
         'estoque_seguranca', 'nivel_servico_z', 'lead_time_dias',
-        'custo_unitario', 'margem_unitaria', 'margem_pct',
+        'custo_unitario', 'preco_venda_1', 'preco_venda_2', 'margem_unitaria', 'margem_pct',
         'teve_outlier_aparado', 'outlier_qtd_aparada', 'outlier_motivo',
         'nivel_servico_custo', 'z_custo', 'estoque_min_custo', 'estoque_max_custo', 'estoque_seg_custo',
         'venda_perdida_12m', 'valor_vendido_12m',

@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import HTMLResponse, StreamingResponse
 import io
+import math
 import pandas as pd
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, text
@@ -24,6 +25,12 @@ SQL_DATABASE = os.getenv('SQL_DATABASE', 'master')
 SQL_USER = os.getenv('SQL_USER', 'sa')
 SQL_PASSWORD = os.getenv('SQL_PASSWORD', 'senha_secreta')
 TDS_VERSION = os.getenv('TDS_VERSION', '7.4')
+
+# Fornecedor "do produto" para filtros: principal do HISTÓRICO de compra (Mongo,
+# gravado pelo worker), com fallback no fornecedor 1 do cadastro. A MESMA
+# expressão é usada na variável {{fornecedor}} dos cards do Metabase — o drill
+# do painel soma exatamente o card.
+FORN_EXPR = "COALESCE(NULLIF(fornecedor_principal,''), fornecedor1)"
 
 # ==========================================
 # SETUP
@@ -239,6 +246,11 @@ class AnaliseItem(BaseModel):
     valor_estoque: Optional[float] = None            # estoque × custo unitário (R$)
     custo_manter_acumulado: Optional[float] = None   # valor × HOLDING_RATE × idade média/365 (R$)
 
+    # Preços do cadastro (ERP) + desconto sugerido para promoção
+    preco_venda_1: Optional[float] = None            # tabela 1 — varejo
+    preco_venda_2: Optional[float] = None            # tabela 2 — atacado especial
+    desconto_sugerido_pct: Optional[float] = None    # % sugerido sobre o preço 1 (varejo)
+
 class PaginatedResponse(BaseModel):
     data: List[AnaliseItem]
     total: int
@@ -254,7 +266,9 @@ class SimulationRequest(BaseModel):
     coverage_days: int
 
 class PromoPlanRequest(BaseModel):
-    days: int = 60
+    # days=None (padrão): excesso medido contra o MÁXIMO SUGERIDO oficial do
+    # cálculo (tempo padrão por curva). Informar days só para simular outra cobertura.
+    days: Optional[int] = None
     subgroups: Optional[List[str]] = None
     brands: Optional[List[str]] = None
     categories: Optional[List[str]] = None
@@ -370,12 +384,35 @@ def planejar_promocao(req: PromoPlanRequest):
         print(f"Erro promo plan: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+def _desconto_promocao(custo, preco, categoria):
+    """% de desconto sugerido para a promoção, sobre o preço 1 (varejo).
+
+    Regra: consome uma fração da margem sobre o preço conforme a urgência de
+    desova do saldo (Obsoleto 80% da margem, Lento 60%, demais 40%), arredonda
+    para baixo em múltiplos de 5% (comercial) e trava em 60%. Por construção o
+    preço final nunca fica abaixo do custo (fração < 100% da margem)."""
+    try:
+        c = float(custo or 0)
+        p = float(preco or 0)
+    except (TypeError, ValueError):
+        return None
+    if c <= 0 or p <= 0 or p <= c:
+        return None
+    margem_sobre_preco = (p - c) / p
+    fator = {"OBSOLETO": 0.8, "LENTO": 0.6}.get((categoria or "").strip().upper(), 0.4)
+    pct = margem_sobre_preco * fator * 100.0
+    if pct >= 5.0:
+        pct = math.floor(pct / 5.0) * 5.0
+    else:
+        pct = round(pct, 1)
+    return min(pct, 60.0)
+
 def _get_promotion_data(req: PromoPlanRequest):
     conn = get_db_connection()
     try:
         # 1. Filtros Basicos
         filters = ["data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)"]
-        params = {"days": float(req.days)}
+        params = {}
         
         if req.subgroups:
             sgs = [s.strip() for s in req.subgroups if s.strip()]
@@ -398,28 +435,38 @@ def _get_promotion_data(req: PromoPlanRequest):
                 for k, v in zip(cat_keys, cats): params[k] = v
                 filters.append(f"categoria_saldo_atual IN ({','.join([':'+k for k in cat_keys])})")
 
-        # 2. Logica de Calculo de Excesso (com base nos dias)
-        
+        # 2. Logica de Calculo de Excesso
+        #    Sem days (padrão): excesso = estoque acima do máximo sugerido OFICIAL
+        #    (tempo padrão do cálculo). Com days: escala o máximo pela cobertura.
+
         # Ref Dias Expression (Same as listar_analise)
         indiv_ref_expr = """
-            (CASE 
-                WHEN sgr_codigo = 154 THEN 
+            (CASE
+                WHEN sgr_codigo = 154 THEN
                     (CASE WHEN curva_abc = 'A' THEN 120.0 WHEN curva_abc = 'B' THEN 180.0 ELSE 240.0 END)
-                ELSE 
+                ELSE
                     (CASE WHEN curva_abc = 'A' THEN 60.0 WHEN curva_abc = 'B' THEN 90.0 ELSE 120.0 END)
             END)
         """
-        
+
+        if req.days and req.days > 0:
+            params["days"] = float(req.days)
+            factor_expr = f"(:days / {indiv_ref_expr})"
+            sim_max_expr = f"CEIL(estoque_max_sugerido * (:days / {indiv_ref_expr}))"
+        else:
+            factor_expr = "1.0"
+            sim_max_expr = "CEIL(estoque_max_sugerido)"
+
         where_basic = " AND ".join(filters)
-        
+
         sql = text(f"""
             WITH base_items AS (
-                 SELECT 
+                 SELECT
                     *,
                     ({indiv_ref_expr}) as ref_days,
-                    (:days / {indiv_ref_expr}) as factor,
-                    CEIL(estoque_max_sugerido * (:days / {indiv_ref_expr})) as sim_max_individual,
-                    (estoque_disponivel - CEIL(estoque_max_sugerido * (:days / {indiv_ref_expr}))) as excess_qty
+                    {factor_expr} as factor,
+                    {sim_max_expr} as sim_max_individual,
+                    (estoque_disponivel - {sim_max_expr}) as excess_qty
                  FROM com_fifo_completo
                  WHERE data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo) -- Base consistency filter
             ),
@@ -499,6 +546,12 @@ def _get_promotion_data(req: PromoPlanRequest):
                 item['lotes_estoque'] = batches
                 item['estoque_obsoleto'] = obs_qty
 
+        # Desconto sugerido para a promoção (sobre o preço 1 — varejo)
+        for item in results:
+            item['desconto_sugerido_pct'] = _desconto_promocao(
+                item.get('custo_unitario'), item.get('preco_venda_1'),
+                item.get('categoria_saldo_atual'))
+
         return results
     finally:
         conn.close()
@@ -533,8 +586,12 @@ def exportar_promocao(req: PromoPlanRequest):
             "curva_abc": "Curva ABC",
             "categoria_saldo_atual": "Categoria",
             "estoque_disponivel": "Estoque Atual",
-            "sim_max_individual": "Máximo Simulado",
+            "sim_max_individual": "Máximo Sugerido",
             "excess_qty": "Quantidade Excedente",
+            "custo_unitario": "Custo (R$)",
+            "preco_venda_1": "Preço 1 Varejo (R$)",
+            "preco_venda_2": "Preço 2 Atacado Esp. (R$)",
+            "desconto_sugerido_pct": "Desconto Sugerido (%)",
             "sgr_descricao": "Subgrupo",
             "mar_descricao": "Marca",
             "fornecedor1": "Fornecedor"
@@ -894,6 +951,27 @@ def listar_marcas():
     finally:
         if 'conn' in locals(): conn.close()
 
+@app.get("/fornecedores")
+def listar_fornecedores():
+    """
+    Fornecedores da análise atual, para o filtro do Painel de Estoque e do
+    drill-down: principal do HISTÓRICO de compra, fallback fornecedor 1 do
+    cadastro (mesma expressão FORN_EXPR usada nos filtros e nos cards Metabase).
+    """
+    try:
+        conn = get_db_connection()
+        sql = text(
+            f"SELECT DISTINCT {FORN_EXPR} AS forn FROM com_fifo_completo "
+            f"WHERE data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo) "
+            f"AND {FORN_EXPR} IS NOT NULL ORDER BY 1"
+        )
+        rows = conn.execute(sql).fetchall()
+        return [row[0] for row in rows if row[0]]
+    except Exception as e:
+         raise HTTPException(status_code=500, detail=str(e))
+    finally:
+        if 'conn' in locals(): conn.close()
+
 @app.get("/categories")
 def listar_categorias_estocagem():
     """
@@ -1005,7 +1083,9 @@ def listar_analise(
     group_id: Optional[str] = None,
     match_type: str = "contains",
     coverage_days: Optional[int] = None,
-    grouped_view: bool = False
+    grouped_view: bool = False,
+    kpi: Optional[str] = None,
+    fornecedor: Optional[str] = None,
 ):
     try:
         conn = get_db_connection()
@@ -1025,6 +1105,27 @@ def listar_analise(
 
         # FILTER: Ensure we only fetch the latest analysis snapshot
         filters.append("data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)")
+
+        # DRILL-DOWN dos KPIs do Painel de Estoque: mesma condição SQL dos cards
+        # do dashboard Metabase — a lista soma EXATAMENTE o valor exibido no card.
+        KPI_FILTERS = {
+            "excesso": ("(estoque_max_sugerido > 0 AND estoque_disponivel > estoque_max_sugerido "
+                        "AND COALESCE(custo_unitario,0) > 0)"),
+            "capital_parado": ("(estoque_disponivel > 0 "
+                               "AND categoria_saldo_atual IN ('Lento','Obsoleto'))"),
+            "ruptura": ("(COALESCE(estoque_disponivel,0) <= 0 AND COALESCE(demanda_real_dia,0) > 0 "
+                        "AND COALESCE(sob_encomenda,false) = false)"),
+            "venda_perdida": "(COALESCE(venda_perdida_12m,0) > 0)",
+        }
+        if kpi:
+            cond = KPI_FILTERS.get(kpi.strip().lower())
+            if cond:
+                filters.append(cond)
+
+        # Filtro de fornecedor (mesma expressão do {{fornecedor}} dos cards)
+        if fornecedor:
+            filters.append(f"{FORN_EXPR} = :fornecedor")
+            params["fornecedor"] = fornecedor
 
         if group_id:
             filters.append("group_id = :group_id")
@@ -1443,7 +1544,9 @@ def exportar_analise(
     status: Optional[str] = None,
     coverage_days: int = 0,  # Novo Parametro
     group_id: Optional[str] = None,
-    match_type: str = "contains"
+    match_type: str = "contains",
+    kpi: Optional[str] = None,
+    fornecedor: Optional[str] = None,
 ):
     try:
         conn = get_db_connection()
@@ -1453,7 +1556,24 @@ def exportar_analise(
     try:
         where_clauses = ["1=1"]
         params = {}
-        
+
+        # Drill-down dos KPIs do painel (mesmas condições do listar_analise)
+        _KPI_FILTERS = {
+            "excesso": ("(estoque_max_sugerido > 0 AND estoque_disponivel > estoque_max_sugerido "
+                        "AND COALESCE(custo_unitario,0) > 0)"),
+            "capital_parado": ("(estoque_disponivel > 0 "
+                               "AND categoria_saldo_atual IN ('Lento','Obsoleto'))"),
+            "ruptura": ("(COALESCE(estoque_disponivel,0) <= 0 AND COALESCE(demanda_real_dia,0) > 0 "
+                        "AND COALESCE(sob_encomenda,false) = false)"),
+            "venda_perdida": "(COALESCE(venda_perdida_12m,0) > 0)",
+        }
+        if kpi and _KPI_FILTERS.get(kpi.strip().lower()):
+            where_clauses.append(_KPI_FILTERS[kpi.strip().lower()])
+
+        if fornecedor:
+            where_clauses.append(f"{FORN_EXPR} = :fornecedor")
+            params["fornecedor"] = fornecedor
+
         if search:
             if match_type == "exact":
                 where_clauses.append("(pro_codigo = :search OR pro_descricao = :search_desc)")
