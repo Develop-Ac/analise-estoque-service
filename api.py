@@ -2199,7 +2199,8 @@ def get_fornecedor_parametros(force=False):
     Parâmetros de compra por fornecedor (com_fornecedor_parametros, preenchidos na
     tela /compras/fornecedores). Casamento por NOME normalizado — o mesmo nome do
     histórico de compra (Mongo). Retorna:
-      {FOR_NOME_UPPER: {"lead_time_dias", "tempo_revisao_dias", "pedido_minimo_valor"}}
+      {FOR_NOME_UPPER: {"lead_time_dias", "tempo_revisao_dias", "pedido_minimo_valor",
+                        "pedido_minimo_qtd"}}
     Vazio se a tabela não existir ainda (tolerante a schema antigo).
     """
     now = _time.time()
@@ -2211,8 +2212,9 @@ def get_fornecedor_parametros(force=False):
         conn = get_db_connection()
         try:
             rows = conn.execute(text(
-                "SELECT for_nome, lead_time_dias, tempo_revisao_dias, pedido_minimo_valor "
-                "FROM com_fornecedor_parametros"
+                # SELECT * p/ tolerar a coluna pedido_minimo_qtd ausente
+                # (SQL manual 2026-07-06 ainda não aplicado) — .get() devolve None.
+                "SELECT * FROM com_fornecedor_parametros"
             )).mappings().all()
         finally:
             conn.close()
@@ -2227,6 +2229,7 @@ def get_fornecedor_parametros(force=False):
                 "lead_time_dias": _pos(r.get("lead_time_dias")),
                 "tempo_revisao_dias": _pos(r.get("tempo_revisao_dias")),
                 "pedido_minimo_valor": _pos(r.get("pedido_minimo_valor")),
+                "pedido_minimo_qtd": _pos(r.get("pedido_minimo_qtd")),
             }
     except Exception as e:
         print(f"AVISO: com_fornecedor_parametros indisponível ({e}).")
@@ -2904,17 +2907,22 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
         itens_sem_custo = sum(1 for x in its if not x.get("valor_estimado"))
         pf = params_forn.get(_sug_norm(f).upper()) or {}
         ped_min = pf.get("pedido_minimo_valor")
+        ped_min_qtd = pf.get("pedido_minimo_qtd")
+        qtd_total = sum(x["qtd_sugerida"] for x in its)
         fornecedores.append({
             "fornecedor": f,
             "qtd_itens": len(its),
-            "qtd_total_sugerida": sum(x["qtd_sugerida"] for x in its),
+            "qtd_total_sugerida": qtd_total,
             "valor_total_estimado": valor_total,
             "itens_sem_custo": itens_sem_custo,
             "lead_time_dias": pf.get("lead_time_dias"),
             "tempo_revisao_dias": pf.get("tempo_revisao_dias"),
             "pedido_minimo_valor": ped_min,
+            "pedido_minimo_qtd": ped_min_qtd,
             # só alerta quando há custo para comparar (valor_total > 0)
             "abaixo_pedido_minimo": bool(ped_min and valor_total > 0 and valor_total < ped_min),
+            # mínimo em QUANTIDADE: compara a soma das unidades sugeridas
+            "abaixo_pedido_minimo_qtd": bool(ped_min_qtd and qtd_total > 0 and qtd_total < ped_min_qtd),
             "itens": its,
         })
     fornecedores.sort(key=lambda x: -x["qtd_itens"])
