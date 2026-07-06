@@ -2243,31 +2243,35 @@ _FORN_GRUPO_CACHE = {"ts": 0.0, "data": None}
 _FORN_GRUPO_TTL_S = int(os.getenv("FORN_GRUPO_TTL_S") or 600)  # 10min
 
 
-def get_grupos_fornecedor(force=False):
+def _carregar_grupos_fornecedor(force=False):
     """
     Fornecedores RELACIONADOS (matriz/filiais — com_fornecedor_relacionamento,
     módulo fornecedor-grupo do compras, tela /compras/fornecedores). A tabela é
     por for_codigo; os NOMES vêm do cadastro do ERP (empresa 3) via OPENQUERY.
-    Retorna {NOME_UPPER: [nomes UPPER de TODO o grupo]}.
+    Cacheia DOIS mapas:
+      grupos:    {NOME_UPPER: [nomes UPPER de TODO o grupo]}
+      principal: {NOME_UPPER: NOME_UPPER do fornecedor PRINCIPAL do grupo
+                  (flag `principal` da tabela; fallback = 1º em ordem alfabética)}
     """
     now = _time.time()
     cached = _FORN_GRUPO_CACHE.get("data")
     if not force and cached is not None and (now - _FORN_GRUPO_CACHE["ts"]) < _FORN_GRUPO_TTL_S:
         return cached
-    out = {}
+    out = {"grupos": {}, "principal": {}}
     try:
         conn = get_db_connection()
         try:
             rows = conn.execute(text(
-                "SELECT group_id, for_codigo FROM com_fornecedor_relacionamento"
+                "SELECT group_id, for_codigo, COALESCE(principal, false) "
+                "FROM com_fornecedor_relacionamento"
             )).fetchall()
         finally:
             conn.close()
 
         grupos = {}
-        for gid, cod in rows:
+        for gid, cod, prin in rows:
             try:
-                grupos.setdefault(str(gid), []).append(int(cod))
+                grupos.setdefault(str(gid), []).append((int(cod), bool(prin)))
             except (TypeError, ValueError):
                 pass
 
@@ -2291,18 +2295,30 @@ def get_grupos_fornecedor(force=False):
                 sconn.close()
 
         for cods in grupos.values():
-            ns = sorted({nomes[c] for c in cods if c in nomes})
+            ns = sorted({nomes[c] for c, _ in cods if c in nomes})
             if len(ns) < 2:
                 continue
+            prin_nome = next((nomes[c] for c, p in cods if p and c in nomes), None) or ns[0]
             for n in ns:
-                out.setdefault(n, set()).update(ns)
-        out = {k: sorted(v) for k, v in out.items()}
+                out["grupos"].setdefault(n, set()).update(ns)
+                out["principal"][n] = prin_nome
+        out["grupos"] = {k: sorted(v) for k, v in out["grupos"].items()}
     except Exception as e:
         print(f"AVISO: fornecedores relacionados indisponíveis ({e}).")
-        out = {}
+        out = {"grupos": {}, "principal": {}}
     _FORN_GRUPO_CACHE["ts"] = now
     _FORN_GRUPO_CACHE["data"] = out
     return out
+
+
+def get_grupos_fornecedor(force=False):
+    """{NOME_UPPER: [nomes UPPER do grupo]} — ver _carregar_grupos_fornecedor."""
+    return _carregar_grupos_fornecedor(force)["grupos"]
+
+
+def get_fornecedor_principal_map(force=False):
+    """{NOME_UPPER: NOME_UPPER do PRINCIPAL do grupo} — só p/ quem está em grupo."""
+    return _carregar_grupos_fornecedor(force)["principal"]
 
 
 def _expandir_fornecedores(nomes):
@@ -2546,7 +2562,7 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
 def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo=True,
                            usar_estoque_realtime=True, fornecedor=None, curva=None,
                            subgrupo=None, apenas_zerados=False, incluir_sem_historico=False,
-                           params_forn=None, marca=None):
+                           params_forn=None, marca=None, grupos_forn=None, principal_forn=None):
     """
     Transforma as linhas de com_fifo_completo (1 por produto/marca) na sugestão de
     compra agrupada por fornecedor. FUNÇÃO PURA — usada pelo endpoint e pela validação.
@@ -2570,6 +2586,24 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
     usar_rt = usar_estoque_realtime and bool(stock_map)
     historico = historico or {}
     params_forn = params_forn or {}
+    grupos_forn = grupos_forn or {}        # {NOME_UPPER: [nomes do grupo]}
+    principal_forn = principal_forn or {}  # {NOME_UPPER: NOME do principal}
+
+    def _canon_forn(nome):
+        """Fornecedor VINCULADO (grupo do compras) aparece como o PRINCIPAL —
+        blocos de matriz/filiais são consolidados num só."""
+        if not nome or nome == SEM_HIST_COMPRA:
+            return nome
+        return principal_forn.get(_sug_norm(nome).upper()) or nome
+
+    def _forn_match(nome, termo_lower):
+        """Busca por fornecedor respeita o grupo: o termo casa com o nome OU com
+        qualquer fornecedor relacionado a ele."""
+        if termo_lower in nome.lower():
+            return True
+        return any(termo_lower in m.lower()
+                   for m in grupos_forn.get(_sug_norm(nome).upper(), []))
+
     curvas_filtro = [c.strip().upper() for c in curva.split(",")] if curva else None
     subs_filtro = [s.strip().lower() for s in subgrupo.split(",")] if subgrupo else None
     marcas_filtro = ([m.strip().upper() for m in marca.split(",") if m.strip()]
@@ -2666,8 +2700,9 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
         all_forns = [n for n, _ in h]
         top = all_forns[0] if all_forns else SEM_HIST_COMPRA
         if fornecedor:
-            # filtro casa se o termo está em QUALQUER fornecedor já comprado do item
-            casado = next((n for n in all_forns if fornecedor.lower() in n.lower()), None)
+            # filtro casa se o termo está em QUALQUER fornecedor já comprado do
+            # item — ou em algum RELACIONADO dele (grupo matriz/filiais)
+            casado = next((n for n in all_forns if _forn_match(n, fornecedor.lower())), None)
             if not casado:
                 return
             bucket = casado
@@ -2675,6 +2710,7 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             bucket = top
         if bucket == SEM_HIST_COMPRA and not incluir_sem_historico:
             return  # produto nunca comprado -> fora da lista
+        bucket = _canon_forn(bucket)  # vinculados aparecem sob o PRINCIPAL
         memoria_item = montar_memoria_calculo(
             escopo="item", minimo=ponto, maximo=maximo,
             curva=curva_item, classe=it.get("classe_xyz"), metodo=it.get("metodo_reposicao"),
@@ -2820,9 +2856,10 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             primario = max(sup_qty.items(), key=lambda kv: kv[1])[0] if sup_qty else SEM_HIST_COMPRA
             todos_forns_grupo = set(sup_qty.keys())  # p/ filtro: tudo já comprado no grupo
 
-            # filtro/bucket: se filtrado, casa contra TUDO que já compramos do grupo
+            # filtro/bucket: se filtrado, casa contra TUDO que já compramos do
+            # grupo — inclusive os fornecedores RELACIONADOS (matriz/filiais)
             if fornecedor:
-                casado = next((n for n in sorted(todos_forns_grupo) if fornecedor.lower() in n.lower()), None)
+                casado = next((n for n in sorted(todos_forns_grupo) if _forn_match(n, fornecedor.lower())), None)
                 if not casado:
                     continue
                 bucket = casado
@@ -2830,6 +2867,7 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 bucket = primario
             if bucket == SEM_HIST_COMPRA and not incluir_sem_historico:
                 continue  # grupo sem histórico de compra -> fora da lista
+            bucket = _canon_forn(bucket)  # vinculados aparecem sob o PRINCIPAL
 
             sgr = gsgr
             # custo unitário do grupo = média ponderada pela demanda das marcas
@@ -3036,8 +3074,17 @@ def _codigos_candidatos(items, historico, curva, subgrupo, fornecedor, consolida
                 extra |= por_desc[d]
         return codes_sel | extra
 
+    # busca por fornecedor respeita o GRUPO (matriz/filiais): o termo casa com o
+    # nome do histórico OU com qualquer fornecedor relacionado a ele
+    _grupos_f = get_grupos_fornecedor() if forn else {}
+
+    def _forn_nome_ok(n):
+        if forn in n.lower():
+            return True
+        return any(forn in m.lower() for m in _grupos_f.get(_sug_norm(n).upper(), []))
+
     def forn_ok(cod):
-        return (not forn) or any(forn in n.lower() for n, _ in historico.get(_sug_norm(cod), []))
+        return (not forn) or any(_forn_nome_ok(n) for n, _ in historico.get(_sug_norm(cod), []))
 
     def sub_ok(sgr):
         return (not subs) or (_sug_norm(sgr).lower() in subs)
@@ -3165,6 +3212,8 @@ def sugestao_compra(
         incluir_sem_historico=incluir_sem_historico,
         params_forn=get_fornecedor_parametros(),
         marca=marca,
+        grupos_forn=get_grupos_fornecedor(),
+        principal_forn=get_fornecedor_principal_map(),
     )
 
 
