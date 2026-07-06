@@ -257,6 +257,9 @@ class PaginatedResponse(BaseModel):
     page: int
     limit: int
     total_pages: int
+    # Somas do FILTRO ATUAL (where completo, não só a página)
+    capital_total: Optional[float] = None   # Σ estoque × custo (itens com estoque > 0)
+    cme_total: Optional[float] = None       # Σ CME acumulado (mesma fórmula do painel)
 
 class GroupRequest(BaseModel):
     pro_codigos: List[str]
@@ -972,6 +975,16 @@ def listar_fornecedores():
     finally:
         if 'conn' in locals(): conn.close()
 
+@app.get("/fornecedores/expandir")
+def expandir_fornecedores_endpoint(nomes: str = ""):
+    """
+    Expande nomes de fornecedores ('||'-separados) incluindo os RELACIONADOS
+    (grupo matriz/filiais do compras). Retorna nomes em UPPER — o painel usa
+    o resultado para filtrar os cards do Metabase com o mesmo conjunto do /analise.
+    """
+    lista = [n for n in (nomes or "").split("||") if n.strip()]
+    return _expandir_fornecedores(lista)
+
 @app.get("/categories")
 def listar_categorias_estocagem():
     """
@@ -1122,10 +1135,16 @@ def listar_analise(
             if cond:
                 filters.append(cond)
 
-        # Filtro de fornecedor (mesma expressão do {{fornecedor}} dos cards)
+        # Filtro de fornecedor (mesma expressão do {{fornecedor}} dos cards):
+        # aceita vários nomes separados por '||' e EXPANDE para os fornecedores
+        # RELACIONADOS (grupo matriz/filiais do compras).
         if fornecedor:
-            filters.append(f"{FORN_EXPR} = :fornecedor")
-            params["fornecedor"] = fornecedor
+            nomes_f = _expandir_fornecedores([n for n in fornecedor.split("||") if n.strip()])
+            if nomes_f:
+                fkeys = {f"forn_{i}": n for i, n in enumerate(nomes_f)}
+                params.update(fkeys)
+                keys = ", ".join(f":{k}" for k in fkeys)
+                filters.append(f"UPPER(TRIM({FORN_EXPR})) IN ({keys})")
 
         if group_id:
             filters.append("group_id = :group_id")
@@ -1273,6 +1292,26 @@ def listar_analise(
                 "limit": limit,
                 "total_pages": 0
             }
+
+        # Somas do FILTRO ATUAL (todas as linhas do where, não só a página):
+        # capital = Σ estoque×custo (estoque>0) e CME acumulado — MESMAS fórmulas
+        # dos cards do painel, para os números conversarem entre as abas.
+        capital_total = cme_total = None
+        try:
+            _hold_tot = float(os.getenv("HOLDING_RATE_ANUAL") or 0.25)
+            tot_row = conn.execute(text(f"""
+                SELECT
+                  COALESCE(SUM(CASE WHEN estoque_disponivel > 0
+                      THEN COALESCE(estoque_disponivel,0) * COALESCE(custo_unitario,0) ELSE 0 END), 0),
+                  COALESCE(SUM(CASE WHEN estoque_disponivel > 0
+                      THEN COALESCE(estoque_disponivel,0) * COALESCE(custo_unitario,0)
+                           * :hold_tot * GREATEST(COALESCE(tempo_medio_saldo_atual,0),0) / 365.0 ELSE 0 END), 0)
+                FROM com_fifo_completo WHERE {where_clause}
+            """), {**params, "hold_tot": _hold_tot}).fetchone()
+            capital_total = round(float(tot_row[0] or 0), 2)
+            cme_total = round(float(tot_row[1] or 0), 2)
+        except Exception as e:
+            print(f"AVISO: totais capital/CME do filtro indisponíveis: {e}")
         
         # Query Dados
         data_sql = text(f"""
@@ -1524,7 +1563,9 @@ def listar_analise(
             "total": total,
             "page": page,
             "limit": limit,
-            "total_pages": total_pages
+            "total_pages": total_pages,
+            "capital_total": capital_total,
+            "cme_total": cme_total
         }
     except Exception as e:
         print(f"ERRO GERAL API: {e}")
@@ -1571,8 +1612,12 @@ def exportar_analise(
             where_clauses.append(_KPI_FILTERS[kpi.strip().lower()])
 
         if fornecedor:
-            where_clauses.append(f"{FORN_EXPR} = :fornecedor")
-            params["fornecedor"] = fornecedor
+            nomes_f = _expandir_fornecedores([n for n in fornecedor.split("||") if n.strip()])
+            if nomes_f:
+                fkeys = {f"forn_{i}": n for i, n in enumerate(nomes_f)}
+                params.update(fkeys)
+                keys = ", ".join(f":{k}" for k in fkeys)
+                where_clauses.append(f"UPPER(TRIM({FORN_EXPR})) IN ({keys})")
 
         if search:
             if match_type == "exact":
@@ -2188,6 +2233,91 @@ def get_fornecedor_parametros(force=False):
         out = {}
     _FORN_PARAM_CACHE["ts"] = now
     _FORN_PARAM_CACHE["data"] = out
+    return out
+
+
+_FORN_GRUPO_CACHE = {"ts": 0.0, "data": None}
+_FORN_GRUPO_TTL_S = int(os.getenv("FORN_GRUPO_TTL_S") or 600)  # 10min
+
+
+def get_grupos_fornecedor(force=False):
+    """
+    Fornecedores RELACIONADOS (matriz/filiais — com_fornecedor_relacionamento,
+    módulo fornecedor-grupo do compras, tela /compras/fornecedores). A tabela é
+    por for_codigo; os NOMES vêm do cadastro do ERP (empresa 3) via OPENQUERY.
+    Retorna {NOME_UPPER: [nomes UPPER de TODO o grupo]}.
+    """
+    now = _time.time()
+    cached = _FORN_GRUPO_CACHE.get("data")
+    if not force and cached is not None and (now - _FORN_GRUPO_CACHE["ts"]) < _FORN_GRUPO_TTL_S:
+        return cached
+    out = {}
+    try:
+        conn = get_db_connection()
+        try:
+            rows = conn.execute(text(
+                "SELECT group_id, for_codigo FROM com_fornecedor_relacionamento"
+            )).fetchall()
+        finally:
+            conn.close()
+
+        grupos = {}
+        for gid, cod in rows:
+            try:
+                grupos.setdefault(str(gid), []).append(int(cod))
+            except (TypeError, ValueError):
+                pass
+
+        nomes = {}
+        if grupos:
+            sconn = get_sql_connection()
+            try:
+                cur = sconn.cursor()
+                cur.execute(
+                    "SELECT * FROM OPENQUERY(CONSULTA, "
+                    "'SELECT for_codigo, for_nome FROM fornecedores WHERE empresa = 3')"
+                )
+                for cod, nome in cur.fetchall():
+                    try:
+                        n = str(nome or "").strip().upper()
+                        if n:
+                            nomes[int(cod)] = n
+                    except (TypeError, ValueError):
+                        pass
+            finally:
+                sconn.close()
+
+        for cods in grupos.values():
+            ns = sorted({nomes[c] for c in cods if c in nomes})
+            if len(ns) < 2:
+                continue
+            for n in ns:
+                out.setdefault(n, set()).update(ns)
+        out = {k: sorted(v) for k, v in out.items()}
+    except Exception as e:
+        print(f"AVISO: fornecedores relacionados indisponíveis ({e}).")
+        out = {}
+    _FORN_GRUPO_CACHE["ts"] = now
+    _FORN_GRUPO_CACHE["data"] = out
+    return out
+
+
+def _expandir_fornecedores(nomes):
+    """
+    Lista de nomes (qualquer caixa) → lista UPPER SEM duplicatas incluindo os
+    RELACIONADOS do grupo de cada um. Usada por /analise, /analise/export e
+    pelo painel (via /fornecedores/expandir) — os dois lados filtram o MESMO conjunto.
+    """
+    grupos = get_grupos_fornecedor()
+    out, vistos = [], set()
+    for n in nomes or []:
+        nu = _sug_norm(n).upper()
+        if not nu:
+            continue
+        for m in [nu] + grupos.get(nu, []):
+            if m not in vistos:
+                vistos.add(m)
+                out.append(m)
     return out
 
 
