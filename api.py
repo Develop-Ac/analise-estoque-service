@@ -1088,6 +1088,7 @@ def listar_analise(
     pro_codigos: Optional[str] = Query(None, description="Lista de códigos separados por virgula"),
     marca: Optional[str] = None,
     subgrupo: Optional[str] = None,
+    saldo_categoria: Optional[str] = Query(None, description="Faixas de idade FIFO do saldo (categoria_saldo_atual), separadas por vírgula: Rápido/Médio/Lento/Obsoleto"),
     only_changes: bool = False,
     critical: bool = False,
     curve: Optional[str] = None,
@@ -1276,7 +1277,17 @@ def listar_analise(
         if subgrupo:
             filters.append("sgr_descricao ILIKE :subgrupo")
             params["subgrupo"] = f"%{subgrupo}%"
-            
+
+        # Filtro por TEMPO EM ESTOQUE (idade FIFO do saldo atual): faixas
+        # Rápido/Médio/Lento/Obsoleto derivadas de tempo_medio_saldo_atual.
+        if saldo_categoria:
+            cats = [c.strip() for c in saldo_categoria.split(",") if c.strip()]
+            if cats:
+                cat_params = {f"saldocat_{i}": c for i, c in enumerate(cats)}
+                params.update(cat_params)
+                keys = ", ".join(f":{k}" for k in cat_params)
+                filters.append(f"categoria_saldo_atual IN ({keys})")
+
         where_clause = " AND ".join(filters) if filters else "1=1"
         
         # Query Total
@@ -1583,6 +1594,8 @@ def exportar_analise(
     curve: Optional[str] = None,
     trend: Optional[str] = None,
     status: Optional[str] = None,
+    subgrupo: Optional[str] = None,
+    saldo_categoria: Optional[str] = None,
     coverage_days: int = 0,  # Novo Parametro
     group_id: Optional[str] = None,
     match_type: str = "contains",
@@ -1687,6 +1700,19 @@ def exportar_analise(
             
             if status_conditions:
                 where_clauses.append(f"({' OR '.join(status_conditions)})")
+
+        if subgrupo:
+            where_clauses.append("sgr_descricao ILIKE :subgrupo")
+            params["subgrupo"] = f"%{subgrupo}%"
+
+        # Tempo em estoque (idade FIFO): mesmas faixas do listar_analise
+        if saldo_categoria:
+            cats = [c.strip() for c in saldo_categoria.split(",") if c.strip()]
+            if cats:
+                cat_params = {f"saldocat_{i}": c for i, c in enumerate(cats)}
+                params.update(cat_params)
+                keys = ", ".join(f":{k}" for k in cat_params)
+                where_clauses.append(f"categoria_saldo_atual IN ({keys})")
 
         where_clause = " AND ".join(where_clauses)
         
