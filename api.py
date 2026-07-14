@@ -2588,7 +2588,8 @@ def montar_memoria_calculo(*, escopo, minimo, maximo, curva, classe, metodo,
 def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo=True,
                            usar_estoque_realtime=True, fornecedor=None, curva=None,
                            subgrupo=None, apenas_zerados=False, incluir_sem_historico=False,
-                           params_forn=None, marca=None, grupos_forn=None, principal_forn=None):
+                           params_forn=None, marca=None, grupos_forn=None, principal_forn=None,
+                           pedidos_map=None):
     """
     Transforma as linhas de com_fifo_completo (1 por produto/marca) na sugestão de
     compra agrupada por fornecedor. FUNÇÃO PURA — usada pelo endpoint e pela validação.
@@ -2614,6 +2615,29 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
     params_forn = params_forn or {}
     grupos_forn = grupos_forn or {}        # {NOME_UPPER: [nomes do grupo]}
     principal_forn = principal_forn or {}  # {NOME_UPPER: NOME do principal}
+    pedidos_map = pedidos_map or {}        # {pro_codigo(str): [{numero,status,qtd}]}
+
+    def _pedidos_do(codigos):
+        """
+        Consolida os pedidos em aberto de um ou mais produtos (grupo) num só bloco:
+        junta por número de pedido (somando a qtd pendente) e devolve
+        (em_pedido, qtd_total_em_pedido, [ {numero, status, qtd} ordenado por qtd desc ]).
+        """
+        por_num = {}
+        for c in codigos:
+            for ped in pedidos_map.get(str(c), []):
+                num = ped.get("numero")
+                slot = por_num.get(num)
+                if slot is None:
+                    por_num[num] = {"numero": num, "status": ped.get("status"),
+                                    "qtd": float(ped.get("qtd") or 0)}
+                else:
+                    slot["qtd"] += float(ped.get("qtd") or 0)
+        lista = sorted(por_num.values(), key=lambda x: -x["qtd"])
+        for p in lista:
+            p["qtd"] = round(p["qtd"], 2)
+        total = round(sum(p["qtd"] for p in lista), 2)
+        return (bool(lista), total, lista)
 
     def _canon_forn(nome):
         """Fornecedor VINCULADO (grupo do compras) aparece como o PRINCIPAL —
@@ -2709,10 +2733,17 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             return
         cod, estoque, transito = _sug_posicao(it, stock_map, usar_rt)
         posicao = estoque + transito
-        if posicao > ponto:
+        em_pedido, pedido_qtd, pedidos_lst = _pedidos_do([cod])
+        # Compra-se quando o ESTOQUE REAL (sem o que está a caminho) chega ao ponto
+        # de pedido. Itens cobertos por pedido em aberto NÃO somem: aparecem com a
+        # qtd a comprar já descontada do que está em pedido (pode ir a 0) e a
+        # marcação em_pedido, para o comprador ver o que está e o que não está.
+        if estoque > ponto:
             return
         qtd = int(math.ceil(maximo - posicao))
-        if qtd <= 0:
+        if qtd < 0:
+            qtd = 0
+        if qtd <= 0 and not em_pedido:
             return
         curva_item = _sug_norm(it.get("curva_abc"))
         if not _passa_filtros_comuns(curva_item, estoque):
@@ -2789,6 +2820,9 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
             "valor_estimado": round(qtd * custo_u, 2) if custo_u > 0 else None,
             "criticidade": "Zerado" if estoque <= 0 else "Abaixo do mínimo",
             "deficit": round(ponto - posicao, 2),
+            "em_pedido": em_pedido,
+            "pedido_qtd": pedido_qtd,
+            "pedidos": pedidos_lst,
             "membros": [],
         })
 
@@ -2847,10 +2881,16 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                     "max_ind": int(_sug_float(m.get("maximo"))),
                 })
             posicao = estoque_total + transito_total
-            if posicao > ponto:
+            cods_grp = [d["pro_codigo"] for d in membros_det]
+            em_pedido, pedido_qtd, pedidos_lst = _pedidos_do(cods_grp)
+            # gatilho pelo ESTOQUE REAL do grupo (sem o em pedido); cobertos por
+            # pedido não somem — ver comentário em _tratar_individual.
+            if estoque_total > ponto:
                 continue
             qtd = int(math.ceil(maximo - posicao))
-            if qtd <= 0:
+            if qtd < 0:
+                qtd = 0
+            if qtd <= 0 and not em_pedido:
                 continue
 
             # atributos do grupo (compartilhados entre membros)
@@ -2958,6 +2998,9 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 "valor_estimado": round(qtd * custo_grp, 2) if custo_grp > 0 else None,
                 "criticidade": "Zerado" if estoque_total <= 0 else "Abaixo do mínimo",
                 "deficit": round(ponto - posicao, 2),
+                "em_pedido": em_pedido,
+                "pedido_qtd": pedido_qtd,
+                "pedidos": pedidos_lst,
                 "membros": membros_det,
             })
 
@@ -3001,6 +3044,61 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
     }
 
 
+# Status de pedido que ainda "seguram" quantidade a caminho e por isso CONTAM
+# contra a necessidade de compra (levam em conta o que já está em pedido).
+# TODOS contam a QUANTIDADE CHEIA do pedido: a mercadoria só entra no estoque do
+# ERP quando o pedido vira 'Entregue(*)' — e esse fica FORA desta lista. Enquanto
+# está Aguardando/Liberado/Faturado/Em Trânsito, a mercadoria ainda NÃO chegou
+# aqui nem entrou no estoque, então conta como "vindo" e reduz o que falta comprar
+# (não se desconta NF vínculo, que é conferência, não entrada de estoque).
+# 'Cancelado'/'Vínculo sugerido' não contam.
+# Itens com status_item='nao_atendido' (fornecedor não vai entregar) são excluídos.
+PEDIDO_STATUS_EM_ABERTO = (
+    'Aguardando analise', 'Liberado', 'Faturado', 'Faturado parcialmente',
+    'Em Trânsito', 'Em Trânsito parcialmente',
+)
+
+
+def _sql_in_list(vals):
+    """Monta a lista literal para um IN (...) de T-SQL/PG a partir de constantes."""
+    return ", ".join("'" + str(v).replace("'", "''") + "'" for v in vals)
+
+
+def _carregar_pedidos_por_produto(conn):
+    """
+    Para cada produto (pro_codigo), os PEDIDOS em aberto em que ele aparece, com
+    o status do pedido e a quantidade PEDIDA (cheia).
+
+    Mesma regra de `em_transito`: statuses de PEDIDO_STATUS_EM_ABERTO e exclui os
+    itens 'nao_atendido'. NÃO desconta NF vínculo — a mercadoria destes pedidos
+    ainda não entrou no estoque (só entra em 'Entregue', fora da lista). Usado para
+    exibir na tela "Comprar agora" o nº do pedido, o status e a qtd em pedido de
+    cada item (sem sumir com o item).
+
+    Retorna: { pro_codigo(str) -> [ {numero, status, qtd}, ... ] }
+    """
+    status_in = _sql_in_list(PEDIDO_STATUS_EM_ABERTO)
+    sql = text(f"""
+        SELECT p.pedido_cotacao AS numero, p.status AS status,
+               i.pro_codigo::text AS pro_codigo, SUM(i.quantidade) AS qtd
+        FROM com_pedido p
+        JOIN com_pedido_itens i ON i.pedido_id = p.id
+        WHERE p.status IN ({status_in})
+          AND COALESCE(i.status_item, '') <> 'nao_atendido'
+        GROUP BY p.id, p.pedido_cotacao, p.status, i.pro_codigo::text
+        HAVING SUM(i.quantidade) > 0
+    """)
+    out = {}
+    for r in conn.execute(sql).mappings().all():
+        cod = str(r["pro_codigo"])
+        out.setdefault(cod, []).append({
+            "numero": r["numero"],
+            "status": r["status"],
+            "qtd": float(r["qtd"] or 0),
+        })
+    return out
+
+
 def _carregar_itens_sugestao(conn):
     """Lê as linhas base da última análise + em trânsito (tolerante a colunas novas ausentes)."""
     existentes = {r[0] for r in conn.execute(text(
@@ -3009,6 +3107,8 @@ def _carregar_itens_sugestao(conn):
 
     def opt(c):
         return c if c in existentes else f"NULL AS {c}"
+
+    _STATUS_EM_ABERTO_IN = _sql_in_list(PEDIDO_STATUS_EM_ABERTO)
 
     sql = text(f"""
         WITH base AS (
@@ -3036,27 +3136,20 @@ def _carregar_itens_sugestao(conn):
             WHERE data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)
         ),
         pedido AS (
+            -- Quantidade CHEIA em pedido aberto (mercadoria a caminho). Não se
+            -- desconta NF vínculo: a mercadoria só entra no estoque em 'Entregue'
+            -- (fora da lista de status). Exclui itens 'nao_atendido'.
             SELECT i.pro_codigo::text AS pro_codigo, SUM(i.quantidade) AS qtd_ped
             FROM com_pedido p
             JOIN com_pedido_itens i ON i.pedido_id = p.id
-            WHERE p.status IN ('Liberado', 'Em Trânsito parcialmente')
+            WHERE p.status IN ({_STATUS_EM_ABERTO_IN})
+              AND COALESCE(i.status_item, '') <> 'nao_atendido'
             GROUP BY i.pro_codigo::text
-        ),
-        recebido AS (
-            SELECT vi.pro_codigo::text AS pro_codigo, SUM(vi.quantidade_alocada) AS qtd_rec
-            FROM com_pedido p
-            JOIN com_pedido_nfe_vinculo v ON v.pedido_id = p.id
-            JOIN com_pedido_nfe_vinculo_item vi ON vi.vinculo_id = v.id
-            WHERE p.status IN ('Liberado', 'Em Trânsito parcialmente')
-              AND COALESCE(v.confirmado, false) = true
-              AND COALESCE(v.rejeitado, false) = false
-            GROUP BY vi.pro_codigo::text
         )
         SELECT b.*,
-               GREATEST(COALESCE(ped.qtd_ped,0) - COALESCE(rec.qtd_rec,0), 0) AS em_transito
+               COALESCE(ped.qtd_ped, 0) AS em_transito
         FROM base b
-        LEFT JOIN pedido   ped ON ped.pro_codigo = b.pro_codigo::text
-        LEFT JOIN recebido rec ON rec.pro_codigo = b.pro_codigo::text
+        LEFT JOIN pedido ped ON ped.pro_codigo = b.pro_codigo::text
     """)
     return [dict(r) for r in conn.execute(sql).mappings().all()]
 
@@ -3194,6 +3287,7 @@ def sugestao_compra(
     conn = get_db_connection()
     try:
         items = _carregar_itens_sugestao(conn)
+        pedidos_map = _carregar_pedidos_por_produto(conn)
     finally:
         conn.close()
 
