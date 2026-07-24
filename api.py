@@ -1347,7 +1347,7 @@ def listar_analise(
                 venda_perdida_12m, valor_vendido_12m,
                 padrao_demanda, metodo_reposicao, fator_sazonal, demanda_planejamento_dia,
                 mean_size_mes, cv2_tamanho,
-                grupo_chave, grupo_estoque_min, grupo_estoque_max, grupo_demanda_dia,
+                grupo_chave, grupo_estoque_min, grupo_estoque_max, grupo_qtd_itens, grupo_demanda_dia,
                 grupo_estoque_seguranca, grupo_curva, grupo_metodo, grupo_fator_sazonal,
                 grupo_mean_size, grupo_cv2,
                 custo_unitario, margem_unitaria, margem_pct,
