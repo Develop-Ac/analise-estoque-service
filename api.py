@@ -2726,10 +2726,13 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
     def _registrar(bucket, rec):
         grupos.setdefault(bucket, []).append(rec)
 
-    def _tratar_individual(it):
+    def _tratar_individual(it, permitir_ponto_zero=False):
         ponto = _sug_float(it.get("ponto_pedido"))
         maximo = _sug_float(it.get("maximo"))
-        if maximo <= 0 or ponto <= 0:
+        # Avulso puro exige ponto de pedido > 0; grupo de 1 item roteado p/ cá
+        # (permitir_ponto_zero=True) aparece com máximo > 0 mesmo com mínimo 0,
+        # igual ao gate leniente do caminho de grupo — senão o item sumiria.
+        if maximo <= 0 or (ponto <= 0 and not permitir_ponto_zero):
             return
         cod, estoque, transito = _sug_posicao(it, stock_map, usar_rt)
         posicao = estoque + transito
@@ -2855,7 +2858,7 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                                 default=len(mem)) or len(mem)
             if qtd_itens_grp <= 1:
                 for m in mem:
-                    _tratar_individual(m)
+                    _tratar_individual(m, permitir_ponto_zero=True)
                 continue
             # grupo_estoque_min/max são iguais para todos os membros (vêm do merge); usa o maior por segurança
             maximo = max((_sug_float(m.get("grupo_estoque_max")) for m in mem), default=0.0)
