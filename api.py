@@ -213,6 +213,7 @@ class AnaliseItem(BaseModel):
     grupo_chave: Optional[str] = None
     grupo_estoque_min: Optional[int] = None
     grupo_estoque_max: Optional[int] = None
+    grupo_qtd_itens: Optional[int] = None
     grupo_demanda_dia: Optional[float] = None
     grupo_estoque_seguranca: Optional[int] = None
     grupo_curva: Optional[str] = None
