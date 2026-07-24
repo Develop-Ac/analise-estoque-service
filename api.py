@@ -2844,6 +2844,19 @@ def montar_sugestao_compra(items, stock_map, *, historico=None, consolidar_grupo
                 avulsos.append(it)
 
         for gk, mem in membros.items():
+            # Regra do mín/máx por tamanho do grupo:
+            #  - grupo_qtd_itens == 1 (grupo de UMA marca): não há pooling real, o
+            #    consolidado é o próprio item -> usa o mín/máx INDIVIDUAL
+            #    (estoque_min_sugerido/estoque_max_sugerido, que chegam como
+            #    ponto_pedido/maximo) e a memória individual, roteando pelo
+            #    caminho de item avulso (mantém valor e memória coerentes).
+            #  - grupo_qtd_itens  > 1: usa o consolidado (pooled) do grupo.
+            qtd_itens_grp = max((int(_sug_float(m.get("grupo_qtd_itens"))) for m in mem),
+                                default=len(mem)) or len(mem)
+            if qtd_itens_grp <= 1:
+                for m in mem:
+                    _tratar_individual(m)
+                continue
             # grupo_estoque_min/max são iguais para todos os membros (vêm do merge); usa o maior por segurança
             maximo = max((_sug_float(m.get("grupo_estoque_max")) for m in mem), default=0.0)
             ponto = max((_sug_float(m.get("grupo_estoque_min")) for m in mem), default=0.0)
@@ -3127,7 +3140,7 @@ def _carregar_itens_sugestao(conn):
                    {opt('marca_linha')},
                    {opt('sob_encomenda')}, {opt('eh_original')},
                    {opt('teve_outlier_aparado')}, {opt('outlier_qtd_aparada')}, {opt('outlier_motivo')},
-                   {opt('grupo_chave')},
+                   {opt('grupo_chave')}, {opt('grupo_qtd_itens')},
                    {opt('grupo_estoque_min')}, {opt('grupo_estoque_max')},
                    {opt('grupo_curva')}, {opt('grupo_padrao')}, {opt('grupo_metodo')},
                    {opt('grupo_demanda_dia')}, {opt('grupo_estoque_seguranca')}, {opt('grupo_fator_sazonal')},
