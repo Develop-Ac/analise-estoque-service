@@ -3261,28 +3261,12 @@ def _codigos_candidatos(items, historico, curva, subgrupo, fornecedor, consolida
     return _expandir_mesma_descricao(codes)
 
 
-@app.get("/compras/sugestao")
-def sugestao_compra(
-    fornecedor: Optional[str] = None,
-    curva: Optional[str] = None,
-    subgrupo: Optional[str] = None,
-    marca: Optional[str] = None,
-    apenas_zerados: bool = False,
-    usar_estoque_realtime: bool = True,
-    consolidar_grupo: bool = True,
-    incluir_sem_historico: bool = False,
-):
+def _gerar_sugestao_compra(fornecedor=None, curva=None, subgrupo=None, marca=None,
+                           apenas_zerados=False, usar_estoque_realtime=True,
+                           consolidar_grupo=True, incluir_sem_historico=False):
     """
-    Lista o que COMPRAR, agrupado por fornecedor, usando o ponto de pedido.
-
-      Posição   = estoque atual (ERP) + em trânsito (pedidos Liberado / Em Trânsito parcialmente,
-                  já descontado o que foi recebido por NF)
-      Comprar?  = Posição <= ponto de pedido
-      Quanto?   = Máximo - Posição
-
-    Com consolidar_grupo=True (padrão): usa o mín/máx CONSOLIDADO do grupo (mesma descrição,
-    várias marcas), soma a posição de todas as marcas e devolve 1 linha por grupo; produtos
-    "Sob Encomenda" (originais) são omitidos. Com False: usa o mín/máx individual por marca.
+    Monta o payload da sugestão de compra (mesma lógica do endpoint /compras/sugestao).
+    Extraído para ser reutilizado pela rota de PDF.
     """
     conn = get_db_connection()
     try:
@@ -3335,6 +3319,212 @@ def sugestao_compra(
         grupos_forn=get_grupos_fornecedor(),
         principal_forn=get_fornecedor_principal_map(),
     )
+
+
+@app.get("/compras/sugestao")
+def sugestao_compra(
+    fornecedor: Optional[str] = None,
+    curva: Optional[str] = None,
+    subgrupo: Optional[str] = None,
+    marca: Optional[str] = None,
+    apenas_zerados: bool = False,
+    usar_estoque_realtime: bool = True,
+    consolidar_grupo: bool = True,
+    incluir_sem_historico: bool = False,
+):
+    """
+    Lista o que COMPRAR, agrupado por fornecedor, usando o ponto de pedido.
+
+      Posição   = estoque atual (ERP) + em trânsito (pedidos Liberado / Em Trânsito parcialmente,
+                  já descontado o que foi recebido por NF)
+      Comprar?  = Posição <= ponto de pedido
+      Quanto?   = Máximo - Posição
+
+    Com consolidar_grupo=True (padrão): usa o mín/máx CONSOLIDADO do grupo (mesma descrição,
+    várias marcas), soma a posição de todas as marcas e devolve 1 linha por grupo; produtos
+    "Sob Encomenda" (originais) são omitidos. Com False: usa o mín/máx individual por marca.
+    """
+    return _gerar_sugestao_compra(
+        fornecedor=fornecedor, curva=curva, subgrupo=subgrupo, marca=marca,
+        apenas_zerados=apenas_zerados, usar_estoque_realtime=usar_estoque_realtime,
+        consolidar_grupo=consolidar_grupo, incluir_sem_historico=incluir_sem_historico,
+    )
+
+
+@app.get("/compras/sugestao/pdf")
+def sugestao_compra_pdf(
+    fornecedor: Optional[str] = None,
+    curva: Optional[str] = None,
+    subgrupo: Optional[str] = None,
+    marca: Optional[str] = None,
+    apenas_zerados: bool = False,
+    usar_estoque_realtime: bool = True,
+    consolidar_grupo: bool = True,
+    incluir_sem_historico: bool = False,
+):
+    """
+    Mesma sugestão de compra do endpoint /compras/sugestao, porém renderizada
+    como um PDF (uma tabela por fornecedor). Aceita os mesmos filtros.
+    """
+    data = _gerar_sugestao_compra(
+        fornecedor=fornecedor, curva=curva, subgrupo=subgrupo, marca=marca,
+        apenas_zerados=apenas_zerados, usar_estoque_realtime=usar_estoque_realtime,
+        consolidar_grupo=consolidar_grupo, incluir_sem_historico=incluir_sem_historico,
+    )
+    pdf_bytes = _render_sugestao_pdf(
+        data,
+        filtros={"fornecedor": fornecedor, "curva": curva, "subgrupo": subgrupo,
+                 "marca": marca, "apenas_zerados": apenas_zerados},
+    )
+    headers = {"Content-Disposition": 'inline; filename="sugestao_compra.pdf"'}
+    return StreamingResponse(io.BytesIO(pdf_bytes), media_type="application/pdf",
+                             headers=headers)
+
+
+def _render_sugestao_pdf(data, filtros=None):
+    """
+    Gera o PDF da sugestão de compra a partir do payload de montar_sugestao_compra.
+    Uma seção (tabela) por fornecedor. Usa fpdf2 (pura Python, sem deps de sistema).
+    """
+    from fpdf import FPDF
+
+    filtros = filtros or {}
+
+    def _txt(s):
+        # fpdf2 core fonts (Helvetica) são latin-1 — troca o que não couber.
+        return str(s if s is not None else "").encode("latin-1", "replace").decode("latin-1")
+
+    def _brl(v):
+        if v is None:
+            return "-"
+        return "R$ " + f"{float(v):,.2f}".replace(",", "X").replace(".", ",").replace("X", ".")
+
+    def _num(v):
+        if v is None:
+            return "-"
+        return f"{float(v):,.0f}".replace(",", ".")
+
+    pdf = FPDF(orientation="L", unit="mm", format="A4")
+    pdf.set_auto_page_break(auto=True, margin=12)
+    pdf.set_margins(10, 10, 10)
+    pdf.alias_nb_pages()
+
+    # Colunas: (título, largura mm, alinhamento, chave)
+    cols = [
+        ("Código", 20, "L", "pro_codigo"),
+        ("Descrição", 95, "L", "pro_descricao"),
+        ("Marca", 28, "L", "marca"),
+        ("Curva", 14, "C", "curva_abc"),
+        ("Estoque", 18, "R", "estoque_atual"),
+        ("Trânsito", 18, "R", "em_transito"),
+        ("Posição", 18, "R", "posicao"),
+        ("P.Pedido", 18, "R", "ponto_pedido"),
+        ("Máximo", 16, "R", "maximo"),
+        ("Sugerido", 18, "R", "qtd_sugerida"),
+        ("Vlr Estim.", 24, "R", "valor_estimado"),
+    ]
+    total_w = sum(c[1] for c in cols)
+
+    def cabecalho_documento():
+        pdf.set_font("Helvetica", "B", 15)
+        pdf.cell(0, 8, _txt("Sugestão de Compra"), ln=1)
+        pdf.set_font("Helvetica", "", 8)
+        partes = []
+        for rot, ch in (("Fornecedor", "fornecedor"), ("Curva", "curva"),
+                        ("Subgrupo", "subgrupo"), ("Marca", "marca")):
+            if filtros.get(ch):
+                partes.append(f"{rot}: {filtros[ch]}")
+        if filtros.get("apenas_zerados"):
+            partes.append("Apenas zerados")
+        partes.append("Modo: " + ("grupo" if data.get("modo") == "grupo" else "individual"))
+        partes.append("Estoque em tempo real" if data.get("estoque_realtime") else "Estoque snapshot")
+        pdf.set_text_color(90, 90, 90)
+        pdf.cell(0, 5, _txt(" | ".join(partes)), ln=1)
+        pdf.cell(0, 5, _txt(
+            f"Fornecedores: {data.get('total_fornecedores', 0)}  •  "
+            f"Itens: {data.get('total_itens', 0)}  •  "
+            f"Valor total estimado: {_brl(data.get('valor_total_geral'))}"), ln=1)
+        pdf.set_text_color(0, 0, 0)
+        pdf.ln(2)
+
+    def cabecalho_tabela():
+        pdf.set_font("Helvetica", "B", 7.5)
+        pdf.set_fill_color(45, 55, 72)
+        pdf.set_text_color(255, 255, 255)
+        for titulo, w, _al, _ch in cols:
+            pdf.cell(w, 7, _txt(titulo), border=0, align="C", fill=True)
+        pdf.ln(7)
+        pdf.set_text_color(0, 0, 0)
+
+    pdf.add_page()
+    cabecalho_documento()
+
+    fornecedores = data.get("fornecedores") or []
+    if not fornecedores:
+        pdf.set_font("Helvetica", "I", 11)
+        pdf.cell(0, 10, _txt("Nenhum item para comprar com os filtros informados."), ln=1)
+        return bytes(pdf.output())
+
+    for forn in fornecedores:
+        # Espaço mínimo para o título + cabeçalho da tabela + 1 linha
+        if pdf.get_y() + 30 > pdf.h - pdf.b_margin:
+            pdf.add_page()
+
+        # Título do fornecedor
+        pdf.set_font("Helvetica", "B", 10)
+        pdf.set_fill_color(230, 234, 240)
+        info = f"{forn.get('fornecedor', '-')}   ({forn.get('qtd_itens', 0)} itens • {_brl(forn.get('valor_total_estimado'))}"
+        alertas = []
+        if forn.get("abaixo_pedido_minimo"):
+            alertas.append(f"abaixo do mín. R$ {_brl(forn.get('pedido_minimo_valor'))}")
+        if forn.get("abaixo_pedido_minimo_qtd"):
+            alertas.append(f"abaixo do mín. {_num(forn.get('pedido_minimo_qtd'))} un")
+        info += (" • " + "; ".join(alertas)) if alertas else ""
+        info += ")"
+        pdf.cell(total_w, 7, _txt(info), border=0, align="L", fill=True)
+        pdf.ln(7)
+
+        cabecalho_tabela()
+
+        pdf.set_font("Helvetica", "", 7)
+        fill = False
+        for it in (forn.get("itens") or []):
+            # Quebra de página no meio da tabela: repete o cabeçalho
+            if pdf.get_y() + 6 > pdf.h - pdf.b_margin:
+                pdf.add_page()
+                cabecalho_tabela()
+                pdf.set_font("Helvetica", "", 7)
+
+            if fill:
+                pdf.set_fill_color(244, 246, 249)
+            for titulo, w, al, ch in cols:
+                v = it.get(ch)
+                if ch == "valor_estimado":
+                    s = _brl(v)
+                elif ch in ("estoque_atual", "em_transito", "posicao",
+                            "ponto_pedido", "maximo", "qtd_sugerida"):
+                    s = _num(v)
+                else:
+                    s = _txt(v)
+                # Trunca descrição longa
+                if ch == "pro_descricao" and pdf.get_string_width(s) > w - 2:
+                    while s and pdf.get_string_width(s + "...") > w - 2:
+                        s = s[:-1]
+                    s = s + "..."
+                pdf.cell(w, 5.5, _txt(s), border="B", align=al, fill=fill)
+            pdf.ln(5.5)
+            fill = not fill
+
+        # Subtotal do fornecedor
+        pdf.set_font("Helvetica", "B", 7.5)
+        soma_sug = sum((x.get("qtd_sugerida") or 0) for x in (forn.get("itens") or []))
+        w_ate_sug = sum(c[1] for c in cols[:-2])
+        pdf.cell(w_ate_sug, 6, _txt("Total do fornecedor"), border=0, align="R")
+        pdf.cell(cols[-2][1], 6, _txt(_num(soma_sug)), border=0, align="R")
+        pdf.cell(cols[-1][1], 6, _txt(_brl(forn.get("valor_total_estimado"))), border=0, align="R")
+        pdf.ln(10)
+
+    return bytes(pdf.output())
 
 
 @app.get("/produto/vendas-mensais")
