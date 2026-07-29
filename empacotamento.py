@@ -67,21 +67,37 @@ def mes_chave(d) -> str:
 # ----------------------------------------------------------------------
 # Núcleo FIFO por camadas (layer model) — provado no POC
 # ----------------------------------------------------------------------
+def _custo_ev(v):
+    """Custo de uma entrada -> float ou None (ausente/inválido não vira 0,00)."""
+    if v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if f != f or f <= 0:            # NaN ou não-positivo
+        return None
+    return f
+
+
 def processar_fifo(camadas_iniciais, eventos):
     """
-    camadas_iniciais: [{'data_compra': date/Timestamp, 'qtd': float}]
-    eventos: lista cronológica de {'tipo':'E'|'S', 'data', 'qtd'}
+    camadas_iniciais: [{'data_compra': date/Timestamp, 'qtd': float, 'custo': float|None}]
+    eventos: lista cronológica de {'tipo':'E'|'S', 'data', 'qtd', 'custo'(só 'E')}
     Retorna (vendas, camadas_residuais):
       vendas: [{'data', 'qtd', 'consumos':[(data_compra, qtd)], 'faltou': float}]
-      camadas_residuais: [{'data_compra', 'qtd'}] (FIFO; mais antigo primeiro)
+      camadas_residuais: [{'data_compra', 'qtd', 'custo'}] (FIFO; mais antigo primeiro)
+
+    A camada carrega o CUSTO da entrada que a originou — é dele que sai o custo
+    FIFO do estoque vivo (ver `custo_fifo_por_produto`).
     """
-    fila = deque([[pd.Timestamp(c['data_compra']), float(c['qtd'])]
+    fila = deque([[pd.Timestamp(c['data_compra']), float(c['qtd']), _custo_ev(c.get('custo'))]
                   for c in camadas_iniciais if float(c.get('qtd', 0)) > 0])
     vendas = []
     for ev in eventos:
         if ev['tipo'] == 'E':
             if ev['qtd'] > 0:
-                fila.append([pd.Timestamp(ev['data']), float(ev['qtd'])])
+                fila.append([pd.Timestamp(ev['data']), float(ev['qtd']), _custo_ev(ev.get('custo'))])
         else:
             q = float(ev['qtd']); consumos = []
             while q > 1e-9 and fila:
@@ -93,20 +109,22 @@ def processar_fifo(camadas_iniciais, eventos):
                     fila.popleft()
             vendas.append({'data': pd.Timestamp(ev['data']), 'qtd': float(ev['qtd']),
                            'consumos': consumos, 'faltou': q})
-    camadas = [{'data_compra': d, 'qtd': qr} for d, qr in fila]
+    camadas = [{'data_compra': d, 'qtd': qr, 'custo': c} for d, qr, c in fila]
     return vendas, camadas
 
 
 def _eventos(df_ent, df_sai):
     """Constrói a lista cronológica de eventos a partir de DataFrames de mov.
-    df_ent: colunas PRO_CODIGO, DATA, QUANTIDADE
+    df_ent: colunas PRO_CODIGO, DATA, QUANTIDADE [, PRECO_CUSTO]
     df_sai: colunas PRO_CODIGO, DATA, QUANTIDADE_AJUSTADA
     Mesma data: ENTRADA antes de SAÍDA.
     """
     evs = []
     if df_ent is not None and not df_ent.empty:
-        for d, q in zip(df_ent["DATA"], df_ent["QUANTIDADE"]):
-            evs.append({'tipo': 'E', 'data': d, 'qtd': float(q or 0)})
+        custos = (df_ent["PRECO_CUSTO"] if "PRECO_CUSTO" in df_ent.columns
+                  else [None] * len(df_ent))
+        for d, q, pc in zip(df_ent["DATA"], df_ent["QUANTIDADE"], custos):
+            evs.append({'tipo': 'E', 'data': d, 'qtd': float(q or 0), 'custo': pc})
     if df_sai is not None and not df_sai.empty:
         for d, q in zip(df_sai["DATA"], df_sai["QUANTIDADE_AJUSTADA"]):
             evs.append({'tipo': 'S', 'data': d, 'qtd': float(q or 0)})
@@ -135,7 +153,9 @@ def reconciliar_camadas(camadas, saldo_atual, hoje):
         return camadas, 0.0
     cam = [dict(c) for c in camadas]
     if diff > 0:
-        cam.append({'data_compra': pd.Timestamp(hoje), 'qtd': diff})
+        # Camada de ajuste: existe estoque que o movimento não explica. Sem nota,
+        # não há custo — fica None e o item cai no fallback de custo do main.py.
+        cam.append({'data_compra': pd.Timestamp(hoje), 'qtd': diff, 'custo': None})
     else:
         faltam = -diff
         i = 0
@@ -226,12 +246,22 @@ class MongoPackStore(PackStore):
 # Serialização das camadas
 # ----------------------------------------------------------------------
 def _cam_to_doc(camadas):
-    return [{"data_compra": pd.Timestamp(c["data_compra"]).strftime(_FMT),
-             "qtd": round(float(c["qtd"]), 6)} for c in camadas]
+    """Serializa camadas. `custo` é omitido quando desconhecido — pacotes antigos
+    (sem o campo) continuam legíveis e rendem custo None."""
+    out = []
+    for c in camadas:
+        d = {"data_compra": pd.Timestamp(c["data_compra"]).strftime(_FMT),
+             "qtd": round(float(c["qtd"]), 6)}
+        cst = _custo_ev(c.get("custo"))
+        if cst is not None:
+            d["custo"] = round(cst, 6)
+        out.append(d)
+    return out
 
 
 def _cam_from_doc(camadas_doc):
-    return [{"data_compra": pd.Timestamp(c["data_compra"]), "qtd": float(c["qtd"])}
+    return [{"data_compra": pd.Timestamp(c["data_compra"]), "qtd": float(c["qtd"]),
+             "custo": _custo_ev(c.get("custo"))}
             for c in camadas_doc]
 
 
@@ -402,8 +432,9 @@ def to_entradas_sinteticas(docs):
             rows.append({"PRO_CODIGO": str(cod).strip(),
                          "DATA": pd.Timestamp(c["data_compra"]),
                          "QUANTIDADE": float(c["qtd"]),
+                         "PRECO_CUSTO": _custo_ev(c.get("custo")),
                          "ORIGEM": "PACK"})
-    cols = ["PRO_CODIGO", "DATA", "QUANTIDADE", "ORIGEM"]
+    cols = ["PRO_CODIGO", "DATA", "QUANTIDADE", "PRECO_CUSTO", "ORIGEM"]
     return pd.DataFrame(rows, columns=cols)
 
 
@@ -463,8 +494,12 @@ def fifo_por_camadas(df_ent, df_sai, df_saldo, packs=None, hoje=None):
 
     Retorna (data_compra, df_long, df_div):
       data_compra: pd.Series alinhada ao índice de df_sai
-      df_long: PRO_CODIGO, DATA_COMPRA_RESIDUAL, QTD_RESTANTE, ESTOQUE_DISPONIVEL, LAYER_INDEX
+      df_long: PRO_CODIGO, DATA_COMPRA_RESIDUAL, QTD_RESTANTE, ESTOQUE_DISPONIVEL,
+               LAYER_INDEX, CUSTO_CAMADA
       df_div:  PRO_CODIGO, DIVERGENCIA (saldo - Σcamadas teóricas)
+
+    CUSTO_CAMADA é o preco_custo da entrada que originou a camada (NaN quando a
+    entrada não trouxe custo ou quando a camada veio do ajuste de inventário).
     """
     import numpy as np
     packs = packs or {}
@@ -477,6 +512,8 @@ def fifo_por_camadas(df_ent, df_sai, df_saldo, packs=None, hoje=None):
     de["DATA"] = pd.to_datetime(de["DATA"], errors="coerce")
     if "LANCTO" not in de.columns:
         de["LANCTO"] = 0
+    if "PRECO_CUSTO" not in de.columns:
+        de["PRECO_CUSTO"] = None
     ds = df_sai.copy()
     ds["PRO_CODIGO"] = ds["PRO_CODIGO"].astype(str).str.strip()
     ds["DATA"] = pd.to_datetime(ds["DATA"], errors="coerce")
@@ -498,20 +535,21 @@ def fifo_por_camadas(df_ent, df_sai, df_saldo, packs=None, hoje=None):
         eventos = []
         ge = ent_por.get(cod)
         if ge is not None:
-            for d, q, lan in zip(ge["DATA"], ge["QUANTIDADE"], ge["LANCTO"]):
-                eventos.append((pd.Timestamp(d), 0, float(lan or 0), 'E', float(q or 0), None))
+            for d, q, lan, pc in zip(ge["DATA"], ge["QUANTIDADE"], ge["LANCTO"], ge["PRECO_CUSTO"]):
+                eventos.append((pd.Timestamp(d), 0, float(lan or 0), 'E', float(q or 0),
+                                None, _custo_ev(pc)))
         gs = sai_por.get(cod)
         if gs is not None:
             for idx, d, q in zip(gs.index, gs["DATA"], gs["QUANTIDADE_AJUSTADA"]):
-                eventos.append((pd.Timestamp(d), 1, 0.0, 'S', float(q or 0), idx))
+                eventos.append((pd.Timestamp(d), 1, 0.0, 'S', float(q or 0), idx, None))
         eventos.sort(key=lambda e: (e[0], e[1], e[2]))
 
-        fila = deque([[pd.Timestamp(c['data_compra']), float(c['qtd'])]
+        fila = deque([[pd.Timestamp(c['data_compra']), float(c['qtd']), _custo_ev(c.get('custo'))]
                       for c in packs.get(cod, []) if float(c.get('qtd', 0)) > 0])
-        for ts, _, _, tipo, qtd, idx in eventos:
+        for ts, _, _, tipo, qtd, idx, custo in eventos:
             if tipo == 'E':
                 if qtd > 0:
-                    fila.append([ts, qtd])
+                    fila.append([ts, qtd, custo])
             else:
                 q = qtd
                 num = 0.0   # Σ(value_ns * qtd) p/ data média ponderada
@@ -529,23 +567,90 @@ def fifo_por_camadas(df_ent, df_sai, df_saldo, packs=None, hoje=None):
                 # se q>0 (faltou estoque) deixa NaT
 
         # camadas residuais (estoque teórico) -> reconcilia ao saldo do ERP
-        camadas = [{'data_compra': d, 'qtd': qr} for d, qr in fila]
+        camadas = [{'data_compra': d, 'qtd': qr, 'custo': c} for d, qr, c in fila]
         saldo = float(saldo_map.get(cod, 0) or 0)
         cam_rec, div = reconciliar_camadas(camadas, saldo, hoje)
         if abs(div) > 1e-6:
             div_rows.append({"PRO_CODIGO": cod, "DIVERGENCIA": div})
         for i, c in enumerate(cam_rec, start=1):
             if c['qtd'] > 1e-9:
+                cst = _custo_ev(c.get('custo'))
                 long_rows.append({"PRO_CODIGO": cod, "LAYER_INDEX": i,
                                   "DATA_COMPRA_RESIDUAL": pd.Timestamp(c['data_compra']),
                                   "QTD_RESTANTE": float(c['qtd']),
-                                  "ESTOQUE_DISPONIVEL": saldo})
+                                  "ESTOQUE_DISPONIVEL": saldo,
+                                  "CUSTO_CAMADA": np.nan if cst is None else cst})
 
     df_long = pd.DataFrame(long_rows, columns=["PRO_CODIGO", "LAYER_INDEX",
                                                "DATA_COMPRA_RESIDUAL", "QTD_RESTANTE",
-                                               "ESTOQUE_DISPONIVEL"])
+                                               "ESTOQUE_DISPONIVEL", "CUSTO_CAMADA"])
     df_div = pd.DataFrame(div_rows, columns=["PRO_CODIGO", "DIVERGENCIA"])
     return data_compra, df_long, df_div
+
+
+def custo_fifo_por_produto(df_long):
+    """
+    CUSTO FIFO do estoque vivo, por produto, a partir das camadas residuais.
+
+    DEFINIÇÃO ADOTADA: **médio ponderado das camadas vivas**
+        custo = Σ(qtd_camada × custo_camada) / Σ(qtd_camada)   [só camadas com custo]
+
+    Por que ponderado e não "custo da camada viva mais antiga" (FIFO puro):
+      1. IDENTIDADE COM O CAPITAL. `estoque_disponivel × custo_unitario` é lido em
+         todo o serviço como "valor em estoque". Só a média ponderada torna essa
+         conta exata; a camada mais antiga superestima ou subestima o lote inteiro.
+      2. ROBUSTEZ A LIXO DO ERP. Uma única camada com custo digitado errado passa a
+         valer por todo o saldo no FIFO puro (ex.: produto 5636 — camada de R$0,06
+         de 2018 contra R$62,17 ponderado em 16 un).
+      3. ESTABILIDADE. No FIFO puro o custo salta a cada camada esgotada; para um
+         piso de margem em precificação isso vira degrau. O ponderado varia suave.
+      4. O CASO COMUM É EMPATE. Em 91,9% dos produtos com estoque há um único custo
+         entre as camadas vivas — as duas definições coincidem e a escolha só pesa
+         nos 8,1% multi-camada.
+    Trade-off aceito: para a PRÓXIMA unidade vendida o FIFO puro é o custo exato de
+    reposição. O ponderado erra essa leitura marginal em troca de valorar o lote
+    inteiro corretamente — que é o que consome esta tabela.
+
+    Retorna DataFrame: PRO_CODIGO, CUSTO_FIFO, CUSTO_FIFO_CAMADA_ANTIGA,
+                       QTD_COM_CUSTO, N_CAMADAS_VIVAS, N_CUSTOS_DISTINTOS
+    """
+    import numpy as np
+    cols = ["PRO_CODIGO", "CUSTO_FIFO", "CUSTO_FIFO_CAMADA_ANTIGA", "QTD_COM_CUSTO",
+            "N_CAMADAS_VIVAS", "N_CUSTOS_DISTINTOS"]
+    if df_long is None or df_long.empty or "CUSTO_CAMADA" not in df_long.columns:
+        return pd.DataFrame(columns=cols)
+
+    d = df_long.copy()
+    d["PRO_CODIGO"] = d["PRO_CODIGO"].astype(str).str.strip()
+    d["QTD_RESTANTE"] = pd.to_numeric(d["QTD_RESTANTE"], errors="coerce").fillna(0.0)
+    d["CUSTO_CAMADA"] = pd.to_numeric(d["CUSTO_CAMADA"], errors="coerce")
+    d = d[d["QTD_RESTANTE"] > 1e-9]
+    n_cam = d.groupby("PRO_CODIGO").size().rename("N_CAMADAS_VIVAS")
+
+    # só camadas com custo conhecido entram na média (camada de ajuste fica de fora)
+    v = d[d["CUSTO_CAMADA"].notna() & (d["CUSTO_CAMADA"] > 0)].copy()
+    if v.empty:
+        out = n_cam.reset_index()
+        for c in cols:
+            if c not in out.columns:
+                out[c] = np.nan
+        return out[cols]
+
+    v["_NUM"] = v["QTD_RESTANTE"] * v["CUSTO_CAMADA"]
+    v["_CUSTO_R"] = v["CUSTO_CAMADA"].round(4)
+    v = v.sort_values(["PRO_CODIGO", "LAYER_INDEX"])
+    g = v.groupby("PRO_CODIGO")
+    qtd = g["QTD_RESTANTE"].sum()
+    res = pd.DataFrame({
+        "CUSTO_FIFO": g["_NUM"].sum() / qtd.replace(0, np.nan),
+        # camada viva mais antiga = FIFO puro; guardada para auditar a escolha
+        "CUSTO_FIFO_CAMADA_ANTIGA": g["CUSTO_CAMADA"].first(),
+        "QTD_COM_CUSTO": qtd,
+        "N_CUSTOS_DISTINTOS": g["_CUSTO_R"].nunique(),
+    })
+    res = res.join(n_cam, how="outer")
+    res["N_CAMADAS_VIVAS"] = res["N_CAMADAS_VIVAS"].fillna(0).astype(int)
+    return res.reset_index()[cols]
 
 
 def stats_por_produto(docs):

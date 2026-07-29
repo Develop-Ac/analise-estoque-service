@@ -1314,14 +1314,23 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
     vendas_mes = s.groupby(["PRO_CODIGO", "MES"])["QUANTIDADE_AJUSTADA"].sum()
     valor_12m = s.groupby("PRO_CODIGO")["TOTAL_LIQUIDO"].sum()
 
-    # ---------- Custo unitário e margem (para o nível de serviço econômico) ----------
-    # COGS = Σ(preco_custo × qtd); custo_unit e preço_unit sobre a MESMA qtd → margem coerente.
+    # ---------- Custo COGS 12m e preço realizado ----------
+    # COGS = Σ(preco_custo × qtd) das LINHAS DE VENDA; sobre a MESMA qtd do preço.
+    #
+    # ATENÇÃO: isto NÃO é o custo do estoque. É o custo médio do que FOI VENDIDO nos
+    # últimos 12 meses — um custo histórico realizado. Enquanto o produto girar sem
+    # mudança de preço de compra os dois coincidem, mas quando o estoque zera e volta
+    # com custo diferente, este número fica preso no custo antigo (caso 47709: vendeu
+    # 1 un a custo 872,09 e 1 un a 10,37 → média 441,23, com estoque hoje 100% na
+    # camada de 10,37). O custo do ESTOQUE vem das camadas FIFO — ver
+    # empacotamento.custo_fifo_por_produto e a montagem de CUSTO_UNIT em
+    # calcular_metricas_e_classificar. Mantido aqui como CUSTO_COGS_12M porque é a
+    # base correta da margem REALIZADA e da auditoria contra o antes/depois.
     s["_COGS"] = s["PRECO_CUSTO"] * s["QUANTIDADE_AJUSTADA"]
     qtd_12m = s.groupby("PRO_CODIGO")["QUANTIDADE_AJUSTADA"].sum()
     cogs_12m = s.groupby("PRO_CODIGO")["_COGS"].sum(min_count=1)  # NaN se nunca houve preco_custo
-    custo_unit = (cogs_12m / qtd_12m.replace(0, np.nan))
+    custo_cogs = (cogs_12m / qtd_12m.replace(0, np.nan))
     preco_unit = (valor_12m / qtd_12m.replace(0, np.nan))
-    margem_unit = (preco_unit - custo_unit)
 
     # venda média por evento (linha de venda) — usada como referência do cap da VP
     linhas = s.groupby("PRO_CODIGO")["QUANTIDADE_AJUSTADA"].agg(["sum", "count"])
@@ -1362,7 +1371,7 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
                                      "SIGMA_DEMANDA_DIA", "CV_DEMANDA",
                                      "VENDA_PERDIDA_12M", "VALOR_VENDIDO_12M",
                                      "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES",
-                                     "CUSTO_UNIT", "MARGEM_UNIT", "MARGEM_PCT",
+                                     "CUSTO_COGS_12M", "PRECO_UNIT_12M",
                                      "TEVE_OUTLIER_APARADO", "OUTLIER_QTD_APARADA", "OUTLIER_MOTIVO"])
 
     mat = demanda_mes.unstack(fill_value=0).reindex(columns=meses, fill_value=0)
@@ -1423,10 +1432,10 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
     res["MEAN_SIZE_MES"] = mean_size.fillna(0.0)
     res["VENDA_PERDIDA_12M"] = vp_total.reindex(mat.index).fillna(0) if not vp_total.empty else 0.0
     res["VALOR_VENDIDO_12M"] = valor_12m.reindex(mat.index).fillna(0)
-    # Custo/margem unitários (NaN quando não há preco_custo → nível de serviço cai na curva)
-    res["CUSTO_UNIT"] = custo_unit.reindex(mat.index)
-    res["MARGEM_UNIT"] = margem_unit.reindex(mat.index)
-    res["MARGEM_PCT"] = (margem_unit / preco_unit).reindex(mat.index)
+    # Base de custo/preço da janela. CUSTO_UNIT e a MARGEM definitivos são montados em
+    # calcular_metricas_e_classificar (custo FIFO das camadas vivas + fallbacks).
+    res["CUSTO_COGS_12M"] = custo_cogs.reindex(mat.index)
+    res["PRECO_UNIT_12M"] = preco_unit.reindex(mat.index)
     if not vendas_mat.empty:
         res["DEM_DIA_VENDAS"] = vendas_mat.reindex(index=mat.index).fillna(0).sum(axis=1) / dias_janela
     else:
@@ -1585,8 +1594,84 @@ METODO_LABEL = {"Suave": "Normal (Z·σ·√LT)", "Erratico": "Normal (Z·σ·�
                 "Intermitente": "Croston+Poisson", "Grumoso": "Croston+Binomial Neg",
                 "Sem_Giro": "—"}
 
+def montar_custo_e_margem(df_met, custo_fifo=None, df_ent_valid=None):
+    """
+    CUSTO UNITÁRIO — custo FIFO do ESTOQUE VIVO (não do que foi vendido).
+
+    Até 07/2026 `custo_unitario` trazia CUSTO_COGS_12M: a média (ponderada por
+    qtd) do preco_custo das LINHAS DE VENDA da janela de 12m. Isso responde
+    "quanto custou o que eu vendi", não "quanto custa o que eu tenho". Quando o
+    estoque zera e volta com custo diferente, o valor fica preso no custo antigo
+    — o produto 47709 gravava 441,23 com o estoque inteiro na camada de 10,37.
+
+    A fonte passa a ser a camada FIFO viva (média ponderada; justificativa em
+    empacotamento.custo_fifo_por_produto), com cadeia de fallback explícita para
+    não deixar buraco onde antes havia número:
+      1. camada_viva    — Σ(qtd×custo)/Σqtd das camadas residuais com custo
+      2. ultima_entrada — produto sem saldo (ou camadas sem custo): último
+                          preco_custo de entrada conhecido
+      3. cadastro       — preco_custo do cadastro do ERP
+      4. (nulo)         — nenhuma das três; cai no nível de serviço da curva
+    CUSTO_FONTE registra qual degrau valeu, para auditoria a jusante.
+
+    A MARGEM passa a ser PROSPECTIVA (preço realizado 12m − custo do estoque
+    HOJE) em vez de retrospectiva. É ela que alimenta o nível de serviço
+    econômico e o piso de margem. A base antiga fica em MARGEM_UNIT_REALIZADA.
+    """
+    df_met = df_met.copy()
+    df_met["CUSTO_UNIT"] = np.nan
+    df_met["CUSTO_FONTE"] = None
+    cod = df_met["PRO_CODIGO"].astype(str).str.strip()
+
+    # 1) camada FIFO viva
+    if custo_fifo is not None and not custo_fifo.empty and "CUSTO_FIFO" in custo_fifo.columns:
+        cf = custo_fifo.copy()
+        cf["PRO_CODIGO"] = cf["PRO_CODIGO"].astype(str).str.strip()
+        cf = cf.drop_duplicates("PRO_CODIGO").set_index("PRO_CODIGO")["CUSTO_FIFO"]
+        v = pd.to_numeric(cod.map(cf), errors="coerce")
+        ok = v.notna() & (v > 0)
+        df_met.loc[ok, "CUSTO_UNIT"] = v[ok]
+        df_met.loc[ok, "CUSTO_FONTE"] = "camada_viva"
+
+    # 2) último custo de entrada conhecido
+    if (df_ent_valid is not None and not df_ent_valid.empty
+            and "PRECO_CUSTO" in df_ent_valid.columns):
+        e = df_ent_valid[["PRO_CODIGO", "DATA", "PRECO_CUSTO"]].copy()
+        e["PRO_CODIGO"] = e["PRO_CODIGO"].astype(str).str.strip()
+        e["PRECO_CUSTO"] = pd.to_numeric(e["PRECO_CUSTO"], errors="coerce")
+        e["DATA"] = pd.to_datetime(e["DATA"], errors="coerce")
+        e = e[e["PRECO_CUSTO"].notna() & (e["PRECO_CUSTO"] > 0)]
+        if not e.empty:
+            ult = (e.sort_values(["PRO_CODIGO", "DATA"])
+                     .groupby("PRO_CODIGO")["PRECO_CUSTO"].last())
+            v = pd.to_numeric(cod.map(ult), errors="coerce")
+            usar = df_met["CUSTO_UNIT"].isna() & v.notna() & (v > 0)
+            df_met.loc[usar, "CUSTO_UNIT"] = v[usar]
+            df_met.loc[usar, "CUSTO_FONTE"] = "ultima_entrada"
+
+    # 3) cadastro do ERP
+    if "CUSTO_CADASTRO" in df_met.columns:
+        cc = pd.to_numeric(df_met["CUSTO_CADASTRO"], errors="coerce")
+        usar = df_met["CUSTO_UNIT"].isna() & cc.notna() & (cc > 0)
+        df_met.loc[usar, "CUSTO_UNIT"] = cc[usar]
+        df_met.loc[usar, "CUSTO_FONTE"] = "cadastro"
+
+    # Sem venda na janela não há preço realizado e, portanto, não há margem: fica
+    # 0, como antes — não vira "−custo". `_nivel_servico_custo` exige m>0 e segue
+    # caindo no nível da curva nesses casos.
+    pu = pd.to_numeric(df_met.get("PRECO_UNIT_12M"), errors="coerce").fillna(0.0)
+    cu = pd.to_numeric(df_met["CUSTO_UNIT"], errors="coerce")
+    tem_venda = pu > 0
+    df_met["MARGEM_UNIT"] = np.where(tem_venda, pu - cu, 0.0)
+    df_met["MARGEM_PCT"] = np.where(tem_venda, (pu - cu) / pu.replace(0, np.nan), 0.0)
+    cc12 = pd.to_numeric(df_met.get("CUSTO_COGS_12M"), errors="coerce")
+    df_met["MARGEM_UNIT_REALIZADA"] = np.where(tem_venda, pu - cc12, 0.0)
+    return df_met
+
+
 def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz,
-                              params_forn=None, mapa_compras=None, mapa_linha=None):
+                              params_forn=None, mapa_compras=None, mapa_linha=None,
+                              custo_por_produto=None):
     """
     Cálculo CONSOLIDADO por grupo de produto (= descrição + LINHA da marca),
     somando a demanda das marcas SUBSTITUTAS DE VERDADE (mesma linha), EXCLUINDO
@@ -1636,6 +1721,36 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     grp_sgr = nao.groupby("GRUPO")["SGR_CODIGO"].agg(lambda s: s.dropna().iloc[0] if s.dropna().size else None)
     grp_est = pd.to_numeric(nao["ESTOQUE_DISPONIVEL"], errors="coerce").fillna(0).groupby(nao["GRUPO"]).sum()
     grp_n = nao.groupby("GRUPO")["PRO_CODIGO"].nunique()
+
+    # ---------- Custo/margem do GRUPO ----------
+    # O motor de demanda devolve preço realizado, mas não custo: custo é por
+    # produto (camada FIFO). Consolida-se aqui a média dos custos dos MEMBROS
+    # ponderada pelo estoque de cada um — mesmo critério do custo por item, que
+    # já é ponderado pela quantidade em estoque. Grupo sem estoque cai na média
+    # simples dos membros que têm custo. Sem isso o nível de serviço econômico
+    # do grupo ficaria sem custo e todo grupo cairia no nível da curva.
+    if custo_por_produto is not None and len(custo_por_produto):
+        _cmap = pd.Series(custo_por_produto).astype(float)
+        _cmap.index = _cmap.index.astype(str).str.strip()
+        _m = nao[["PRO_CODIGO", "GRUPO"]].copy()
+        _m["CUSTO"] = _m["PRO_CODIGO"].map(_cmap)
+        _m["EST"] = pd.to_numeric(nao["ESTOQUE_DISPONIVEL"], errors="coerce").fillna(0.0).values
+        _m = _m[_m["CUSTO"].notna() & (_m["CUSTO"] > 0)]
+        if not _m.empty:
+            _m["_NUM"] = _m["CUSTO"] * _m["EST"]
+            _ag = _m.groupby("GRUPO").agg(NUM=("_NUM", "sum"), DEN=("EST", "sum"),
+                                          SIMPLES=("CUSTO", "mean"))
+            _custo_grp = np.where(_ag["DEN"] > 0, _ag["NUM"] / _ag["DEN"].replace(0, np.nan),
+                                  _ag["SIMPLES"])
+            _custo_grp = pd.Series(_custo_grp, index=_ag.index)
+            g["CUSTO_UNIT"] = g["GRUPO"].map(_custo_grp)
+        else:
+            g["CUSTO_UNIT"] = np.nan
+    else:
+        g["CUSTO_UNIT"] = np.nan
+    _pu_g = pd.to_numeric(g.get("PRECO_UNIT_12M"), errors="coerce").fillna(0.0)
+    g["MARGEM_UNIT"] = np.where(_pu_g > 0, _pu_g - g["CUSTO_UNIT"], 0.0)
+    g["MARGEM_PCT"] = np.where(_pu_g > 0, g["MARGEM_UNIT"] / _pu_g.replace(0, np.nan), 0.0)
 
     g["SGR_CODIGO"] = g["GRUPO"].map(grp_sgr)
     g["DATA_MAX_VENDA"] = g["GRUPO"].map(dmax_grp)
@@ -1721,7 +1836,8 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                                     df_saldo_produto: pd.DataFrame,
                                     df_vp: pd.DataFrame = None,
                                     vendas_mensais_extra: pd.DataFrame = None,
-                                    pack_stats: pd.DataFrame = None) -> pd.DataFrame:
+                                    pack_stats: pd.DataFrame = None,
+                                    custo_fifo: pd.DataFrame = None) -> pd.DataFrame:
     """
     Calcula métricas (demanda 12m + venda perdida), ABC/XYZ, padrão de demanda,
     sazonalidade e min/máx. `vendas_mensais_extra` (modo incremental) traz os meses
@@ -1879,17 +1995,22 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     cols_rec = ["DEM_DIA_VENDAS", "DEM_DIA_REAL", "SIGMA_DEMANDA_DIA",
                 "CV_DEMANDA", "VENDA_PERDIDA_12M", "VALOR_VENDIDO_12M",
                 "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES",
-                "CUSTO_UNIT", "MARGEM_UNIT", "MARGEM_PCT",
+                "CUSTO_COGS_12M", "PRECO_UNIT_12M",
                 "TEVE_OUTLIER_APARADO", "OUTLIER_QTD_APARADA", "OUTLIER_MOTIVO"]
     if df_rec is not None and not df_rec.empty:
         df_rec["PRO_CODIGO"] = df_rec["PRO_CODIGO"].astype(str).str.strip()
         df_met = df_met.merge(df_rec[["PRO_CODIGO"] + cols_rec], on="PRO_CODIGO", how="left")
     _cols_rec_texto = {"OUTLIER_MOTIVO", "TEVE_OUTLIER_APARADO"}  # não-numéricas
+    # Custo/preço da janela ficam NaN quando não há venda: "não sei" é diferente de
+    # "zero" e a cadeia de custo depende dessa distinção para escolher o fallback.
+    _cols_rec_nan_ok = {"CUSTO_COGS_12M", "PRECO_UNIT_12M"}
     for c in cols_rec:
         if c not in df_met.columns:
             df_met[c] = (None if c == "OUTLIER_MOTIVO"
                          else (False if c == "TEVE_OUTLIER_APARADO" else 0.0))
-        if c not in _cols_rec_texto:
+        if c in _cols_rec_nan_ok:
+            df_met[c] = pd.to_numeric(df_met[c], errors="coerce")
+        elif c not in _cols_rec_texto:
             df_met[c] = pd.to_numeric(df_met[c], errors="coerce").fillna(0.0)
     df_met["TEVE_OUTLIER_APARADO"] = df_met["TEVE_OUTLIER_APARADO"].fillna(False).astype(bool)
 
@@ -1922,20 +2043,9 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
 
     df_met = df_met.merge(df_saldo_produto[colunas_saldo], on="PRO_CODIGO", how="left")
 
-    # ==========================================
-    # FALLBACK DE CUSTO: item SEM venda 12m não tem custo (o CUSTO_UNIT vem do
-    # preco_custo das VENDAS) → capital/CME dele sumia do dashboard e o total
-    # não batia com o inventário fiscal (diferença medida: R$ 1,65 mi em 9,5 mil
-    # itens). Usa o preco_custo do CADASTRO do ERP nesses casos. NÃO afeta o
-    # nível de serviço econômico: a MARGEM segue nula sem venda → cai na curva.
-    # ==========================================
-    if "CUSTO_CADASTRO" in df_met.columns:
-        _cc = pd.to_numeric(df_met["CUSTO_CADASTRO"], errors="coerce")
-        _cu = pd.to_numeric(df_met["CUSTO_UNIT"], errors="coerce").fillna(0.0)
-        _usar = (_cu <= 0) & _cc.notna() & (_cc > 0)
-        df_met.loc[_usar, "CUSTO_UNIT"] = _cc[_usar]
-        print(f"  - Custo do CADASTRO aplicado a {int(_usar.sum())} itens sem venda 12m "
-              f"(capital do dashboard passa a cobrir o estoque parado).")
+    df_met = montar_custo_e_margem(df_met, custo_fifo, df_ent_valid)
+    _cnt = df_met["CUSTO_FONTE"].value_counts(dropna=False).to_dict()
+    print(f"  - Custo unitário (FIFO camada viva) por fonte: {_cnt}")
 
     # ==========================================
     # Curva ABC (sobre valor vendido dos últimos 12 meses, não vitalício)
@@ -2213,9 +2323,12 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
           f"sob encomenda: {int((mask_orig & mask_naoplan).sum())})")
 
     try:
+        _custo_prod = (df_met.set_index("PRO_CODIGO")["CUSTO_UNIT"].dropna()
+                       if "CUSTO_UNIT" in df_met.columns else None)
         df_grp = calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz,
                                            params_forn=params_forn, mapa_compras=mapa_compras,
-                                           mapa_linha=mapa_linha)
+                                           mapa_linha=mapa_linha,
+                                           custo_por_produto=_custo_prod)
         if df_grp is not None and not df_grp.empty:
             print(f"  - Grupos de produto (consolidados): {len(df_grp)}")
             df_met = df_met.merge(df_grp, left_on="GRUPO_CHAVE", right_on="GRUPO", how="left")
@@ -2821,6 +2934,9 @@ def salvar_metricas_postgres(df_metricas):
         'ESTOQUE_SEGURANCA': 'estoque_seguranca',
         'NIVEL_SERVICO_Z': 'nivel_servico_z',
         'CUSTO_UNIT': 'custo_unitario',
+        'CUSTO_COGS_12M': 'custo_cogs_12m',
+        'CUSTO_FONTE': 'custo_fonte',
+        'MARGEM_UNIT_REALIZADA': 'margem_unitaria_realizada',
         'PRECO_VENDA_1': 'preco_venda_1',
         'PRECO_VENDA_2': 'preco_venda_2',
         'MARGEM_UNIT': 'margem_unitaria',
@@ -2904,7 +3020,25 @@ def salvar_metricas_postgres(df_metricas):
         'grupo_nivel_servico_custo', 'grupo_estoque_min_custo', 'grupo_estoque_max_custo', 'grupo_margem_pct',
         'dados_alteracao_json'
     ]
-    
+
+    # Colunas NOVAS da correção de custo FIFO. O DDL é MANUAL (sql/2026-07-29_custo_fifo.sql):
+    # só são gravadas depois que o DBA aplicar o ALTER — antes disso o ETL segue
+    # rodando e apenas não popula estas colunas.
+    colunas_opcionais = ['custo_cogs_12m', 'custo_fonte', 'margem_unitaria_realizada']
+    try:
+        _eng = get_postgres_engine()
+        with _eng.connect() as _c:
+            _existentes = {r[0] for r in _c.execute(text(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'com_fifo_completo'"))}
+        _add = [c for c in colunas_opcionais if c in _existentes]
+        _falta = [c for c in colunas_opcionais if c not in _existentes]
+        table_columns = table_columns + _add
+        if _falta:
+            print(f"  - AVISO: colunas ausentes na tabela (aplique sql/2026-07-29_custo_fifo.sql): {_falta}")
+    except Exception as e:
+        print(f"  - AVISO: não foi possível checar colunas opcionais ({e}). Gravando sem elas.")
+
     # Garante que todas as colunas necessárias existem (adiciona como None se não existir)
     for col in table_columns:
         if col not in df_save.columns:
@@ -3096,6 +3230,17 @@ def run_job():
                              for c, d in packs_docs.items()}
                 print(f"  [EMPAC] modo INCREMENTAL — corte={corte_pack}, "
                       f"{len(packs_docs)} produtos no pacote (janela {emp.JANELA_MESES}m)")
+                # Pacotes gravados antes de 2026-07-29 não têm custo nas camadas.
+                # Essas camadas ficam sem custo e o item cai no fallback de última
+                # entrada — o custo FIFO só fica completo após um BACKFILL.
+                _cam_tot = sum(len(d.get("camadas", [])) for d in packs_docs.values())
+                _cam_sem = sum(1 for d in packs_docs.values()
+                               for c in d.get("camadas", []) if c.get("custo") is None)
+                if _cam_sem:
+                    print(f"  [EMPAC] ATENÇÃO: {_cam_sem}/{_cam_tot} camadas do pacote sem custo "
+                          f"(pacote anterior à correção de custo FIFO). Esses itens usam o "
+                          f"fallback de última entrada. Rode um BACKFILL (limpar fifo_pack) "
+                          f"para o custo de camada ficar completo.")
             else:
                 print("  [EMPAC] habilitado, pacote vazio -> BACKFILL (carga completa desta vez)")
         except Exception as e:
@@ -3165,6 +3310,11 @@ def run_job():
     if not df_div.empty:
         print(f"  [FIFO] {len(df_div)} produtos com ajuste de inventário (saldo x movimento) reconciliados.")
 
+    # Custo FIFO do estoque vivo (média ponderada das camadas residuais) — base do
+    # custo_unitario. Ver empacotamento.custo_fifo_por_produto.
+    df_custo_fifo = emp.custo_fifo_por_produto(df_long)
+    print(f"  [FIFO] custo de camada viva calculado para {len(df_custo_fifo)} produtos.")
+
     # Sazonalidade: no modo incremental, traz os meses congelados do pacote.
     vendas_mensais_extra = (emp.vendas_mensais_subgrupo(packs_docs, df_saldo_produto)
                             if modo_incremental else None)
@@ -3175,7 +3325,8 @@ def run_job():
     df_metricas = calcular_metricas_e_classificar(
         df_sai_fifo, df_ent_valid, df_saldo_produto, df_vp,
         vendas_mensais_extra=vendas_mensais_extra,
-        pack_stats=pack_stats)
+        pack_stats=pack_stats,
+        custo_fifo=df_custo_fifo)
     
     # === ETAPA NOVA: Calcular Idade Média do Saldo Atual e Classificar ===
     # Agrupar df_long por produto para calcular weighted average age
