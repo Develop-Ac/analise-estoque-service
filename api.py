@@ -85,6 +85,13 @@ ERP_API_TOKEN = (os.getenv('ERP_API_TOKEN') or '').strip()
 ERP_API_TIMEOUT_S = float(os.getenv('ERP_API_TIMEOUT_MS') or 15000) / 1000.0
 ERP_API_MAX_EM = 500  # teto do filtro `em` do lado da API
 
+# Log de subida: diz de cara qual caminho está ativo, para ninguém precisar
+# adivinhar pelo comportamento (mesma convenção do ErpApiService do compras).
+if ERP_API_URL:
+    print(f"[ERP-API] leitura do ERP habilitada em {ERP_API_URL}")
+else:
+    print("[ERP-API] ERP_API_URL nao configurada — estoque realtime segue 100% pelo OPENQUERY")
+
 
 def _erp_api_consulta(recurso, corpo):
     """POST /erp/<recurso>/consulta na erp-firebird-api. Levanta exceção em
@@ -196,10 +203,15 @@ def get_realtime_stocks(pro_codes):
 
     if ERP_API_URL:
         try:
-            return _realtime_stocks_via_api(pro_codes)
+            import time as _t
+            _ini = _t.monotonic()
+            mapa = _realtime_stocks_via_api(pro_codes)
+            print(f"[ERP-API] estoque realtime: {len(mapa)}/{len(pro_codes)} codigos via api em {int((_t.monotonic() - _ini) * 1000)}ms")
+            return mapa
         except Exception as e:
             print(f"AVISO: erp-firebird-api indisponível ({e}) — caindo para o OPENQUERY")
 
+    print(f"[OPENQUERY] estoque realtime: {len(pro_codes)} codigos via linked server CONSULTA")
     return _realtime_stocks_openquery(pro_codes)
 
 # ==========================================
