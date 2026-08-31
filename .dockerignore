@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.git/
+.env
+.venv/
+.venv-audit/
+api.py.bak
+*.xlsx
+*.log
+data/
+resultado/

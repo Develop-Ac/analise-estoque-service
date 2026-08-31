@@ -4,6 +4,7 @@ pyodbc
 psycopg2-binary
 sqlalchemy
 openpyxl
+xlsxwriter
 fastapi
 uvicorn
 python-dotenv

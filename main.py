@@ -199,6 +199,40 @@ SAZ_FATOR_MAX = float(os.getenv("SAZ_FATOR_MAX") or 2.0)
 # causa de onda sazonal do subgrupo — o item lento participa pouco da onda.
 SAZ_FATOR_MAX_LENTO = float(os.getenv("SAZ_FATOR_MAX_LENTO") or 1.5)
 
+import time as _time_etapa
+
+
+class _Cronometro:
+    """Cronômetro por etapa do job: imprime a duração de cada etapa ao vivo e
+    um resumo ordenado no fim — é o que diz ONDE o tempo do batch é gasto."""
+
+    def __init__(self):
+        self.etapas = []
+        self._ini = None
+        self._nome = None
+
+    def etapa(self, nome):
+        self.fim()
+        self._nome = nome
+        self._ini = _time_etapa.monotonic()
+        print(f"\n[ETAPA] {nome}...")
+
+    def fim(self):
+        if self._nome is not None:
+            dur = _time_etapa.monotonic() - self._ini
+            self.etapas.append((self._nome, dur))
+            print(f"[ETAPA] {self._nome}: {dur:.1f}s")
+            self._nome = None
+
+    def resumo(self):
+        self.fim()
+        total = sum(d for _, d in self.etapas) or 1
+        print("\n===== TEMPO POR ETAPA (maior primeiro) =====")
+        for nome, dur in sorted(self.etapas, key=lambda x: -x[1]):
+            print(f"  {dur / 60:6.1f} min ({100 * dur / total:4.1f}%)  {nome}")
+        print(f"  TOTAL: {total / 60:.1f} min")
+
+
 # ==========================================
 # CONEXÃO ODBC / CARGA DE DADOS
 # ==========================================
@@ -245,12 +279,18 @@ def get_connection():
     return pyodbc.connect(conn_str)
 
 
+_pg_engine = None
+
+
 def get_postgres_engine():
-    """Cria engine do SQLAlchemy para PostgreSQL"""
-    print(f"DEBUG: POSTGRES_URL={POSTGRES_URL}")
-    # Replace postgres:// with postgresql:// just in case it is still wrong in memory for some reason
-    final_url = POSTGRES_URL.replace("postgres://", "postgresql://")
-    return create_engine(final_url)
+    """Engine ÚNICO do processo (pool reaproveitado entre as etapas do job).
+    pool_pre_ping descarta conexão morta no checkout — sobrevive a restart do
+    Postgres no meio do job sem estourar na etapa seguinte."""
+    global _pg_engine
+    if _pg_engine is None:
+        final_url = POSTGRES_URL.replace("postgres://", "postgresql://")
+        _pg_engine = create_engine(final_url, pool_pre_ping=True, pool_recycle=1800)
+    return _pg_engine
 
 
 def criar_tabela_postgres():
@@ -3203,6 +3243,7 @@ def atualizar_compras_fornecedor_mongo():
 
 def run_job():
     print(f"\n=== INICIANDO JOB DE ANÁLISE FIFO: {datetime.datetime.now()} ===")
+    cron = _Cronometro()
 
     import empacotamento as emp
     hoje_ts = pd.Timestamp.today().normalize()
@@ -3247,10 +3288,12 @@ def run_job():
             print(f"  [EMPAC] AVISO: store indisponível ({e}). Caindo para carga completa.")
             emp_on = False; pack_store = None; modo_incremental = False
 
+    cron.etapa("1) carga do ERP (OPENQUERY fatiado)")
     # 1) Carregar dados (janela no modo incremental; completa caso contrário)
     df_saidas, df_ent, df_dev, df_saldo_produto, df_vp = carregar_dados_do_banco(
         corte=corte_pack if modo_incremental else None)
     
+    cron.etapa("2) limpeza e tipos")
     # === CORREÇÃO DE TIPOS: Garantir que PRO_CODIGO seja string em todos os DataFrames ===
     df_saidas["PRO_CODIGO"] = df_saidas["PRO_CODIGO"].astype(str).str.strip()
     df_ent["PRO_CODIGO"] = df_ent["PRO_CODIGO"].astype(str).str.strip()
@@ -3300,6 +3343,7 @@ def run_job():
     # 3) FIFO Core — MOTOR ÚNICO por camadas (semeado pelo pacote no modo incremental).
     #    Produz, num só passe: DATA_COMPRA por venda (data média ponderada) e as
     #    camadas residuais do estoque atual (df_long), reconciliadas ao saldo do ERP.
+    cron.etapa("3) FIFO por camadas + custo FIFO")
     print("Processando FIFO (motor por camadas)...")
     df_sai_fifo = df_sai_valid.copy()
     data_compra, df_long, df_div = emp.fifo_por_camadas(
@@ -3321,6 +3365,7 @@ def run_job():
     # Estatísticas vitalícias congeladas (nº vendas, datas, tempo em estoque)
     pack_stats = (emp.stats_por_produto(packs_docs) if modo_incremental else None)
 
+    cron.etapa("4) métricas e classificação")
     # 4) Metricas
     df_metricas = calcular_metricas_e_classificar(
         df_sai_fifo, df_ent_valid, df_saldo_produto, df_vp,
@@ -3328,6 +3373,7 @@ def run_job():
         pack_stats=pack_stats,
         custo_fifo=df_custo_fifo)
     
+    cron.etapa("5) idade média do saldo atual")
     # === ETAPA NOVA: Calcular Idade Média do Saldo Atual e Classificar ===
     # Agrupar df_long por produto para calcular weighted average age
     if not df_long.empty:
@@ -3370,10 +3416,11 @@ def run_job():
         df_metricas["TEMPO_MEDIO_SALDO_ATUAL"] = None
         df_metricas["CATEGORIA_SALDO_ATUAL"] = None
     
-    # 6) Comparação com Anterior
+    cron.etapa("6) comparação com execução anterior (banco)")
     # 6) Comparação com Anterior (AGORA VIA BANCO)
     df_metricas, df_mudancas = detectar_alteracoes_via_banco(df_metricas)
     
+    cron.etapa("7) gravação no PostgreSQL")
     # 7) Salvar no PostgreSQL
     print("Salvando dados no PostgreSQL...")
     try:
@@ -3383,6 +3430,7 @@ def run_job():
         print(f"Erro ao salvar no PostgreSQL: {e}")
         return
 
+    cron.etapa("7b) empacotamento (Mongo)")
     # 7b) EMPACOTAMENTO: backfill (1ª vez) ou fold incremental do corte -> grava no Mongo
     if emp_on and pack_store is not None:
         try:
@@ -3407,11 +3455,20 @@ def run_job():
         except Exception as e:
             print(f"  [EMPAC] AVISO: falha ao gravar pacote: {e}")
 
+    cron.etapa("8) backup Excel")
     # 8) Opcional: Ainda salvar Excel para backup/compatibilidade
     print(f"Salvando backup em Excel: {ARQUIVO_SAIDA}")
     try:
         if ARQUIVO_SAIDA.exists(): os.remove(ARQUIVO_SAIDA)
-        with pd.ExcelWriter(ARQUIVO_SAIDA, engine="openpyxl") as writer:
+        # xlsxwriter escreve o mesmo .xlsx várias vezes mais rápido que o
+        # openpyxl neste volume (dezenas de milhares de linhas x ~100 colunas);
+        # openpyxl fica como reserva para ambiente sem a dependência.
+        try:
+            import xlsxwriter  # noqa: F401
+            engine_xlsx = "xlsxwriter"
+        except ImportError:
+            engine_xlsx = "openpyxl"
+        with pd.ExcelWriter(ARQUIVO_SAIDA, engine=engine_xlsx) as writer:
             df_metricas.to_excel(writer, sheet_name="ANALISE_ATUAL", index=False)
             if not df_mudancas.empty:
                 df_mudancas.to_excel(writer, sheet_name="RELATORIO_MUDANCAS", index=False)
@@ -3422,17 +3479,21 @@ def run_job():
         print(f"Erro ao salvar Excel de backup: {e}")
         # Não retorna erro aqui, pois o principal (PostgreSQL) já foi salvo
 
+    cron.etapa("9) e-mail do relatório")
     # 9) Enviar e-mail
     enviar_email_relatorio(ARQUIVO_SAIDA, df_mudancas)
     
+    cron.etapa("10) verificação final da tabela")
     # 10) Verificar dados salvos
     print("\n" + "="*50)
     print("VERIFICAÇÃO FINAL DA TABELA")
     print("="*50)
     verificar_tabela_postgres()
     
+    cron.etapa("11) auto-agrupamento de similares")
     # 11) Auto-Agrupamento Similares
     agrupar_similares_automaticamente()
+    cron.resumo()
 
     # 12) Lista produto x fornecedor (histórico de compra) -> Mongo (tela Comprar agora)
     try:

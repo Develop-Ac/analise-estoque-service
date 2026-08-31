@@ -1,4 +1,4 @@
-from api import listar_analise
+from rotas_analise import listar_analise
 import pandas as pd
 from sqlalchemy import create_engine, text
 import os
