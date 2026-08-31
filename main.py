@@ -3278,10 +3278,13 @@ def run_job():
                 _cam_sem = sum(1 for d in packs_docs.values()
                                for c in d.get("camadas", []) if c.get("custo") is None)
                 if _cam_sem:
-                    print(f"  [EMPAC] ATENÇÃO: {_cam_sem}/{_cam_tot} camadas do pacote sem custo "
-                          f"(pacote anterior à correção de custo FIFO). Esses itens usam o "
-                          f"fallback de última entrada. Rode um BACKFILL (limpar fifo_pack) "
-                          f"para o custo de camada ficar completo.")
+                    # Custo ausente NA ORIGEM: a entrada veio sem PRECO_CUSTO do
+                    # ERP (lançamentos antigos, ajustes LIA/CAD/CDE). Backfill
+                    # não completa o que a fonte não tem — o item usa o fallback
+                    # de última entrada, que é o comportamento desenhado.
+                    print(f"  [EMPAC] {_cam_sem}/{_cam_tot} camadas do pacote sem custo na origem "
+                          f"(entrada sem PRECO_CUSTO no ERP) — esses itens usam o fallback "
+                          f"de última entrada.")
             else:
                 print("  [EMPAC] habilitado, pacote vazio -> BACKFILL (carga completa desta vez)")
         except Exception as e:
