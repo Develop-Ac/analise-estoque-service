@@ -71,67 +71,136 @@ def get_sql_connection():
             f"UID={{{SQL_USER}}};"
             f"PWD={{{SQL_PASSWORD}}};"
         )
-    return pyodbc.connect(conn_str)
+    # timeout de LOGIN: SQL Server fora do ar não pode segurar a thread
+    # indefinidamente (o timeout de query é setado por consulta, via conn.timeout)
+    return pyodbc.connect(conn_str, timeout=int(os.getenv('SQL_LOGIN_TIMEOUT_S') or 10))
 
-def get_realtime_stocks(pro_codes):
-    """
-    Busca o estoque atual (saldo) para uma lista de códigos de produto
-    usando OPENQUERY no SQL Server (Linked Server CONSULTA)
-    """
-    if not pro_codes:
-        return {}
-        
-    # Formata lista para SQL: 'COD1', 'COD2'
-    # Sanitize inputs (simple replace of ' to '')
-    safe_codes = [c.replace("'", "") for c in pro_codes]
-    codes_str = "','" .join(safe_codes)
-    
-    # Query interna a ser executada no Linked Server
-    # Buscando da tabela PRODUTOS (saldo atual)
-    # Supondo coluna PRO_CODIGO e ESTOQUE_DISPONIVEL (conforme visto no main.py)
-    # main.py usa: SELECT ... pro.estoque_disponivel FROM produtos pro ...
-    
-    # Preparing the IN clause for SQL Server OPENQUERY
-    # We need to escape single quotes by doubling them '' because we are inside an OPENQUERY string
-    
-    # 1. Start with safe codes (already stripped of single quotes)
-    # 2. Join them with "','" to create the list for the IN clause: COD1','COD2
-    # 3. For OPENQUERY, we need to double the single quotes: COD1'',''COD2
-    
-    # Let's rebuild properly:
-    # We want final customized SQL: ... IN (''COD1'', ''COD2'') ...
-    
+# =============================================================================
+# Leitura do ERP pela erp-firebird-api (sem SQL Server/OPENQUERY no meio).
+# Sem ERP_API_URL configurada, tudo segue pelo OPENQUERY como sempre; com ela,
+# o OPENQUERY vira plano B quando a API não responder.
+# =============================================================================
+ERP_API_URL = (os.getenv('ERP_API_URL') or '').strip().rstrip('/')
+ERP_API_TOKEN = (os.getenv('ERP_API_TOKEN') or '').strip()
+ERP_API_TIMEOUT_S = float(os.getenv('ERP_API_TIMEOUT_MS') or 15000) / 1000.0
+ERP_API_MAX_EM = 500  # teto do filtro `em` do lado da API
+
+
+def _erp_api_consulta(recurso, corpo):
+    """POST /erp/<recurso>/consulta na erp-firebird-api. Levanta exceção em
+    qualquer falha (rede, HTTP != 2xx, resposta truncada) — quem chama decide
+    o fallback."""
+    import json as _json
+    import urllib.request as _urlreq
+    req = _urlreq.Request(
+        f"{ERP_API_URL}/erp/{recurso}/consulta",
+        data=_json.dumps(corpo).encode('utf-8'),
+        headers={
+            'content-type': 'application/json',
+            'x-app-token': ERP_API_TOKEN,
+            # O relatório /health/n1 do outro lado é por serviço: sem este
+            # header o consumo aparece como "desconhecido".
+            'x-servico': 'analise-estoque-service',
+        },
+        method='POST',
+    )
+    with _urlreq.urlopen(req, timeout=ERP_API_TIMEOUT_S) as resp:
+        payload = _json.loads(resp.read().decode('utf-8'))
+    meta = payload.get('meta') or {}
+    if meta.get('truncado'):
+        raise RuntimeError(
+            f"consulta {recurso} truncada em {meta.get('linhas')} linhas — resultado incompleto"
+        )
+    return payload.get('dados') or []
+
+
+def _realtime_stocks_via_api(pro_codes):
+    """Saldo por produto pela erp-firebird-api (PRO_CODIGO é inteiro no catálogo)."""
+    codigos = []
+    for c in pro_codes:
+        try:
+            codigos.append(int(str(c).strip()))
+        except (TypeError, ValueError):
+            continue
+    codigos = sorted(set(codigos))
+
+    stock_map = {}
+    for i in range(0, len(codigos), ERP_API_MAX_EM):
+        lote = codigos[i:i + ERP_API_MAX_EM]
+        dados = _erp_api_consulta('produtos', {
+            'empresa': 3,
+            'campos': ['PRO_CODIGO', 'ESTOQUE_DISPONIVEL'],
+            'filtros': [{'campo': 'PRO_CODIGO', 'op': 'em', 'valor': lote}],
+            # +1 de folga: pedir o tamanho exato do lote marcaria toda
+            # consulta completa como truncada.
+            'limite': len(lote) + 1,
+        })
+        for row in dados:
+            cod = row.get('PRO_CODIGO')
+            if cod is None:
+                continue
+            qty = row.get('ESTOQUE_DISPONIVEL')
+            stock_map[str(cod).strip()] = float(qty) if qty is not None else 0.0
+    return stock_map
+
+
+def _realtime_stocks_openquery(pro_codes):
+    """Plano B: saldo via OPENQUERY no SQL Server (Linked Server CONSULTA).
+    Com timeout obrigatório: sem ele, um travamento do linked server segura a
+    thread para sempre e derruba o /analise inteiro."""
+    safe_codes = [str(c).replace("'", "") for c in pro_codes]
+
+    # Dentro do OPENQUERY as aspas simples são dobradas: IN (''COD1'', ''COD2'')
     formatted_codes_list = [f"''{c}''" for c in safe_codes]
     in_clause_inner = ", ".join(formatted_codes_list)
 
     inner_query = f"SELECT pro_codigo, estoque_disponivel FROM produtos WHERE pro_codigo IN ({in_clause_inner}) AND empresa = 3"
-    
-    # Query final
     query = f"SELECT * FROM OPENQUERY(CONSULTA, '{inner_query}')"
-    
+
     conn = get_sql_connection()
+    try:
+        conn.timeout = int(os.getenv("STOCK_RT_TIMEOUT_S") or 15)
+    except Exception:
+        pass
     stock_map = {}
-    
+
     try:
         cursor = conn.cursor()
         cursor.execute(query)
         rows = cursor.fetchall()
-        
+
         for row in rows:
             # row[0] = pro_codigo, row[1] = estoque_disponivel
-            # Normalizar codigo (strip)
             if row[0]:
                 code = str(row[0]).strip()
                 qty = float(row[1]) if row[1] is not None else 0.0
                 stock_map[code] = qty
-                
+
     except Exception as e:
         print(f"Erro no SQL Server: {e}")
         raise e
     finally:
         conn.close()
-        
+
     return stock_map
+
+
+def get_realtime_stocks(pro_codes):
+    """
+    Busca o estoque atual (saldo) para uma lista de códigos de produto.
+    Caminho preferido: erp-firebird-api (leitura direta do Firebird, com
+    timeout). Plano B: OPENQUERY no SQL Server, como sempre foi.
+    """
+    if not pro_codes:
+        return {}
+
+    if ERP_API_URL:
+        try:
+            return _realtime_stocks_via_api(pro_codes)
+        except Exception as e:
+            print(f"AVISO: erp-firebird-api indisponível ({e}) — caindo para o OPENQUERY")
+
+    return _realtime_stocks_openquery(pro_codes)
 
 # ==========================================
 # MODELOS
@@ -2307,6 +2376,10 @@ def _carregar_grupos_fornecedor(force=False):
         if grupos:
             sconn = get_sql_connection()
             try:
+                try:
+                    sconn.timeout = int(os.getenv("STOCK_RT_TIMEOUT_S") or 15)
+                except Exception:
+                    pass
                 cur = sconn.cursor()
                 cur.execute(
                     "SELECT * FROM OPENQUERY(CONSULTA, "

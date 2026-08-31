@@ -27,6 +27,10 @@ services:
       - SQL_DATABASE=${SQL_DATABASE:-master}
       - SQL_USER=${SQL_USER:-sa}
       - SQL_PASSWORD=${SQL_PASSWORD:-senha_secreta}
+      # Leitura do ERP pela erp-firebird-api. VAZIO = segue 100% pelo OPENQUERY.
+      - ERP_API_URL=${ERP_API_URL:-}
+      - ERP_API_TOKEN=${ERP_API_TOKEN:-}
+      - ERP_API_TIMEOUT_MS=${ERP_API_TIMEOUT_MS:-15000}
     restart: unless-stopped
     volumes:
       - ./data:/app/data
