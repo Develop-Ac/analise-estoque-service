@@ -38,10 +38,10 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
-# Copiar código da aplicação
-COPY main.py .
-COPY api.py .
-COPY empacotamento.py .
+# Copiar código da aplicação — todos os .py da raiz: o app é modular
+# (config, infra_db, erp_api, rotas_*...); copiar por lista deixa módulo
+# novo fora da imagem e o container morre com ModuleNotFoundError no boot.
+COPY *.py .
 
 # Criar diretório de dados/cache se necessario
 RUN mkdir -p /app/data
