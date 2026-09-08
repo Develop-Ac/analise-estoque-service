@@ -200,6 +200,7 @@ SAZ_FATOR_MAX = float(os.getenv("SAZ_FATOR_MAX") or 2.0)
 SAZ_FATOR_MAX_LENTO = float(os.getenv("SAZ_FATOR_MAX_LENTO") or 1.5)
 
 import time as _time_etapa
+import estado_job as _estado
 
 
 class _Cronometro:
@@ -216,6 +217,7 @@ class _Cronometro:
         self._nome = nome
         self._ini = _time_etapa.monotonic()
         print(f"\n[ETAPA] {nome}...")
+        _estado.registrar_etapa(nome)   # a tela Sistema→ETL acompanha a etapa em curso
 
     def fim(self):
         if self._nome is not None:
@@ -3242,6 +3244,22 @@ def atualizar_compras_fornecedor_mongo():
 
 
 def run_job():
+    """Executa a análise semanal registrando início, etapas e fim em estado_job —
+    é o que a tela Sistema→ETL da intranet mostra. Recusa rodar em paralelo:
+    o scheduler de domingo e o botão "Rodar" da tela passam pela mesma porta."""
+    if not _estado.registrar_inicio():
+        print("Job já está rodando. Ignorando disparo.")
+        return
+    try:
+        _executar_job()
+    except BaseException as e:
+        _estado.registrar_fim("erro", erro=e)
+        raise
+    else:
+        _estado.registrar_fim("ok")
+
+
+def _executar_job():
     print(f"\n=== INICIANDO JOB DE ANÁLISE FIFO: {datetime.datetime.now()} ===")
     cron = _Cronometro()
 
@@ -3422,6 +3440,8 @@ def run_job():
     cron.etapa("6) comparação com execução anterior (banco)")
     # 6) Comparação com Anterior (AGORA VIA BANCO)
     df_metricas, df_mudancas = detectar_alteracoes_via_banco(df_metricas)
+    _estado.anotar(produtos=int(len(df_metricas)), alteracoes=int(len(df_mudancas)),
+                   modo=("incremental" if modo_incremental else "completa"))
     
     cron.etapa("7) gravação no PostgreSQL")
     # 7) Salvar no PostgreSQL
@@ -3431,6 +3451,9 @@ def run_job():
         salvar_distribuicao_fifo_postgres(df_long)
     except Exception as e:
         print(f"Erro ao salvar no PostgreSQL: {e}")
+        # Saída antecipada sem exceção: fecha a execução como erro para a tela;
+        # o wrapper run_job não sobrescreve (registrar_fim é idempotente).
+        _estado.registrar_fim("erro", erro=f"gravação no PostgreSQL: {e}")
         return
 
     cron.etapa("7b) empacotamento (Mongo)")

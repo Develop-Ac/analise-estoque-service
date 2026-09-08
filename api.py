@@ -12,7 +12,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 import config  # noqa: F401  (carrega o .env antes de tudo)
-from estado_job import ARQUIVO_ESTADO, load_state, save_state
+from estado_job import ARQUIVO_ESTADO, em_execucao, load_state, save_state
 from infra_db import get_db_connection
 
 BACKGROUND_Running = False
@@ -99,7 +99,8 @@ def background_scheduler():
                         should_run = True
                 
                 if should_run:
-                    if not BACKGROUND_Running:
+                    # em_execucao(): a tela pode ter disparado o job à mão.
+                    if not BACKGROUND_Running and not em_execucao():
                         BACKGROUND_Running = True
                         try:
                             print(f">>> Iniciando execução do Job FIFO: {now}")

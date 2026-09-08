@@ -330,6 +330,8 @@ Base FastAPI (docs interativas em `/docs`). Principais rotas:
 | POST | `/similar/recalc` · `/similar/auto-group` | recalcular/auto-agrupar grupos |
 | POST | `/promo/plan` · `/promo/export` | itens com excesso para promoção/giro |
 | GET | `/health` | healthcheck |
+| GET | `/sistema/job` | estado do job semanal (execução em curso com etapa atual, última execução com etapas/duração/produtos/alterações, histórico, próxima execução) — alimenta a tela Sistema→ETL da intranet |
+| POST | `/sistema/job/rodar` | dispara a análise agora, em thread (409 se já estiver rodando) |
 
 ---
 
@@ -375,6 +377,10 @@ lead time do fornecedor; muito acima com capital alto → dá para enxugar.
 
 - **Agendamento:** loop interno roda o job aos **domingos às 14h** (estado em
   `data/fifo_service_state.json`). Em produção pode ser disparado por cron/EasyPanel.
+- **Acompanhamento:** `estado_job.py` registra início, etapa em curso, fim (ok/erro),
+  contagens e as últimas 20 execuções no mesmo JSON; a tela **Sistema→ETL** da intranet
+  lê `GET /sistema/job` e dispara `POST /sistema/job/rodar`. O JSON fica em `data/` —
+  sem volume nesse caminho, o histórico zera a cada redeploy (o `last_run` também).
 - **Retenção:** mantém as **2 últimas execuções** em `com_fifo_completo`
   (compara a atual com a anterior e marca `teve_alteracao_analise`).
 - **Relatório:** ao fim do job, envia e-mail com resumo + Excel de backup
