@@ -11,20 +11,34 @@ import promo_regra as pr  # noqa: E402
 def _item(**kw):
     base = dict(estoque_disponivel=30, estoque_max_sugerido=10, custo_unitario=100.0, preco_venda_1=270.0,
                 preco_venda_2=160.0, demanda_real_dia=1 / 30.0, dias_sem_venda=20, curva_abc="C",
-                sgr_codigo=1, qtd_varejo_12m=10, qtd_atacado_12m=0, fora_regua=False)
+                sgr_codigo=1, qtd_varejo_12m=10, qtd_atacado_12m=0, fora_regua=False, tempo_medio_saldo_atual=300)
     base.update(kw)
     return base
 
 
 def test_acao_precedencia():
-    assert pr.acao_sugerida(None, 10, 3, "A")[0] == "revisar_cadastro"
-    assert pr.acao_sugerida(100, None, None, "A") == ("giro_caixa", "sem_venda_12m")
-    assert pr.acao_sugerida(100, 400, 3, "A") == ("giro_caixa", "sem_venda_12m")
+    V, N = 300, 90  # idade média do saldo: velho (> 240 d) / novo
+    assert pr.acao_sugerida(None, 10, 3, "A", V)[0] == "revisar_cadastro"
+    assert pr.acao_sugerida(100, None, None, "A", V) == ("giro_caixa", "sem_venda_12m")
+    assert pr.acao_sugerida(100, 400, 3, "A", V) == ("giro_caixa", "sem_venda_12m")
+    assert pr.acao_sugerida(100, 10, 30, "A", V) == ("giro_caixa", "cobertura_alta")
+    assert pr.acao_sugerida(100, 10, 18, "B", V) == ("vender_sem_repor", None)
+    assert pr.acao_sugerida(100, 10, 18, "C", V) == ("promocao", "promocao_24")
+    assert pr.acao_sugerida(100, 10, 8, "A", V) == ("promocao", "promocao_12")
+    assert pr.acao_sugerida(100, 10, 2, "D", V) == ("promocao", "promocao_6")
+    # sem idade informada = trata como velho (conservador)
     assert pr.acao_sugerida(100, 10, 30, "A") == ("giro_caixa", "cobertura_alta")
-    assert pr.acao_sugerida(100, 10, 18, "B") == ("vender_sem_repor", None)
-    assert pr.acao_sugerida(100, 10, 18, "C") == ("promocao", "promocao_24")
-    assert pr.acao_sugerida(100, 10, 8, "A") == ("promocao", "promocao_12")
-    assert pr.acao_sugerida(100, 10, 2, "D") == ("promocao", "promocao_6")
+
+
+def test_saldo_recente_nao_liquida():
+    """Compra grande recente (36 un há 65 d) com cobertura de 25 meses: não é liquidação —
+    a promoção do ERP é por item e pegaria as unidades novas. Vira vender sem repor."""
+    N = 94
+    assert pr.acao_sugerida(482, 49, 24.9, "A", N) == ("vender_sem_repor", None)
+    assert pr.acao_sugerida(482, 49, 24.9, "D", N) == ("vender_sem_repor", None)
+    # nunca vendeu, mas saldo recente: começa em promoção 30 %; vira liquidação quando envelhecer
+    assert pr.acao_sugerida(100, None, None, "D", N) == ("promocao", "promocao_24")
+    assert pr.acao_sugerida(100, None, None, "D", 241) == ("giro_caixa", "sem_venda_12m")
 
 
 def test_publico():

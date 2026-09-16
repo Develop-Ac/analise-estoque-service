@@ -45,16 +45,26 @@ SRVSQLWIN inverte `yyyy-mm-dd`). DDL das colunas segue o padrão idempotente do 
 
 ## 2. Ação sugerida (uma por item, avaliada nesta ordem)
 
+A **idade média FIFO do saldo** (`tempo_medio_saldo_atual`, dias; limite `PROMO_IDADE_LIQUIDACAO_DIAS`
+= 240 = faixa "Obsoleto") manda na liquidação, porque a promoção do ERP é **por item, não por
+quantidade**: um desconto de liquidação atingiria também as unidades que entraram semana passada
+(caso real: 47 un, 36 delas com 65 dias, cobertura 24,9 m → 40 % no balcão era irreal).
+
 1. `revisar_cadastro` — `custo_unitario` nulo ou ≤ 0.
-2. `giro_caixa` — sem venda em 12 m (`dias_sem_venda` > 365 ou nulo) **ou** `cobertura_meses` > 24.
-   Subtipo informativo: `sem_venda_12m` | `cobertura_alta`.
-3. `vender_sem_repor` — `curva_abc` ∈ {A, B} e `cobertura_meses` > 12: item que vende, só está em
-   quantidade demais. Sem desconto (preço de tabela) e sem compra até normalizar.
-4. `promocao` — os demais (vendeu em 12 m e zera em ≤ 24 m).
+2. sem venda em 12 m (`dias_sem_venda` > 365 ou nulo):
+   saldo velho (idade > 240) → `giro_caixa` / `sem_venda_12m`; saldo recente → `promocao` /
+   `promocao_24` (30 %) — vira liquidação quando o saldo envelhecer (escada no tempo, run a run).
+3. `cobertura_meses` > 24: saldo velho → `giro_caixa` / `cobertura_alta`; saldo recente →
+   `vender_sem_repor` (compra grande recente: não desconta, não repõe).
+4. `vender_sem_repor` — `curva_abc` ∈ {A, B} e `cobertura_meses` > 12.
+5. `promocao` — os demais (degrau pela cobertura: ≤ 6 / ≤ 12 / > 12 m).
+
+Sem idade informada, trata como velho (conservador só na ausência do dado).
 
 Só entram na lista itens com `excesso_qtd > 0` (regra atual do `/promo/plan`), mais os
-`revisar_cadastro` com saldo (para o comprador ver o buraco). Simulação de 13/09/2026: giro 9.582
-itens / R$ 2.041 mil · vender sem repor 199 / R$ 225 mil · promoção 844 / R$ 208 mil.
+`revisar_cadastro` com saldo (para o comprador ver o buraco). Simulação de 13/09/2026: giro 8.443
+itens / R$ 1.527 mil · vender sem repor 495 / R$ 521 mil · promoção 1.687 / R$ 426 mil (843 deles
+sem venda em 12 m mas com saldo recente, R$ 218 mil, começam em 30 %).
 
 **Regras de conteúdo (permanentes):** não existe ação "devolver ao fornecedor" (a AC não devolve);
 nenhum rótulo, tooltip, exportação ou texto da tela cita filial, expansão ou qualquer plano futuro —
@@ -125,6 +135,8 @@ sozinho, então a escada do varejo começa em 15% e termina em 50%.
   395,27 / 496,36 / 696,37 / 996,38; classe PB = `sgr_codigo 154`): ler de `ven_regua_atacado`
   (vendas-service, mesmo Postgres) — não duplicar a tabela no código.
 - Sem `preco_venda_1`/`preco_venda_2` (325 / 899 itens) → preço nulo com motivo `sem_tabela`.
+- A resposta traz `piso_varejo` e `piso_atacado` em R$ (a tela marca "no piso" quando o preço
+  travou nele) e `idade_saldo_dias`.
 - Público decide qual preço vai para a carga: `atacado` → só tabela 2; `varejo` → só tabela 1;
   `ambos` → as duas.
 
@@ -157,7 +169,19 @@ A lista deixa de ser modal e vira a **terceira aba** da página: `Painel | Anál
   **Valor parado** · Cobertura (m) · Última venda · Público (`Badge`) · **Ação** (`Select` inline;
   manual = badge "manual") · Preço balcão · Preço atac. esp. (nulo → "—" com tooltip do motivo) ·
   detalhes (memória do cálculo com custo, tabelas, piso, degrau).
-- Estados: vazio antes de gerar; sem resultado; erro em banner; carregando (`TableSkeleton`).
+- Estados: sem resultado; erro em banner; carregando (`TableSkeleton`). A lista carrega ao abrir a
+  aba e recarrega a cada filtro (sem botão "Gerar").
+- Modal de detalhe organizado por pergunta (critique impeccable 16/09/2026, 18/40 antes do
+  redesenho): "Por que esta ação" (frase com os números do item + para quem + troca de ação),
+  "Preço proposto (aprovação da gerência)" (tabela Canal · Tabela · Proposta · Desconto · Piso em
+  R$, badge "no piso"; caixa potencial em frase), "Estoque" (um fato por `Campo`, com detalhe),
+  "Lotes em estoque"
+  (`CardHead` com total acima de 240 dias). Datas `YYYY-MM-DD` formatadas sem `Date` (UTC recuaria
+  um dia em Cuiabá).
+- Decisões do usuário 16/09/2026: o comprador **nunca decide o preço sozinho** — todo preço da
+  lista é proposta e passa pela aprovação da gerência antes da carga no ERP (a tela diz isso na
+  frase de abertura e no título da seção de preço). O **bônus do vendedor na liquidação sai só no
+  Excel** (coluna "Bônus liquidação/un (R$)" da aba Promocao); não aparece na tela.
 
 ## 6. Cartão atrelado — tela no padrão visual + auditoria impeccable
 

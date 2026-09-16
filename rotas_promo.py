@@ -57,7 +57,7 @@ def _linhas(conn, req: PromoPlanRequest):
     tem_acao = _tabela_existe(conn, "com_promo_acao")
     sql = f"""
         SELECT f.id, f.pro_codigo, f.pro_descricao, f.pro_referencia, f.sgr_codigo, f.sgr_descricao,
-               f.mar_descricao, f.fornecedor1, f.curva_abc, f.categoria_saldo_atual, f.group_id,
+               f.mar_descricao, f.fornecedor1, f.curva_abc, f.categoria_saldo_atual, f.tempo_medio_saldo_atual, f.group_id,
                f.estoque_disponivel, CEIL(COALESCE(f.estoque_max_sugerido,0)) AS estoque_max_sugerido,
                f.custo_unitario, f.custo_fonte, f.preco_venda_1, f.preco_venda_2, f.demanda_real_dia,
                f.data_max_venda, (CURRENT_DATE - f.data_max_venda::date) AS dias_sem_venda, {canal},
@@ -142,11 +142,11 @@ COLS_EXPORT = {
     "fornecedor1": "Fornecedor", "curva_abc": "Curva ABC", "categoria_saldo_atual": "Tempo em estoque",
     "estoque_disponivel": "Saldo", "estoque_max_sugerido": "Máximo sugerido", "excesso_qtd": "Excesso (un)",
     "custo_unitario": "Custo (R$)", "valor_parado": "Valor parado (R$)", "valor_excesso": "Valor em excesso (R$)",
-    "cobertura_meses": "Cobertura (meses)", "data_max_venda": "Última venda", "dias_sem_venda": "Dias sem venda",
+    "cobertura_meses": "Cobertura (meses)", "idade_saldo_dias": "Idade média do saldo (dias)", "data_max_venda": "Última venda", "dias_sem_venda": "Dias sem venda",
     "publico": "Público", "acao": "Ação", "acao_sugerida": "Ação sugerida", "acao_manual": "Ação manual?",
     "preco_venda_1": "Tabela 1 (R$)", "preco_varejo": "Preço promocional balcão (R$)", "desc_varejo_pct": "Desc. balcão (%)",
-    "motivo_varejo": "Obs. balcão", "preco_venda_2": "Tabela 2 (R$)", "preco_atacado": "Preço promocional atacado (R$)",
-    "desc_atacado_pct": "Desc. atacado (%)", "motivo_atacado": "Obs. atacado", "bonus_liquidacao_unit": "Bônus liquidação/un (R$)",
+    "motivo_varejo": "Obs. balcão", "piso_varejo": "Piso balcão (R$)", "preco_venda_2": "Tabela 2 (R$)", "preco_atacado": "Preço promocional atacado (R$)",
+    "desc_atacado_pct": "Desc. atacado (%)", "motivo_atacado": "Obs. atacado", "piso_atacado": "Piso atacado (R$)", "bonus_liquidacao_unit": "Bônus liquidação/un (R$)",
     "caixa_potencial": "Caixa potencial (R$)", "observacao_manual": "Observação",
 }
 TIPO_CAMPANHA = {"promocao": "promocao", "giro_caixa": "liquidacao"}

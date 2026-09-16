@@ -4,8 +4,16 @@
 Função pura (sem banco) — a rota só alimenta com as linhas do com_fifo_completo e a
 régua v3 do atacado (ven_regua_atacado). Regras (spec docs/promocao-valor-parado.md):
 
-  ação (precedência): revisar_cadastro (sem custo) → giro_caixa (sem venda em 12 m ou
-  cobertura > 24 m) → vender_sem_repor (curva A/B e cobertura > 12 m) → promocao.
+  ação (precedência): revisar_cadastro (sem custo) → giro_caixa (saldo VELHO — idade média
+  FIFO > 240 d — e sem venda em 12 m ou cobertura > 24 m) → vender_sem_repor (curva A/B com
+  cobertura > 12 m, ou saldo recente com cobertura > 24 m: compra grande que ainda vai
+  girar) → promocao (degrau pela cobertura).
+
+  A idade do saldo manda porque a promoção do ERP é POR ITEM, não por quantidade: um
+  desconto de liquidação atinge também as unidades que entraram semana passada e
+  venderiam a preço cheio. Item que nunca vendeu mas tem saldo recente começa em
+  promoção (30 %) e só vira liquidação quando o saldo envelhece — a escada no tempo
+  acontece sozinha, run a run.
 
   varejo   (tabela 1): desconto por degrau — promoção 15/20/30 %, liquidação 40/50 % —
                        piso custo × 1,30; nunca abaixo do promocional do atacado.
@@ -36,6 +44,7 @@ VALIDADE_DIAS = int(os.getenv("PROMO_VALIDADE_DIAS", "30"))
 ESCADA_VAREJO = {"promocao_6": .15, "promocao_12": .20, "promocao_24": .30, "cobertura_alta": .40, "sem_venda_12m": .50}
 ESCADA_ATACADO_LIQ = {"cobertura_alta": .15, "sem_venda_12m": .25}
 SGR_PARABRISA = 154
+IDADE_LIQUIDACAO_DIAS = int(os.getenv("PROMO_IDADE_LIQUIDACAO_DIAS", "240"))  # = faixa "Obsoleto" da análise
 
 ACOES = ("revisar_cadastro", "giro_caixa", "vender_sem_repor", "promocao")
 PUBLICOS = ("atacado", "varejo", "ambos")
@@ -61,18 +70,27 @@ def classe(sgr_codigo):
     return "PB" if sgr_codigo == SGR_PARABRISA else "GERAL"
 
 
-def acao_sugerida(custo, dias_sem_venda, cob_meses, curva):
-    """Devolve (acao, subtipo). subtipo: sem_venda_12m | cobertura_alta | promocao_6/12/24 | None."""
+def acao_sugerida(custo, dias_sem_venda, cob_meses, curva, idade_saldo_dias=None):
+    """Devolve (acao, subtipo). subtipo: sem_venda_12m | cobertura_alta | promocao_6/12/24 | None.
+
+    idade_saldo_dias = idade média FIFO do saldo atual (tempo_medio_saldo_atual). Sem o dado,
+    assume saldo velho (comportamento conservador só na ausência da informação)."""
     c = _num(custo)
     if c is None or c <= 0:
         return "revisar_cadastro", None
     sem_venda = dias_sem_venda is None or dias_sem_venda > 365
     cob = _num(cob_meses)
+    idade = _num(idade_saldo_dias)
+    saldo_velho = idade is None or idade > IDADE_LIQUIDACAO_DIAS
+    ab = (curva or "").upper() in ("A", "B")
     if sem_venda:
-        return "giro_caixa", "sem_venda_12m"
+        return ("giro_caixa", "sem_venda_12m") if saldo_velho else ("promocao", "promocao_24")
     if cob is not None and cob > 24:
-        return "giro_caixa", "cobertura_alta"
-    if (curva or "").upper() in ("A", "B") and cob is not None and cob > 12:
+        if saldo_velho:
+            return "giro_caixa", "cobertura_alta"
+        # saldo recente com cobertura alta = compra grande recente: não desconta, não repõe
+        return "vender_sem_repor", None
+    if ab and cob is not None and cob > 12:
         return "vender_sem_repor", None
     if cob is None or cob <= 6:
         return "promocao", "promocao_6"
@@ -101,7 +119,8 @@ def precos(acao, subtipo, custo, preco1, preco2, sgr_codigo, fora_regua=False, r
     p1 = _num(preco1)
     p2 = _num(preco2)
     out = {"preco_varejo": None, "preco_atacado": None, "desc_varejo_pct": None, "desc_atacado_pct": None,
-           "motivo_varejo": None, "motivo_atacado": None, "bonus_liquidacao_unit": None}
+           "motivo_varejo": None, "motivo_atacado": None, "bonus_liquidacao_unit": None,
+           "piso_varejo": None, "piso_atacado": None}   # pisos em R$ (a tela mostra "no piso" quando travou)
 
     if acao == "revisar_cadastro":
         out["motivo_varejo"] = out["motivo_atacado"] = "sem_custo"
@@ -125,6 +144,7 @@ def precos(acao, subtipo, custo, preco1, preco2, sgr_codigo, fora_regua=False, r
             mk, dmax = regua.get((classe(sgr_codigo), faixa(c)), REGUA_PADRAO[(classe(sgr_codigo), faixa(c))])
             d = float(dmax)
             piso = c * float(mk) * (1 - d)
+        out["piso_atacado"] = round(piso, 2)
         if piso >= p2:
             out["motivo_atacado"] = "tabela_abaixo_regua"
         else:
@@ -138,7 +158,8 @@ def precos(acao, subtipo, custo, preco1, preco2, sgr_codigo, fora_regua=False, r
         out["motivo_varejo"] = "sem_tabela"
     else:
         d = ESCADA_VAREJO[subtipo]
-        pv = max(p1 * (1 - d), c * PISO_VAREJO, out["preco_atacado"] or 0.0)  # balcão nunca abaixo do atacado
+        out["piso_varejo"] = round(max(c * PISO_VAREJO, out["preco_atacado"] or 0.0), 2)  # balcão nunca abaixo do atacado
+        pv = max(p1 * (1 - d), out["piso_varejo"])
         if pv >= p1:
             out["motivo_varejo"] = "tabela_abaixo_piso"
         else:
@@ -160,7 +181,8 @@ def avaliar(item, regua=None):
     r["valor_parado"] = round(saldo * (custo or 0.0), 2)
     r["valor_excesso"] = round(r["excesso_qtd"] * (custo or 0.0), 2)
     r["cobertura_meses"] = round(saldo / (dem * 30.0), 1) if dem > 0 else None
-    acao, sub = acao_sugerida(custo, r.get("dias_sem_venda"), r["cobertura_meses"], r.get("curva_abc"))
+    r["idade_saldo_dias"] = _num(r.get("tempo_medio_saldo_atual"))
+    acao, sub = acao_sugerida(custo, r.get("dias_sem_venda"), r["cobertura_meses"], r.get("curva_abc"), r["idade_saldo_dias"])
     r["acao_sugerida"], r["acao_subtipo"] = acao, sub
     r["publico"] = publico(r.get("qtd_varejo_12m"), r.get("qtd_atacado_12m"))
     r.update(precos(acao, sub, custo, r.get("preco_venda_1"), r.get("preco_venda_2"),
