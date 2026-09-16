@@ -203,6 +203,12 @@ A lista deixa de ser modal e vira a **terceira aba** da página: `Painel | Anál
   `group_id`) para os similares não se separarem; na individual a ordem é estrita. Sem `sort`
   vale a ordem histórica (curva do grupo, nome). No front, clique no cabeçalho: 1º desc (asc em
   Produto/ABC), 2º inverte, 3º volta ao padrão; `aria-sort` no `Th`.
+- Rótulo da ação `giro_caixa` na tela e no Excel: **Liquidação** (o código interno não muda).
+- Critério único de grupo no front (`emGrupo`): `grupo_chave` com `grupo_qtd_itens > 1` — o mesmo
+  que monta os cabeçalhos. O `group_id` antigo (com_relacionamento_itens) só marca "relacionado";
+  um original relacionado nunca tem `grupo_chave` e aparece como item avulso, sem recuo,
+  "Unificado" nem números do grupo. Filho de grupo = flag `isGroupChild` posta ao renderizar
+  sob o cabeçalho.
 - Visão individual: o mín–máx do grupo de similares aparece dentro do cartão Sugestão, abaixo do
   rótulo ("Grupo 5 – 20"), em vez de badge solto.
 

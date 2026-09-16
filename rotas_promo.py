@@ -150,6 +150,7 @@ COLS_EXPORT = {
     "caixa_potencial": "Caixa potencial (R$)", "observacao_manual": "Observação",
 }
 TIPO_CAMPANHA = {"promocao": "promocao", "giro_caixa": "liquidacao"}
+ACAO_ROTULO = {"giro_caixa": "Liquidação", "promocao": "Promoção", "vender_sem_repor": "Vender sem repor", "revisar_cadastro": "Revisar cadastro"}
 
 
 def _registrar_campanhas(conn, carga, inicio, fim, usuario):
@@ -179,6 +180,9 @@ def exportar_promocao(req: PromoPlanRequest):
         linhas.sort(key=lambda x: -x["valor_parado"])
         df = pd.DataFrame(linhas)
         df_lista = df[[c for c in COLS_EXPORT if c in df.columns]].rename(columns=COLS_EXPORT)
+        for col in ("Ação", "Ação sugerida"):   # rótulo legível, igual ao da tela
+            if col in df_lista.columns:
+                df_lista[col] = df_lista[col].map(lambda v: ACAO_ROTULO.get(v, v))
 
         inicio, fim = date.today(), date.today() + timedelta(days=VALIDADE_DIAS)
         carga = df[df["acao"].isin(TIPO_CAMPANHA) & (df["preco_varejo"].notna() | df["preco_atacado"].notna())].copy()
