@@ -178,12 +178,33 @@ A lista deixa de ser modal e vira a **terceira aba** da página: `Painel | Anál
   "Lotes em estoque"
   (`CardHead` com total acima de 240 dias). Datas `YYYY-MM-DD` formatadas sem `Date` (UTC recuaria
   um dia em Cuiabá).
+- Destilado 16/09/2026 (noite, comando `distill`): o modal ficou com quatro blocos e nada além —
+  (1) decisão: badge da ação + "Vender no …" + histórico por canal em uma linha, e uma frase curta com
+  o número que decide; (2) preço proposto (Canal · Tabela · Proposta · Desconto; "no piso" vira badge
+  na proposta, a coluna Piso saiu); (3) cinco `Campo`: Saldo (máximo), Leva para zerar, Última venda,
+  Idade do saldo, Custo (valor parado); (4) lotes em `<details>` recolhido. Trocar a ação foi para o
+  rodapé do modal. Tamanho `lg`. Saíram: nota da regra de piso, caixa potencial por item, valor em
+  excesso, categoria de tempo, fonte do custo (tudo continua no Excel).
+- Filtro de ação da aba: botão ativo pinta como primário (`Btn pressed`, `aria-pressed`) — antes o
+  `bg-brand-50` perdia para o `bg-white` do kit e o ativo não aparecia.
+- **Grupo de similares: a lista NÃO considera** (pendente de decisão). O excesso é medido contra o
+  máximo do próprio item (`estoque_max_sugerido`); `group_id`, `grp_estoque_*` e `rateio_prop_grupo`
+  existem em `com_fifo_completo` e permitem medir contra o grupo (excesso do grupo × rateio do item).
 - Decisões do usuário 16/09/2026: o comprador **nunca decide o preço sozinho** — todo preço da
   lista é proposta e passa pela aprovação da gerência antes da carga no ERP (a tela diz isso na
   frase de abertura e no título da seção de preço). O **bônus do vendedor na liquidação sai só no
   Excel** (coluna "Bônus liquidação/un (R$)" da aba Promocao); não aparece na tela.
 
 ## 6. Cartão atrelado — tela no padrão visual + auditoria impeccable
+
+- Ordenação por coluna em `GET /analise` (16/09/2026): `sort` ∈ produto | curva | estoque | capital |
+  tendencia | sugestao e `sort_dir` asc|desc, lista fechada em `_SORT_COLS` (`rotas_analise.py`).
+  Na visão agrupada o grupo inteiro é posicionado pelo seu extremo (window MAX/MIN por
+  `group_id`) para os similares não se separarem; na individual a ordem é estrita. Sem `sort`
+  vale a ordem histórica (curva do grupo, nome). No front, clique no cabeçalho: 1º desc (asc em
+  Produto/ABC), 2º inverte, 3º volta ao padrão; `aria-sort` no `Th`.
+- Visão individual: o mín–máx do grupo de similares aparece dentro do cartão Sugestão, abaixo do
+  rótulo ("Grupo 5 – 20"), em vez de badge solto.
 
 Escopo (só visual e acessibilidade; lógica, filtros e chamadas intocados):
 

@@ -196,6 +196,43 @@ def comparacao_nivel_servico_custo():
         if 'conn' in locals(): conn.close()
 
 
+# Chave que mantém os itens de um grupo de similares juntos na listagem.
+_CHAVE_GRUPO = "CASE WHEN group_id IS NOT NULL AND group_id <> '' THEN group_id ELSE pro_codigo END"
+
+# Colunas ordenáveis pela tela (nome público -> expressão SQL). Lista fechada: nada do cliente entra no SQL.
+_SORT_COLS = {
+    "produto": "pro_descricao",
+    "curva": "curva_abc",
+    "estoque": "COALESCE(estoque_disponivel, 0)",
+    "capital": "COALESCE(estoque_disponivel, 0) * COALESCE(custo_unitario, 0)",
+    "tendencia": "COALESCE(fator_tendencia, 0)",
+    "sugestao": "COALESCE(estoque_max_sugerido, 0)",
+}
+
+
+def _order_by(sort: Optional[str], sort_dir: str, grouped_view: bool) -> str:
+    """ORDER BY da listagem. Sem `sort`: melhor curva do grupo, nome do grupo, nome do item
+    (ordem histórica). Com `sort`: na visão agrupada o grupo inteiro é posicionado pelo seu
+    extremo (MAX no desc, MIN no asc) para os similares não se separarem; na individual a
+    ordem é estrita pela coluna."""
+    expr = _SORT_COLS.get(sort or "")
+    if expr is None:
+        return f"""
+                MIN(curva_abc) OVER (PARTITION BY {_CHAVE_GRUPO}) ASC,
+                MIN(pro_descricao) OVER (PARTITION BY {_CHAVE_GRUPO}) ASC,
+                pro_descricao ASC"""
+    d = "DESC" if (sort_dir or "").lower() == "desc" else "ASC"
+    nulls = "NULLS LAST"
+    if not grouped_view:
+        return f"{expr} {d} {nulls}, pro_descricao ASC"
+    agg = "MAX" if d == "DESC" else "MIN"
+    return f"""
+                {agg}({expr}) OVER (PARTITION BY {_CHAVE_GRUPO}) {d} {nulls},
+                {_CHAVE_GRUPO} ASC,
+                {expr} {d} {nulls},
+                pro_descricao ASC"""
+
+
 @router.get("/analise", response_model=PaginatedResponse)
 def listar_analise(
     page: int = 1,
@@ -216,6 +253,8 @@ def listar_analise(
     grouped_view: bool = False,
     kpi: Optional[str] = None,
     fornecedor: Optional[str] = None,
+    sort: Optional[str] = Query(None, description="Coluna: produto | curva | estoque | capital | tendencia | sugestao"),
+    sort_dir: str = "asc",
 ):
     try:
         conn = get_db_connection()
@@ -225,6 +264,7 @@ def listar_analise(
 
     try:
         offset = (page - 1) * limit
+        order_by = _order_by(sort, sort_dir, grouped_view)
         
         # Filtros Cláusula WHERE
         filters = []
@@ -472,15 +512,7 @@ def listar_analise(
                 eh_original, teve_outlier_aparado, outlier_qtd_aparada, outlier_motivo
             FROM com_fifo_completo
             WHERE {where_clause}
-            ORDER BY
-                -- 1. Melhor Curva do Grupo (Prioridade A)
-                MIN(curva_abc) OVER (PARTITION BY CASE WHEN group_id IS NOT NULL AND group_id <> '' THEN group_id ELSE pro_codigo END) ASC,
-                
-                -- 2. Ordem Alfabética do Grupo (Mantém consistência)
-                MIN(pro_descricao) OVER (PARTITION BY CASE WHEN group_id IS NOT NULL AND group_id <> '' THEN group_id ELSE pro_codigo END) ASC,
-                
-                -- 3. Ordenação dentro do grupo ou itens soltos
-                pro_descricao ASC
+            ORDER BY {order_by}
             LIMIT :limit OFFSET :offset
         """)
         
