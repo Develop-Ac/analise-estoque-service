@@ -138,11 +138,27 @@ class SimulationRequest(BaseModel):
     coverage_days: int
 
 class PromoPlanRequest(BaseModel):
-    # days=None (padrão): excesso medido contra o MÁXIMO SUGERIDO oficial do
-    # cálculo (tempo padrão por curva). Informar days só para simular outra cobertura.
+    # Lista de promoção por valor parado (docs/promocao-valor-parado.md). O excesso é
+    # sempre medido contra o máximo sugerido oficial; `days` e `grouped_view` ficaram
+    # só por compatibilidade com o cliente antigo e são ignorados.
     days: Optional[int] = None
+    grouped_view: bool = False
     subgroups: Optional[List[str]] = None
     brands: Optional[List[str]] = None
     categories: Optional[List[str]] = None
-    grouped_view: bool = False
+    acoes: Optional[List[str]] = None      # revisar_cadastro | giro_caixa | vender_sem_repor | promocao
+    publicos: Optional[List[str]] = None   # atacado | varejo | ambos
+    curvas: Optional[List[str]] = None
+    page: int = 1
+    page_size: int = 100
+    sort: Optional[str] = "valor_parado"
+    sort_dir: Optional[str] = "desc"
+    usuario: Optional[str] = None          # quem exportou (registro da campanha)
+
+class PromoAcaoRequest(BaseModel):
+    acao: str
+    preco_varejo: Optional[float] = None
+    preco_atacado: Optional[float] = None
+    observacao: Optional[str] = None
+    usuario: Optional[str] = None
 

@@ -565,6 +565,13 @@ def criar_tabela_postgres():
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='preco_venda_2') THEN
             ALTER TABLE com_fifo_completo ADD COLUMN preco_venda_2 DECIMAL(15,4);
         END IF;
+        -- ===== Canal de venda 12 m (BI): público da lista de promoção =====
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='qtd_varejo_12m') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN qtd_varejo_12m DECIMAL(15,4);
+        END IF;
+        IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='qtd_atacado_12m') THEN
+            ALTER TABLE com_fifo_completo ADD COLUMN qtd_atacado_12m DECIMAL(15,4);
+        END IF;
 
         -- ===== Originais (encomenda) + cálculo consolidado por grupo (descrição) =====
         IF NOT EXISTS (SELECT 1 FROM information_schema.columns WHERE table_name='com_fifo_completo' AND column_name='sob_encomenda') THEN
@@ -933,6 +940,18 @@ def carregar_dados_do_banco(corte=None):
     print(f"  - Entradas carregadas: {len(df_ent)} registros")
     print(f"  - Devoluções carregadas: {len(df_dev)} registros")
     print(f"  - Produtos (Saldo) carregados: {len(df_saldo_produto)} registros")
+    # Venda perdida registrada na INTRANET (orçamento do atacado concluído com item
+    # sem saldo: tabela ven_venda_perdida do vendas-service). Mesmas colunas da
+    # VENDA_PERDIDA do ERP; soma-se a ela.
+    try:
+        df_vp_intranet = pd.read_sql(
+            "SELECT pro_codigo, quantidade, created_at::date AS data FROM ven_venda_perdida WHERE quantidade > 0",
+            get_postgres_engine())
+        if not df_vp_intranet.empty:
+            df_vp = pd.concat([df_vp, df_vp_intranet], ignore_index=True)
+        print(f"  - Venda perdida da intranet: {len(df_vp_intranet)} registros")
+    except Exception as e:
+        print(f"  - AVISO: venda perdida da intranet indisponível ({e}). Seguindo sem ela.")
     print(f"  - Venda perdida carregada: {len(df_vp)} registros")
 
     # Normalizar nomes das colunas de saldo_produto
@@ -972,7 +991,37 @@ def carregar_dados_do_banco(corte=None):
         print("DEBUG: SGR_DESCRICAO não encontrada no DataFrame!")
 
     conn.close()
+    # Canal por item (12 m): define o PÚBLICO da lista de promoção. Anexado ao saldo
+    # para seguir o mesmo merge que já leva preços e fornecedores até o com_fifo_completo.
+    df_saldo_produto = _anexar_canal_12m(df_saldo_produto, conn)
+
     return df_saidas, df_ent, df_dev, df_saldo_produto, df_vp
+
+
+def _anexar_canal_12m(df_saldo_produto, conn):
+    """Unidades vendidas nos últimos 12 meses por canal (balcão × atacado), lidas da
+    vw_analise_vendas do BI — mesmo SQL Server do linked server, sem OPENQUERY.
+    Falha aqui não derruba o job: colunas ficam nulas e a lista trata como 'ambos'."""
+    # Data em yyyymmdd: o locale português do SRVSQLWIN inverte 'yyyy-mm-dd' (vira yyyy-dd-mm).
+    ini = (pd.Timestamp.today().normalize() - pd.DateOffset(months=12)).strftime("%Y%m%d")
+    bi = os.getenv("BI_DATABASE", "BI")
+    sql = f"""
+        SELECT PRO_CODIGO,
+               SUM(CASE WHEN UPPER(local_venda) LIKE '%ATAC%' THEN QUANTIDADE ELSE 0 END) AS QTD_ATACADO_12M,
+               SUM(CASE WHEN UPPER(local_venda) LIKE '%ATAC%' THEN 0 ELSE QUANTIDADE END) AS QTD_VAREJO_12M
+        FROM {bi}.dbo.vw_analise_vendas
+        WHERE DT_EMISSAO >= '{ini}' AND DT_CANCELAMENTO IS NULL
+        GROUP BY PRO_CODIGO"""
+    try:
+        conn.timeout = 300
+        df = pd.read_sql(sql, conn)
+        print(f"  - Canal 12m (BI): {len(df)} produtos com venda")
+    except Exception as e:
+        print(f"  - AVISO: canal 12m do BI indisponível ({e}). Público da promoção ficará 'ambos'.")
+        df = pd.DataFrame(columns=["PRO_CODIGO", "QTD_ATACADO_12M", "QTD_VAREJO_12M"])
+    df["PRO_CODIGO"] = df["PRO_CODIGO"].astype(str).str.strip()
+    df_saldo_produto["PRO_CODIGO"] = df_saldo_produto["PRO_CODIGO"].astype(str).str.strip()
+    return df_saldo_produto.merge(df, on="PRO_CODIGO", how="left")
 
 def aplicar_analise_agrupada(df_met: pd.DataFrame) -> pd.DataFrame:
     """
@@ -2075,7 +2124,7 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     colunas_saldo = [
         "PRO_CODIGO", "PRO_DESCRICAO", "SGR_CODIGO", "SGR_DESCRICAO",
         "ESTOQUE_DISPONIVEL", "MAR_DESCRICAO", "CUSTO_CADASTRO",
-        "PRECO_VENDA_1", "PRECO_VENDA_2",
+        "PRECO_VENDA_1", "PRECO_VENDA_2", "QTD_VAREJO_12M", "QTD_ATACADO_12M",
         "FORNECEDOR1", "FORNECEDOR2", "FORNECEDOR3",
     ]
     colunas_saldo = [c for c in colunas_saldo if c in df_saldo_produto.columns]
@@ -2981,6 +3030,8 @@ def salvar_metricas_postgres(df_metricas):
         'MARGEM_UNIT_REALIZADA': 'margem_unitaria_realizada',
         'PRECO_VENDA_1': 'preco_venda_1',
         'PRECO_VENDA_2': 'preco_venda_2',
+        'QTD_VAREJO_12M': 'qtd_varejo_12m',
+        'QTD_ATACADO_12M': 'qtd_atacado_12m',
         'MARGEM_UNIT': 'margem_unitaria',
         'MARGEM_PCT': 'margem_pct',
         'TEVE_OUTLIER_APARADO': 'teve_outlier_aparado',
@@ -3048,7 +3099,8 @@ def salvar_metricas_postgres(df_metricas):
         'pro_referencia',
         'demanda_real_dia', 'sigma_demanda_dia', 'cv_demanda', 'mean_size_mes', 'cv2_tamanho', 'classe_xyz',
         'estoque_seguranca', 'nivel_servico_z', 'lead_time_dias',
-        'custo_unitario', 'preco_venda_1', 'preco_venda_2', 'margem_unitaria', 'margem_pct',
+        'custo_unitario', 'preco_venda_1', 'preco_venda_2', 'qtd_varejo_12m', 'qtd_atacado_12m',
+        'margem_unitaria', 'margem_pct',
         'teve_outlier_aparado', 'outlier_qtd_aparada', 'outlier_motivo',
         'nivel_servico_custo', 'z_custo', 'estoque_min_custo', 'estoque_max_custo', 'estoque_seg_custo',
         'venda_perdida_12m', 'valor_vendido_12m',
