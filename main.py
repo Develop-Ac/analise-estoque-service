@@ -2443,6 +2443,17 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
         (df_met["DATA_MAX_VENDA"] < corte_data) &
         (df_met["ESTOQUE_DISPONIVEL"] <= 0)
     )
+    # O consolidado do grupo (GRUPO_QTD_ITENS, demanda, venda perdida) já contou
+    # TODOS os membros do cadastro. Membro velho de um grupo que continua na
+    # análise tem de ficar: sem ele a tela mostra um grupo de 1 item com mín/máx
+    # vindo de uma venda perdida que ninguém enxerga. Também fica quem ainda tem
+    # alvo de compra próprio (venda perdida recente num item sem venda desde 2020).
+    if "GRUPO_CHAVE" in df_met.columns:
+        _grupos_vivos = set(df_met.loc[~mask_velho_sem_estoque, "GRUPO_CHAVE"].dropna())
+        mask_velho_sem_estoque &= ~df_met["GRUPO_CHAVE"].isin(_grupos_vivos)
+    for _c in ("ESTOQUE_MAX_SUGERIDO", "GRUPO_ESTOQUE_MAX"):
+        if _c in df_met.columns:
+            mask_velho_sem_estoque &= ~(pd.to_numeric(df_met[_c], errors="coerce").fillna(0) > 0)
     df_met = df_met.loc[~mask_velho_sem_estoque].copy()
 
     # ==========================================
