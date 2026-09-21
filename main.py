@@ -1762,7 +1762,7 @@ def montar_custo_e_margem(df_met, custo_fifo=None, df_ent_valid=None):
 
 def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz,
                               params_forn=None, mapa_compras=None, mapa_linha=None,
-                              custo_por_produto=None):
+                              custo_por_produto=None, data_max_por_produto=None):
     """
     Cálculo CONSOLIDADO por grupo de produto (= descrição + LINHA da marca),
     somando a demanda das marcas SUBSTITUTAS DE VERDADE (mesma linha), EXCLUINDO
@@ -1794,6 +1794,15 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     sai = sai.dropna(subset=["GRP"]).copy()
     sai["DATA"] = pd.to_datetime(sai["DATA"], errors="coerce")
     dmax_grp = sai.groupby("GRP")["DATA"].max()
+    # Última venda do grupo = a mais recente entre os membros, contando o histórico
+    # congelado do pacote (`data_max_por_produto`). Só com a janela raw, grupo sem
+    # venda em 12m ficava sem data e escapava da trava de produto velho que o item
+    # individual recebe — o grupo saía com máximo maior que o dos próprios membros.
+    if data_max_por_produto is not None and len(data_max_por_produto):
+        _dm = pd.to_datetime(pd.Series(data_max_por_produto), errors="coerce").dropna()
+        _dm.index = _dm.index.astype(str).str.strip()
+        _dm_grp = _dm.groupby(_dm.index.map(pro2grp)).max()
+        dmax_grp = pd.concat([dmax_grp, _dm_grp]).groupby(level=0).max()
     sai["PRO_CODIGO"] = sai["GRP"]  # re-chaveia: grupo vira o "produto"
 
     vp = pd.DataFrame()
@@ -2419,7 +2428,10 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
         df_grp = calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz,
                                            params_forn=params_forn, mapa_compras=mapa_compras,
                                            mapa_linha=mapa_linha,
-                                           custo_por_produto=_custo_prod)
+                                           custo_por_produto=_custo_prod,
+                                           data_max_por_produto=(
+                                               df_met.set_index("PRO_CODIGO")["DATA_MAX_VENDA"]
+                                               if "DATA_MAX_VENDA" in df_met.columns else None))
         if df_grp is not None and not df_grp.empty:
             print(f"  - Grupos de produto (consolidados): {len(df_grp)}")
             df_met = df_met.merge(df_grp, left_on="GRUPO_CHAVE", right_on="GRUPO", how="left")
