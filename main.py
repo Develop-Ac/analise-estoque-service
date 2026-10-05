@@ -948,6 +948,10 @@ def carregar_dados_do_banco(corte=None):
             "SELECT pro_codigo, quantidade, created_at::date AS data FROM ven_venda_perdida WHERE quantidade > 0",
             get_postgres_engine())
         if not df_vp_intranet.empty:
+            # OPENQUERY devolve MAIÚSCULAS e o Postgres minúsculas; sem alinhar aqui o
+            # concat cria PRO_CODIGO duas vezes e df["PRO_CODIGO"] vira DataFrame.
+            df_vp_intranet.columns = [str(c).upper() for c in df_vp_intranet.columns]
+            df_vp.columns = [str(c).upper() for c in df_vp.columns]
             df_vp = pd.concat([df_vp, df_vp_intranet], ignore_index=True)
         print(f"  - Venda perdida da intranet: {len(df_vp_intranet)} registros")
     except Exception as e:
