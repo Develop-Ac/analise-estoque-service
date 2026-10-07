@@ -2,7 +2,8 @@ pandas
 numpy
 pyodbc
 psycopg2-binary
-sqlalchemy
+# 2.1 troca o driver padrao de postgresql:// para psycopg 3; a imagem tem psycopg2
+sqlalchemy<2.1
 openpyxl
 xlsxwriter
 fastapi

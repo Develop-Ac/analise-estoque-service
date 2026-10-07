@@ -12,11 +12,21 @@ from config import POSTGRES_URL, SQL_HOST, SQL_PORT, SQL_DATABASE, SQL_USER, SQL
 _pg_engine = None
 
 
+def normalizar_url_pg(url):
+    """Fixa o driver psycopg2 em URLs postgres:// ou postgresql:// sem +driver.
+    O SQLAlchemy 2.x recusa o alias postgres:// e, a partir do 2.1, o driver
+    padrao de postgresql:// passou a ser o psycopg 3, que a imagem nao tem.
+    URL que ja traz +driver passa intacta."""
+    esquema, _, resto = url.partition("://")
+    if esquema in ("postgres", "postgresql"):
+        return "postgresql+psycopg2://" + resto
+    return url
+
+
 def get_pg_engine():
     global _pg_engine
     if _pg_engine is None:
-        # SQLAlchemy 2.x não aceita o alias 'postgres://' — normaliza
-        url = POSTGRES_URL.replace("postgres://", "postgresql://")
+        url = normalizar_url_pg(POSTGRES_URL)
         _pg_engine = create_engine(
             url,
             pool_pre_ping=True,

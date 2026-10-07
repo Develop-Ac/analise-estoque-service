@@ -2,6 +2,7 @@
 import os
 import pyodbc
 from sqlalchemy import create_engine, text
+from infra_db import normalizar_url_pg
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -47,7 +48,7 @@ def get_connection():
     return pyodbc.connect(conn_str)
 
 def get_postgres_engine():
-    final_url = POSTGRES_URL.replace("postgres://", "postgresql://")
+    final_url = normalizar_url_pg(POSTGRES_URL)
     return create_engine(final_url)
 
 # ==========================================

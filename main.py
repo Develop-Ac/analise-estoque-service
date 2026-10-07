@@ -17,6 +17,7 @@ import math
 # Imports para PostgreSQL
 import psycopg2
 from sqlalchemy import create_engine, text
+from infra_db import normalizar_url_pg
 import warnings
 from dotenv import load_dotenv
 
@@ -290,7 +291,7 @@ def get_postgres_engine():
     Postgres no meio do job sem estourar na etapa seguinte."""
     global _pg_engine
     if _pg_engine is None:
-        final_url = POSTGRES_URL.replace("postgres://", "postgresql://")
+        final_url = normalizar_url_pg(POSTGRES_URL)
         _pg_engine = create_engine(final_url, pool_pre_ping=True, pool_recycle=1800)
     return _pg_engine
 
