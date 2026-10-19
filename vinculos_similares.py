@@ -7,7 +7,16 @@ as chaves desses produtos são UNIDAS: todos os itens que tinham qualquer uma
 delas passam a compartilhar uma única chave (a menor em ordem alfabética, para
 ser estável entre rodadas). Itens sem chave (originais, descrição vazia) não
 entram — o original continua avulso, como no grupo automático.
+
+Desvincular (origem='avulso') faz o contrário: o produto sai de QUALQUER grupo,
+inclusive o da própria descrição, e é planejado sozinho até ser vinculado de novo.
 """
+AVULSO = "avulso"
+
+
+def group_id_avulso(pro_codigo):
+    """group_id da linha de um produto desvinculado (a coluna é NOT NULL e única por produto)."""
+    return f"{AVULSO}:{str(pro_codigo).strip()}"
 
 
 def unificar_chaves(pro2chave, vinculos):
@@ -54,3 +63,17 @@ def carregar_vinculos_manuais(engine):
     if vinculos:
         print(f"  - Vínculos manuais: {len(vinculos)} grupos.")
     return vinculos
+
+
+def carregar_avulsos(engine):
+    """Produtos desvinculados na tela (origem 'avulso'): ficam fora de qualquer grupo."""
+    import pandas as pd
+    try:
+        df = pd.read_sql(f"SELECT pro_codigo FROM com_relacionamento_itens WHERE origem = '{AVULSO}'", engine)
+    except Exception as e:
+        print(f"  - AVISO: desvinculados indisponíveis ({e}).")
+        return set()
+    avulsos = set(df["pro_codigo"].astype(str).str.strip())
+    if avulsos:
+        print(f"  - Desvinculados (avulsos): {len(avulsos)} produtos.")
+    return avulsos

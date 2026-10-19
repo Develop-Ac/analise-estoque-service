@@ -21,7 +21,7 @@ import pandas as pd
 from sqlalchemy import text
 
 from infra_db import get_db_connection, get_pg_engine, get_sql_connection
-from vinculos_similares import carregar_vinculos_manuais, unificar_chaves
+from vinculos_similares import carregar_avulsos, carregar_vinculos_manuais, unificar_chaves
 
 _COD_OK = re.compile(r"^[A-Za-z0-9._-]{1,50}$")
 MAX_PRODUTOS = 500          # trava de segurança da busca por descrição/vínculo
@@ -198,22 +198,24 @@ def analisar_grupo(pro_codigos):
     hoje = pd.Timestamp.today().normalize()
     mapa_linha = main.carregar_marca_linha()
     vinculos = [[str(p).strip() for p in v] for v in carregar_vinculos_manuais(get_pg_engine())]
+    avulsos = sorted(carregar_avulsos(get_pg_engine()))
 
     sql_conn = get_sql_connection()
     try:
         sp, vinc_rel = fechar_membros(codigos, vinculos, lambda c, d: _ler_produtos(sql_conn, c, d))
 
-        # Chaves como na rodada: original fica fora; vínculo manual une as chaves.
+        # Chaves como na rodada: original e desvinculado ficam fora; vínculo manual une as chaves.
         sp["IS_ORIG"] = sp["MAR_DESCRICAO"].apply(main.marca_eh_original)
         sp["GRUPO"] = [main.grupo_chave_com_linha(d, m, mapa_linha) or ""
                        for d, m in zip(sp["PRO_DESCRICAO"], sp["MAR_DESCRICAO"])]
+        sp.loc[sp["PRO_CODIGO"].isin(avulsos), "GRUPO"] = ""
         nao = sp[(~sp["IS_ORIG"]) & (sp["GRUPO"] != "")]
         remap = unificar_chaves(dict(zip(nao["PRO_CODIGO"], nao["GRUPO"])), vinc_rel)
         chave_final = {p: remap.get(k, k) for p, k in zip(nao["PRO_CODIGO"], nao["GRUPO"])}
         alvos = {chave_final[c] for c in codigos if c in chave_final}
         fora = sorted(codigos - set(chave_final))
         if fora:
-            avisos.append(f"Sem grupo (original, inativo ou sem descrição): {', '.join(fora)}")
+            avisos.append(f"Sem grupo (original, desvinculado, inativo ou sem descrição): {', '.join(fora)}")
         if not alvos:
             return {"status": "success", "grupos": [], "avisos": avisos}
 
@@ -265,12 +267,13 @@ def analisar_grupo(pro_codigos):
             gk = r["GRUPO"]
             cods_g = [p for p in membros if chave_final[p] == gk]
             params = {c.lower(): _sem_nan(r.get(c)) for c in _COLS_GRUPO}
-            params.update({"gk": gk, "cods": cods_g, "antigas": antigas_por_grupo[gk]})
+            params.update({"gk": gk, "cods": cods_g, "antigas": antigas_por_grupo[gk], "avulsos": avulsos})
             # Linhas do snapshot com chave antiga e fora do cadastro ativo vão junto:
-            # senão sobrariam como um grupo fantasma com números velhos.
+            # senão sobrariam como um grupo fantasma com números velhos. Desvinculado nunca.
             pg.execute(text(
                 f"UPDATE com_fifo_completo SET grupo_chave = :gk, {sets} "
-                f"WHERE {_SNAPSHOT} AND (pro_codigo = ANY(:cods) OR grupo_chave = ANY(:antigas))"),
+                f"WHERE {_SNAPSHOT} AND (pro_codigo = ANY(:cods) OR grupo_chave = ANY(:antigas)) "
+                f"AND NOT (pro_codigo = ANY(:avulsos))"),
                 params)
             resumo.append({"grupo_chave": gk, "qtd_itens": params["grupo_qtd_itens"],
                            "curva": params["grupo_curva"], "estoque_min": params["grupo_estoque_min"],
