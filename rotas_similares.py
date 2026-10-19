@@ -33,7 +33,7 @@ def criar_grupo_similares(req: GroupRequest):
         # 1. Identificar se algum já tem grupo
         current_groups = set()
         for pc in req.pro_codigos:
-             res = conn.execute(text("SELECT group_id FROM com_relacionamento_itens WHERE pro_codigo = :c"), {"c": pc.strip()}).scalar()
+             res = conn.execute(text("SELECT group_id FROM com_relacionamento_itens WHERE pro_codigo = :c AND origem <> 'avulso'"), {"c": pc.strip()}).scalar()
              if res:
                  current_groups.add(res)
         
@@ -72,22 +72,67 @@ def criar_grupo_similares(req: GroupRequest):
 @router.delete("/similar/ungroup")
 def desvincular_produtos(req: GroupRequest):
     """
-    Remove produtos de qualquer grupo que participem.
-    Também limpa os dados de grupo na tabela principal.
+    Tira os produtos de qualquer grupo, inclusive o da própria descrição: ficam
+    'avulso' em com_relacionamento_itens (a análise os planeja sozinhos e o
+    auto-agrupamento não os junta de novo) até serem vinculados outra vez.
+    No snapshot atual saem do grupo na hora; `restantes` = quem ficou no(s)
+    grupo(s), para a tela oferecer a análise do grupo (POST /similar/analise-grupo).
     """
     from sqlalchemy import text
+    from vinculos_similares import AVULSO, group_id_avulso
+    if not req.pro_codigos:
+        raise HTTPException(status_code=400, detail="Lista de produtos vazia")
+    codes = sorted({pc.strip() for pc in req.pro_codigos if pc.strip()})
+    snapshot = "data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)"
     try:
         conn = get_db_connection()
         trans = conn.begin()
-        
-        for pc in req.pro_codigos:
-            # 1. Remove do relacionamento
-            conn.execute(text("DELETE FROM com_relacionamento_itens WHERE pro_codigo = :c"), {"c": pc.strip()})
-            
-            # 2. Limpa dados de grupo na tabela principal
+
+        # Grupos de onde saem (antes de limpar), para devolver quem fica
+        chaves = [r[0] for r in conn.execute(text(
+            f"SELECT DISTINCT grupo_chave FROM com_fifo_completo "
+            f"WHERE {snapshot} AND pro_codigo = ANY(:c) AND grupo_chave IS NOT NULL"), {"c": codes}).fetchall()]
+
+        for code in codes:
+            # 1. Marca como avulso (substitui qualquer vínculo, manual ou automático)
+            conn.execute(text("""
+                INSERT INTO com_relacionamento_itens (group_id, pro_codigo, origem) VALUES (:g, :c, :o)
+                ON CONFLICT (pro_codigo) DO UPDATE SET group_id = EXCLUDED.group_id, origem = EXCLUDED.origem
+            """), {"g": group_id_avulso(code), "c": code, "o": AVULSO})
+
+        # 2. Sai do grupo consolidado no snapshot atual (planejado pelo mín/máx do próprio item)
+        conn.execute(text(f"""
+            UPDATE com_fifo_completo
+            SET grupo_chave = NULL, grupo_qtd_itens = NULL, grupo_estoque_disponivel = NULL,
+                grupo_demanda_dia = NULL, grupo_fator_sazonal = NULL, grupo_curva = NULL,
+                grupo_padrao = NULL, grupo_metodo = NULL, grupo_estoque_min = NULL,
+                grupo_estoque_max = NULL, grupo_estoque_seguranca = NULL, grupo_mean_size = NULL,
+                grupo_cv2 = NULL, grupo_lead_time_dias = NULL, grupo_nivel_servico_custo = NULL,
+                grupo_estoque_min_custo = NULL, grupo_estoque_max_custo = NULL, grupo_margem_pct = NULL
+            WHERE {snapshot} AND pro_codigo = ANY(:c)
+        """), {"c": codes})
+
+        restantes = [r[0] for r in conn.execute(text(
+            f"SELECT pro_codigo FROM com_fifo_completo "
+            f"WHERE {snapshot} AND grupo_chave = ANY(:k) ORDER BY pro_codigo"), {"k": chaves}).fetchall()] if chaves else []
+
+        # Cabeçalho do grupo que ficou: nº de itens e estoque já sem quem saiu
+        # (mín/máx consolidados só mudam com a análise do grupo).
+        if chaves:
+            conn.execute(text(f"""
+                UPDATE com_fifo_completo f
+                SET grupo_qtd_itens = t.n, grupo_estoque_disponivel = t.est
+                FROM (SELECT grupo_chave, COUNT(*) AS n, SUM(COALESCE(estoque_disponivel, 0)) AS est
+                      FROM com_fifo_completo WHERE {snapshot} AND grupo_chave = ANY(:k)
+                      GROUP BY grupo_chave) t
+                WHERE f.{snapshot} AND f.grupo_chave = t.grupo_chave
+            """), {"k": chaves})
+
+        for pc in codes:
+            # 3. Limpa dados do agrupamento antigo (group_id / grp_*) na tabela principal
             conn.execute(text("""
                 UPDATE com_fifo_completo
-                SET 
+                SET
                     group_id = NULL,
                     grp_estoque_disponivel = NULL,
                     grp_qtd_vendida = NULL,
@@ -104,10 +149,10 @@ def desvincular_produtos(req: GroupRequest):
                     grp_demanda_media_dia = NULL,
                     rateio_prop_grupo = NULL
                 WHERE pro_codigo = :c
-            """), {"c": pc.strip()})
-            
+            """), {"c": pc})
+
         trans.commit()
-        return {"status": "success", "message": "Produtos desvinculados"}
+        return {"status": "success", "message": "Produtos desvinculados", "restantes": restantes}
     except Exception as e:
         trans.rollback()
         raise HTTPException(status_code=500, detail=str(e))
@@ -132,7 +177,7 @@ def recalcular_grupo_especifico(req: GroupRequest):
         target_groups = set()
         fmt_codes = [f"'{c.strip()}'" for c in req.pro_codigos]
         if fmt_codes:
-            sql_find_groups = text(f"SELECT DISTINCT group_id FROM com_relacionamento_itens WHERE pro_codigo IN ({','.join(fmt_codes)})")
+            sql_find_groups = text(f"SELECT DISTINCT group_id FROM com_relacionamento_itens WHERE pro_codigo IN ({','.join(fmt_codes)}) AND origem <> 'avulso'")
             rows = conn.execute(sql_find_groups).fetchall()
             for r in rows:
                 if r[0]: target_groups.add(str(r[0]))

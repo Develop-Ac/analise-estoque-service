@@ -591,7 +591,8 @@ def listar_analise(
             try:
                 # Prepara IN clause
                 fmt_codes = [f"'{c}'" for c in page_start_codes]
-                sql_groups = text(f"SELECT pro_codigo, group_id FROM com_relacionamento_itens WHERE pro_codigo IN ({','.join(fmt_codes)})")
+                # Desvinculado (origem 'avulso') não é "relacionado": não entra no group_id da tela
+                sql_groups = text(f"SELECT pro_codigo, group_id FROM com_relacionamento_itens WHERE pro_codigo IN ({','.join(fmt_codes)}) AND origem <> 'avulso'")
                 group_map = {row[0]: row[1] for row in conn.execute(sql_groups).fetchall()}
                 
                 # Identificar grupos unicos envolvidos

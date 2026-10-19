@@ -18,7 +18,7 @@ import math
 import psycopg2
 from sqlalchemy import create_engine, text
 from infra_db import normalizar_url_pg
-from vinculos_similares import carregar_vinculos_manuais, unificar_chaves
+from vinculos_similares import AVULSO, carregar_avulsos, carregar_vinculos_manuais, unificar_chaves
 import warnings
 from dotenv import load_dotenv
 
@@ -1048,7 +1048,7 @@ def aplicar_analise_agrupada(df_met: pd.DataFrame) -> pd.DataFrame:
         engine_pg = get_postgres_engine()
 
         df_groups = pd.read_sql(
-            "SELECT pro_codigo, group_id FROM com_relacionamento_itens",
+            f"SELECT pro_codigo, group_id FROM com_relacionamento_itens WHERE origem <> '{AVULSO}'",
             engine_pg
         )
 
@@ -1771,7 +1771,7 @@ def montar_custo_e_margem(df_met, custo_fifo=None, df_ent_valid=None):
 def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz,
                               params_forn=None, mapa_compras=None, mapa_linha=None,
                               custo_por_produto=None, data_max_por_produto=None,
-                              remap_chaves=None, valores_base=None):
+                              remap_chaves=None, valores_base=None, avulsos=None):
     """
     Cálculo CONSOLIDADO por grupo de produto (= descrição + LINHA da marca),
     somando a demanda das marcas SUBSTITUTAS DE VERDADE (mesma linha), EXCLUINDO
@@ -1786,6 +1786,7 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     aplicado ao GRUPO_CHAVE do item, para o merge casar).
     `valores_base`: valor 12m dos demais grupos (análise de um grupo só, ver
     analise_grupo.py) — a curva ABC do grupo é posicionada contra eles.
+    `avulsos`: produtos desvinculados na tela — ficam fora do consolidado.
     """
     params_forn = params_forn or {}
     mapa_compras = mapa_compras or {}
@@ -1796,6 +1797,8 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     _marcas_sp = sp["MAR_DESCRICAO"] if "MAR_DESCRICAO" in sp.columns else [None] * len(sp)
     sp["GRUPO"] = [grupo_chave_com_linha(d, m, mapa_linha) or ""
                    for d, m in zip(sp["PRO_DESCRICAO"], _marcas_sp)]
+    if avulsos:
+        sp.loc[sp["PRO_CODIGO"].isin(avulsos), "GRUPO"] = ""
     nao = sp[(~sp["IS_ORIG"]) & (sp["GRUPO"] != "")].copy()
     if nao.empty:
         return pd.DataFrame()
@@ -2438,7 +2441,11 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     else:
         df_met["MARCA_LINHA"] = 2
         df_met["GRUPO_CHAVE"] = None
-    # Vínculo manual da tela ("Vincular") une as chaves dos produtos vinculados.
+    # Desvinculado na tela ("Desvincular") sai de qualquer grupo; vínculo manual
+    # ("Vincular") une as chaves dos produtos vinculados.
+    avulsos = carregar_avulsos(get_postgres_engine())
+    if avulsos:
+        df_met.loc[df_met["PRO_CODIGO"].astype(str).str.strip().isin(avulsos), "GRUPO_CHAVE"] = None
     _com_chave = df_met[df_met["GRUPO_CHAVE"].notna()]
     remap_chaves = unificar_chaves(
         dict(zip(_com_chave["PRO_CODIGO"].astype(str).str.strip(), _com_chave["GRUPO_CHAVE"])),
@@ -2466,7 +2473,7 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                                            params_forn=params_forn, mapa_compras=mapa_compras,
                                            mapa_linha=mapa_linha,
                                            custo_por_produto=_custo_prod,
-                                           remap_chaves=remap_chaves,
+                                           remap_chaves=remap_chaves, avulsos=avulsos,
                                            data_max_por_produto=(
                                                df_met.set_index("PRO_CODIGO")["DATA_MAX_VENDA"]
                                                if "DATA_MAX_VENDA" in df_met.columns else None))
@@ -3702,7 +3709,8 @@ def agrupar_similares_automaticamente():
                 # Busca grupos já existentes para esses códigos
                 existing_groups = set()
                 for pc in pro_codigos:
-                    g = conn.execute(text("SELECT group_id FROM com_relacionamento_itens WHERE pro_codigo = :c"), {"c": pc}).scalar()
+                    # Desvinculado não empresta o group_id; a linha dele (curr abaixo) impede reinserir.
+                    g = conn.execute(text(f"SELECT group_id FROM com_relacionamento_itens WHERE pro_codigo = :c AND origem <> '{AVULSO}'"), {"c": pc}).scalar()
                     if g:
                         existing_groups.add(g)
                 

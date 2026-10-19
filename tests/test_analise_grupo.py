@@ -77,3 +77,14 @@ def test_curva_posicionada_contra_a_base():
     assert _grupo(valores_base=[valor / 4] * 4)["GRUPO_CURVA"].iloc[0] == "A"
     # grupo é miúdo perto da base -> cauda
     assert _grupo(valores_base=[1e7] * 50)["GRUPO_CURVA"].iloc[0] in ("C", "D")
+
+
+def test_desvinculado_sai_do_grupo_da_propria_descricao():
+    sp = pd.DataFrame({"PRO_CODIGO": ["1", "2", "3"], "PRO_DESCRICAO": ["PASTILHA X"] * 3,
+                       "MAR_DESCRICAO": ["COBREQ", "FRASLE", "SYL"], "SGR_CODIGO": [10] * 3,
+                       "ESTOQUE_DISPONIVEL": [5, 3, 7], "FORNECEDOR1": ["F"] * 3})
+    sai = pd.concat([_vendas("1", 8, 50.0), _vendas("2", 4, 50.0), _vendas("3", 4, 50.0)],
+                    ignore_index=True)
+    g = main.calcular_grupos_descricao(sai, pd.DataFrame(), sp, HOJE, {}, avulsos={"3"})
+    assert int(g["GRUPO_QTD_ITENS"].iloc[0]) == 2
+    assert float(g["GRUPO_ESTOQUE_DISPONIVEL"].iloc[0]) == 8.0
