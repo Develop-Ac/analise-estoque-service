@@ -262,6 +262,24 @@ def recalcular_grupo_especifico(req: GroupRequest):
     finally:
         conn.close()
 
+@router.post("/similar/analise-grupo")
+def analisar_grupo_vinculado(req: GroupRequest):
+    """
+    Análise unificada só do(s) grupo(s) dos produtos informados (ver analise_grupo.py):
+    lê do ERP apenas os membros, roda o motor do consolidado e grava no snapshot atual.
+    """
+    import estado_job
+    if estado_job.em_execucao():
+        raise HTTPException(status_code=409, detail="Análise completa em execução; tente quando terminar.")
+    from analise_grupo import analisar_grupo
+    try:
+        return analisar_grupo(req.pro_codigos)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Erro análise de grupo: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro na análise do grupo: {e}")
+
 @router.post("/similar/auto-group")
 def trigger_auto_group():
     """
