@@ -18,6 +18,7 @@ import math
 import psycopg2
 from sqlalchemy import create_engine, text
 from infra_db import normalizar_url_pg
+from vinculos_similares import carregar_vinculos_manuais, unificar_chaves
 import warnings
 from dotenv import load_dotenv
 
@@ -1767,7 +1768,8 @@ def montar_custo_e_margem(df_met, custo_fifo=None, df_ent_valid=None):
 
 def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz,
                               params_forn=None, mapa_compras=None, mapa_linha=None,
-                              custo_por_produto=None, data_max_por_produto=None):
+                              custo_por_produto=None, data_max_por_produto=None,
+                              remap_chaves=None):
     """
     Cálculo CONSOLIDADO por grupo de produto (= descrição + LINHA da marca),
     somando a demanda das marcas SUBSTITUTAS DE VERDADE (mesma linha), EXCLUINDO
@@ -1778,6 +1780,8 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     `params_forn`/`mapa_compras`: parâmetros por fornecedor e histórico
     produto×fornecedor — o lead time/revisão do grupo vem do fornecedor de quem
     o grupo MAIS comprou (somando as marcas).
+    `remap_chaves`: {chave_antiga: chave_nova} dos vínculos manuais (o mesmo
+    aplicado ao GRUPO_CHAVE do item, para o merge casar).
     """
     params_forn = params_forn or {}
     mapa_compras = mapa_compras or {}
@@ -1791,6 +1795,8 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     nao = sp[(~sp["IS_ORIG"]) & (sp["GRUPO"] != "")].copy()
     if nao.empty:
         return pd.DataFrame()
+    if remap_chaves:
+        nao["GRUPO"] = nao["GRUPO"].replace(remap_chaves)
     pro2grp = nao.set_index("PRO_CODIGO")["GRUPO"].to_dict()
 
     sai = df_sai_fifo.copy()
@@ -2415,6 +2421,15 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     else:
         df_met["MARCA_LINHA"] = 2
         df_met["GRUPO_CHAVE"] = None
+    # Vínculo manual da tela ("Vincular") une as chaves dos produtos vinculados.
+    _com_chave = df_met[df_met["GRUPO_CHAVE"].notna()]
+    remap_chaves = unificar_chaves(
+        dict(zip(_com_chave["PRO_CODIGO"].astype(str).str.strip(), _com_chave["GRUPO_CHAVE"])),
+        carregar_vinculos_manuais(get_postgres_engine()))
+    if remap_chaves:
+        _troca = df_met["GRUPO_CHAVE"].isin(list(remap_chaves))
+        df_met.loc[_troca, "GRUPO_CHAVE"] = df_met.loc[_troca, "GRUPO_CHAVE"].map(remap_chaves)
+        print(f"  - Vínculos manuais: {len(remap_chaves)} chaves unificadas.")
     # Zera só os NÃO planejados (Sob Encomenda de verdade); os planejados mantêm min/máx.
     mask_naoplan = df_met["SOB_ENCOMENDA"] == True  # noqa: E712
     for col in ["ESTOQUE_MIN_SUGERIDO", "ESTOQUE_MAX_SUGERIDO", "ESTOQUE_SEGURANCA",
@@ -2434,6 +2449,7 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                                            params_forn=params_forn, mapa_compras=mapa_compras,
                                            mapa_linha=mapa_linha,
                                            custo_por_produto=_custo_prod,
+                                           remap_chaves=remap_chaves,
                                            data_max_por_produto=(
                                                df_met.set_index("PRO_CODIGO")["DATA_MAX_VENDA"]
                                                if "DATA_MAX_VENDA" in df_met.columns else None))

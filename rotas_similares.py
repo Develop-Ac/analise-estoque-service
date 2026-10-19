@@ -49,15 +49,15 @@ def criar_grupo_similares(req: GroupRequest):
             placeholders = ",".join([f"'{g}'" for g in current_groups])
             conn.execute(text(f"UPDATE com_relacionamento_itens SET group_id = :new_g WHERE group_id IN ({placeholders})"), {"new_g": final_group_id})
         
-        # Upsert produtos
+        # Upsert produtos (origem 'manual': a análise une o grupo_chave deles)
         for pc in req.pro_codigos:
             code = pc.strip()
             # Check exist
             exists = conn.execute(text("SELECT 1 FROM com_relacionamento_itens WHERE pro_codigo = :c"), {"c": code}).scalar()
             if exists:
-                conn.execute(text("UPDATE com_relacionamento_itens SET group_id = :g WHERE pro_codigo = :c"), {"g": final_group_id, "c": code})
+                conn.execute(text("UPDATE com_relacionamento_itens SET group_id = :g, origem = 'manual' WHERE pro_codigo = :c"), {"g": final_group_id, "c": code})
             else:
-                conn.execute(text("INSERT INTO com_relacionamento_itens (group_id, pro_codigo) VALUES (:g, :c)"), {"g": final_group_id, "c": code})
+                conn.execute(text("INSERT INTO com_relacionamento_itens (group_id, pro_codigo, origem) VALUES (:g, :c, 'manual')"), {"g": final_group_id, "c": code})
         
         trans.commit()
         return {"status": "success", "group_id": final_group_id, "message": "Produtos agrupados com sucesso"}
