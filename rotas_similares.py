@@ -49,15 +49,15 @@ def criar_grupo_similares(req: GroupRequest):
             placeholders = ",".join([f"'{g}'" for g in current_groups])
             conn.execute(text(f"UPDATE com_relacionamento_itens SET group_id = :new_g WHERE group_id IN ({placeholders})"), {"new_g": final_group_id})
         
-        # Upsert produtos
+        # Upsert produtos (origem 'manual': a análise une o grupo_chave deles)
         for pc in req.pro_codigos:
             code = pc.strip()
             # Check exist
             exists = conn.execute(text("SELECT 1 FROM com_relacionamento_itens WHERE pro_codigo = :c"), {"c": code}).scalar()
             if exists:
-                conn.execute(text("UPDATE com_relacionamento_itens SET group_id = :g WHERE pro_codigo = :c"), {"g": final_group_id, "c": code})
+                conn.execute(text("UPDATE com_relacionamento_itens SET group_id = :g, origem = 'manual' WHERE pro_codigo = :c"), {"g": final_group_id, "c": code})
             else:
-                conn.execute(text("INSERT INTO com_relacionamento_itens (group_id, pro_codigo) VALUES (:g, :c)"), {"g": final_group_id, "c": code})
+                conn.execute(text("INSERT INTO com_relacionamento_itens (group_id, pro_codigo, origem) VALUES (:g, :c, 'manual')"), {"g": final_group_id, "c": code})
         
         trans.commit()
         return {"status": "success", "group_id": final_group_id, "message": "Produtos agrupados com sucesso"}
@@ -261,6 +261,24 @@ def recalcular_grupo_especifico(req: GroupRequest):
         raise HTTPException(status_code=500, detail=str(e))
     finally:
         conn.close()
+
+@router.post("/similar/analise-grupo")
+def analisar_grupo_vinculado(req: GroupRequest):
+    """
+    Análise unificada só do(s) grupo(s) dos produtos informados (ver analise_grupo.py):
+    lê do ERP apenas os membros, roda o motor do consolidado e grava no snapshot atual.
+    """
+    import estado_job
+    if estado_job.em_execucao():
+        raise HTTPException(status_code=409, detail="Análise completa em execução; tente quando terminar.")
+    from analise_grupo import analisar_grupo
+    try:
+        return analisar_grupo(req.pro_codigos)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        print(f"Erro análise de grupo: {e}")
+        raise HTTPException(status_code=500, detail=f"Erro na análise do grupo: {e}")
 
 @router.post("/similar/auto-group")
 def trigger_auto_group():

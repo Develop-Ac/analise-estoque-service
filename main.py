@@ -18,6 +18,7 @@ import math
 import psycopg2
 from sqlalchemy import create_engine, text
 from infra_db import normalizar_url_pg
+from vinculos_similares import carregar_vinculos_manuais, unificar_chaves
 import warnings
 from dotenv import load_dotenv
 
@@ -1460,7 +1461,9 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
           f"quantidade aparada pelo cap: {qtd_capada:.0f} un")
 
     # ---------- Demanda mensal real = vendas + venda perdida ----------
-    demanda_mes = vendas_mes.add(vp_mes, fill_value=0)
+    # Sem VP na janela (comum na análise de um grupo só) a Series vazia não tem os
+    # nomes do índice (PRO_CODIGO, MES) e o add com MultiIndex quebra.
+    demanda_mes = vendas_mes.add(vp_mes, fill_value=0) if not vp_mes.empty else vendas_mes
 
     if demanda_mes.empty:
         return pd.DataFrame(columns=["PRO_CODIGO", "DEM_DIA_VENDAS", "DEM_DIA_REAL",
@@ -1767,7 +1770,8 @@ def montar_custo_e_margem(df_met, custo_fifo=None, df_ent_valid=None):
 
 def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indices_saz,
                               params_forn=None, mapa_compras=None, mapa_linha=None,
-                              custo_por_produto=None, data_max_por_produto=None):
+                              custo_por_produto=None, data_max_por_produto=None,
+                              remap_chaves=None, valores_base=None):
     """
     Cálculo CONSOLIDADO por grupo de produto (= descrição + LINHA da marca),
     somando a demanda das marcas SUBSTITUTAS DE VERDADE (mesma linha), EXCLUINDO
@@ -1778,6 +1782,10 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     `params_forn`/`mapa_compras`: parâmetros por fornecedor e histórico
     produto×fornecedor — o lead time/revisão do grupo vem do fornecedor de quem
     o grupo MAIS comprou (somando as marcas).
+    `remap_chaves`: {chave_antiga: chave_nova} dos vínculos manuais (o mesmo
+    aplicado ao GRUPO_CHAVE do item, para o merge casar).
+    `valores_base`: valor 12m dos demais grupos (análise de um grupo só, ver
+    analise_grupo.py) — a curva ABC do grupo é posicionada contra eles.
     """
     params_forn = params_forn or {}
     mapa_compras = mapa_compras or {}
@@ -1791,6 +1799,8 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     nao = sp[(~sp["IS_ORIG"]) & (sp["GRUPO"] != "")].copy()
     if nao.empty:
         return pd.DataFrame()
+    if remap_chaves:
+        nao["GRUPO"] = nao["GRUPO"].replace(remap_chaves)
     pro2grp = nao.set_index("PRO_CODIGO")["GRUPO"].to_dict()
 
     sai = df_sai_fifo.copy()
@@ -1862,10 +1872,20 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     g["GRUPO_ESTOQUE_DISPONIVEL"] = g["GRUPO"].map(grp_est).fillna(0.0)
     g["GRUPO_QTD_ITENS"] = g["GRUPO"].map(grp_n).fillna(0).astype(int)
 
-    # ABC sobre o valor 12m do grupo
+    # ABC sobre o valor 12m do grupo. `valores_base` (análise de um grupo só):
+    # valor 12m dos DEMAIS grupos da última rodada, para a curva sair na mesma régua.
     g = g.sort_values("VALOR_VENDIDO_12M", ascending=False).reset_index(drop=True)
-    tot = g["VALOR_VENDIDO_12M"].sum()
-    g["_PCT"] = (g["VALOR_VENDIDO_12M"].cumsum() / tot * 100) if tot > 0 else 0
+    if valores_base is not None and len(valores_base):
+        _v = pd.concat([pd.Series(g["VALOR_VENDIDO_12M"].values, index=g.index.astype(str)),
+                        pd.Series(pd.to_numeric(pd.Series(valores_base), errors="coerce").fillna(0).values,
+                                  index=[f"_base{i}" for i in range(len(valores_base))])])
+        _v = _v.sort_values(ascending=False, kind="stable")
+        tot = _v.sum()
+        _pct = (_v.cumsum() / tot * 100) if tot > 0 else _v * 0
+        g["_PCT"] = _pct.reindex(g.index.astype(str)).values if tot > 0 else 0
+    else:
+        tot = g["VALOR_VENDIDO_12M"].sum()
+        g["_PCT"] = (g["VALOR_VENDIDO_12M"].cumsum() / tot * 100) if tot > 0 else 0
     g["GRUPO_CURVA"] = g["_PCT"].apply(lambda p: "A" if p <= 70 else "B" if p <= 90 else "C" if p <= 97 else "D")
     g["GRUPO_PADRAO"] = g.apply(lambda r: _classificar_padrao(r["DEM_DIA_REAL"], r.get("ADI"), r.get("CV2_TAMANHO")), axis=1)
 
@@ -2214,6 +2234,9 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                                             vendas_mensais_extra=vendas_mensais_extra)
     n_saz_ok = sum(1 for v in indices_saz.values() if v.get("confiavel"))
     print(f"  - Subgrupos sazonais confiáveis: {n_saz_ok} de {len(indices_saz)}")
+    # A análise de um grupo só (analise_grupo.py) reaproveita estes índices.
+    from analise_grupo import salvar_indices_sazonais
+    salvar_indices_sazonais(indices_saz)
 
     # Os índices sazonais vão DIRETO para calcular_min_max, que aplica um fator
     # por janela: proteção (LT+revisão) no mínimo e LT+revisão+ciclo no máximo.
@@ -2415,6 +2438,15 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     else:
         df_met["MARCA_LINHA"] = 2
         df_met["GRUPO_CHAVE"] = None
+    # Vínculo manual da tela ("Vincular") une as chaves dos produtos vinculados.
+    _com_chave = df_met[df_met["GRUPO_CHAVE"].notna()]
+    remap_chaves = unificar_chaves(
+        dict(zip(_com_chave["PRO_CODIGO"].astype(str).str.strip(), _com_chave["GRUPO_CHAVE"])),
+        carregar_vinculos_manuais(get_postgres_engine()))
+    if remap_chaves:
+        _troca = df_met["GRUPO_CHAVE"].isin(list(remap_chaves))
+        df_met.loc[_troca, "GRUPO_CHAVE"] = df_met.loc[_troca, "GRUPO_CHAVE"].map(remap_chaves)
+        print(f"  - Vínculos manuais: {len(remap_chaves)} chaves unificadas.")
     # Zera só os NÃO planejados (Sob Encomenda de verdade); os planejados mantêm min/máx.
     mask_naoplan = df_met["SOB_ENCOMENDA"] == True  # noqa: E712
     for col in ["ESTOQUE_MIN_SUGERIDO", "ESTOQUE_MAX_SUGERIDO", "ESTOQUE_SEGURANCA",
@@ -2434,6 +2466,7 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
                                            params_forn=params_forn, mapa_compras=mapa_compras,
                                            mapa_linha=mapa_linha,
                                            custo_por_produto=_custo_prod,
+                                           remap_chaves=remap_chaves,
                                            data_max_por_produto=(
                                                df_met.set_index("PRO_CODIGO")["DATA_MAX_VENDA"]
                                                if "DATA_MAX_VENDA" in df_met.columns else None))
