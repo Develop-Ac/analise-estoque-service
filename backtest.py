@@ -81,12 +81,12 @@ def montar_politica(df_pre, df_vp_pre, df_saldo, t0, params_forn, mapa_compras):
               .fillna({"NUM_VENDAS": 0, "NUM_VENDAS_12M": 0})
               .reset_index())
 
-    # ABC pelo valor 12m (mesma regra 70/90/97)
+    # ABC = valor 12m × giro (mesma regra do worker)
     rec = rec.sort_values("VALOR_VENDIDO_12M", ascending=False).reset_index(drop=True)
     tot = rec["VALOR_VENDIDO_12M"].sum()
-    pct = rec["VALOR_VENDIDO_12M"].cumsum() / tot * 100 if tot > 0 else 0
-    rec["CURVA_ABC"] = pd.Series(pct).apply(
-        lambda p: "A" if p <= 70 else "B" if p <= 90 else "C" if p <= 97 else "D")
+    pct = rec["VALOR_VENDIDO_12M"].cumsum() / tot * 100 if tot > 0 else pd.Series(0, index=rec.index)
+    rec["CURVA_ABC"] = [m.curva_combinada(m.curva_por_valor(p), m.classe_giro(mv))
+                        for p, mv in zip(pct, rec["MESES_COM_VENDA_12M"])]
 
     # cadastro (subgrupo, marca, fornecedor1)
     sp = df_saldo.copy()

@@ -98,9 +98,25 @@ subestima a procura). Cada apontamento de venda perdida tem **teto por evento**
 
 ### 2.2 Classificação
 
-- **Curva ABC** — por valor vendido em 12 meses: A (≤70% do faturamento
-  acumulado), B (≤90%), C (≤97%), D (resto). Define a **faixa (piso/teto) do nível
-  de serviço** — o custo escolhe o ponto dentro dela (§2.3).
+- **Curva ABC** — matriz **valor × giro** (Flores & Whybark, 1986), desde 06/11/2026.
+  *Valor* (`curva_valor`): Pareto do valor vendido em 12 meses — A (≤70% do
+  faturamento acumulado), B (≤90%), C (≤97%), D (resto). *Giro* (`classe_giro`): em
+  quantos meses da janela o item vendeu (`meses_com_venda_12m`; venda perdida não
+  conta) — A ≥`GIRO_MESES_A` (6), B ≥`GIRO_MESES_B` (3), C abaixo. Giro por meses e
+  não por quantidade: uma venda única de 200 parafusos conta 1 mês e o critério não
+  depende da unidade (UN/par/jogo/metro).
+
+  | valor \ giro | A | B | C |
+  |---|---|---|---|
+  | A | A | A | B |
+  | B | A | B | C |
+  | C/D | B | C | D |
+
+  Motivo: só por valor bastavam ~R$ 2 mil/ano para ser A — peça cara que vende
+  1×/ano virava A e item barato de giro mensal ficava C/D. Vale também para
+  `grupo_curva` (giro = meses em que alguma marca do grupo vendeu). Define a
+  **faixa (piso/teto) do nível de serviço** — o custo escolhe o ponto dentro dela
+  (§2.3) — e a prioridade da sugestão de compra.
 - **Classe XYZ** — pelo coeficiente de variação (CV) da demanda mensal:
   X (≤`XYZ_LIMIAR_X`), Y (≤`XYZ_LIMIAR_Y`), Z (acima). Item sem giro fica nulo.
 - **Padrão de demanda (Syntetos-Boylan-Croston)** — por **ADI** (intervalo médio
@@ -231,7 +247,7 @@ mantém as 2 últimas execuções). Colunas por grupo:
 |---|---|
 | Identidade | `pro_codigo`, `pro_descricao`, `pro_referencia`, `mar_descricao`, `sgr_codigo`, `sgr_descricao`, `fornecedor1..3`, `estoque_disponivel` |
 | Demanda | `demanda_media_dia`, `demanda_real_dia`, `demanda_media_dia_ajustada`, `demanda_planejamento_dia`, `sigma_demanda_dia`, `venda_perdida_12m`, `valor_vendido_12m`, `dias_ruptura` |
-| Classificação | `curva_abc`, `classe_xyz`, `cv_demanda`, `padrao_demanda`, `metodo_reposicao`, `categoria_estocagem` |
+| Classificação | `curva_abc`, `curva_valor`, `classe_giro`, `meses_com_venda_12m` (DDL manual `sql/2026-11-06_curva_abc_valor_giro.sql`), `classe_xyz`, `cv_demanda`, `padrao_demanda`, `metodo_reposicao`, `categoria_estocagem` |
 | Tendência/Sazonal | `fator_tendencia`, `tendencia_label`, `alerta_tendencia_alta`, `fator_sazonal` |
 | Mín/Máx (item) | `estoque_min_base/max_base`, `estoque_min_ajustado/max_ajustado`, **`estoque_min_sugerido`/`estoque_max_sugerido`**, `estoque_seguranca`, `nivel_servico_z`, `lead_time_dias`, `tipo_planejamento` |
 | Nível econômico (auditoria) | `custo_unitario`, `margem_unitaria`, `margem_pct`, `nivel_servico_custo`, `z_custo`, `estoque_min_custo/max_custo/seg_custo` (e os `grupo_*_custo`) |
@@ -265,6 +281,7 @@ Auxiliares:
 | Variável | Padrão | Descrição |
 |---|---|---|
 | `JANELA_DEMANDA_MESES` | `12` | janela da demanda e do ABC |
+| `GIRO_MESES_A` · `GIRO_MESES_B` | `6` · `3` | meses com venda (na janela) para giro A / B da curva ABC combinada |
 | `LEAD_TIME_DIAS` | `17` | prazo de reposição (dias) — **fallback**; o prazo real vem de `com_fornecedor_parametros` por fornecedor |
 | `PERIODO_REVISAO_PADRAO` | `0` | período de revisão (dias) — fallback; o real vem do cadastro do fornecedor |
 | `SAZ_FATOR_MAX_LENTO` | `1.5` | trava extra do fator sazonal p/ cauda longa (curva C/D, Intermitente/Grumoso) |

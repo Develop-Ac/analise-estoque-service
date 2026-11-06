@@ -55,6 +55,48 @@ TABELA_FIFO = "com_fifo_completo"
 # média desde 2005). ABC também passa a ser calculada sobre esta janela.
 JANELA_DEMANDA_MESES = int(os.getenv("JANELA_DEMANDA_MESES") or 12)
 
+# Curva ABC COMBINADA = valor vendido × giro (matriz de Flores & Whybark, 1986).
+# Só valor punha em A peça cara que vende 1×/ano (para-brisa importado) e deixava
+# em C/D item barato que sai todo mês. Giro = em quantos meses da janela o item
+# VENDEU (critério FSN por % de períodos): uma venda grande de 200 parafusos conta
+# 1 mês, e o critério não depende da unidade (UN, par, jogo, metro).
+GIRO_MESES_A = int(os.getenv("GIRO_MESES_A") or 6)   # vendeu em >= 6 meses
+GIRO_MESES_B = int(os.getenv("GIRO_MESES_B") or 3)   # 3 a 5 meses; abaixo = C
+
+# linha = curva por valor (C e D juntos), coluna = giro
+_MATRIZ_ABC = {
+    ("A", "A"): "A", ("A", "B"): "A", ("A", "C"): "B",
+    ("B", "A"): "A", ("B", "B"): "B", ("B", "C"): "C",
+    ("C", "A"): "B", ("C", "B"): "C", ("C", "C"): "D",
+}
+
+
+def curva_por_valor(pct_acum):
+    """Pareto do valor vendido: A até 70% do faturamento, B até 90, C até 97, D resto."""
+    if pct_acum <= 70:
+        return "A"
+    if pct_acum <= 90:
+        return "B"
+    if pct_acum <= 97:
+        return "C"
+    return "D"
+
+
+def classe_giro(meses_com_venda):
+    """A = vendeu em >= GIRO_MESES_A meses; B = >= GIRO_MESES_B; C = menos (inclui 0)."""
+    m = 0 if pd.isna(meses_com_venda) else int(meses_com_venda)
+    if m >= GIRO_MESES_A:
+        return "A"
+    if m >= GIRO_MESES_B:
+        return "B"
+    return "C"
+
+
+def curva_combinada(curva_valor, giro):
+    """Classe final da matriz valor × giro. Valor D entra como C na matriz."""
+    v = "C" if curva_valor in ("C", "D") else curva_valor
+    return _MATRIZ_ABC[(v, giro)]
+
 # Lead time (prazo de reposição) em dias. O ERP não tem prazo por fornecedor;
 # o prazo REAL vem do cadastro de parâmetros do fornecedor (tabela
 # com_fornecedor_parametros, preenchida na tela /compras/fornecedores) casado
@@ -1467,7 +1509,7 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
                                      "SIGMA_DEMANDA_DIA", "CV_DEMANDA",
                                      "VENDA_PERDIDA_12M", "VALOR_VENDIDO_12M",
                                      "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES",
-                                     "CUSTO_COGS_12M", "PRECO_UNIT_12M",
+                                     "CUSTO_COGS_12M", "PRECO_UNIT_12M", "MESES_COM_VENDA_12M",
                                      "TEVE_OUTLIER_APARADO", "OUTLIER_QTD_APARADA", "OUTLIER_MOTIVO"])
 
     mat = demanda_mes.unstack(fill_value=0).reindex(columns=meses, fill_value=0)
@@ -1484,6 +1526,9 @@ def calcular_demanda_recente_e_variabilidade(df_sai_fifo: pd.DataFrame,
               f"{_aud['total']:.0f} un removidas do cálculo de estocagem")
 
     res = pd.DataFrame(index=mat.index)
+    # Giro da curva ABC: meses em que houve VENDA (venda perdida não conta).
+    res["MESES_COM_VENDA_12M"] = ((vendas_mat.reindex(mat.index, fill_value=0) > 0).sum(axis=1)
+                                  if not vendas_mes.empty else 0)
     res["DEM_DIA_REAL"] = mat.sum(axis=1) / dias_janela
     sigma_mes = mat.std(axis=1, ddof=1) if n_meses > 1 else pd.Series(0.0, index=mat.index)
     media_mes = mat.mean(axis=1)
@@ -1862,11 +1907,12 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     g["GRUPO_ESTOQUE_DISPONIVEL"] = g["GRUPO"].map(grp_est).fillna(0.0)
     g["GRUPO_QTD_ITENS"] = g["GRUPO"].map(grp_n).fillna(0).astype(int)
 
-    # ABC sobre o valor 12m do grupo
+    # ABC do grupo = valor 12m do grupo × giro do grupo (meses em que ALGUMA marca vendeu)
     g = g.sort_values("VALOR_VENDIDO_12M", ascending=False).reset_index(drop=True)
     tot = g["VALOR_VENDIDO_12M"].sum()
     g["_PCT"] = (g["VALOR_VENDIDO_12M"].cumsum() / tot * 100) if tot > 0 else 0
-    g["GRUPO_CURVA"] = g["_PCT"].apply(lambda p: "A" if p <= 70 else "B" if p <= 90 else "C" if p <= 97 else "D")
+    g["GRUPO_CURVA"] = [curva_combinada(curva_por_valor(p), classe_giro(mv))
+                        for p, mv in zip(g["_PCT"], g["MESES_COM_VENDA_12M"])]
     g["GRUPO_PADRAO"] = g.apply(lambda r: _classificar_padrao(r["DEM_DIA_REAL"], r.get("ADI"), r.get("CV2_TAMANHO")), axis=1)
 
     # Fornecedor primário do GRUPO = de quem o grupo (todas as marcas) mais
@@ -2100,7 +2146,7 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     cols_rec = ["DEM_DIA_VENDAS", "DEM_DIA_REAL", "SIGMA_DEMANDA_DIA",
                 "CV_DEMANDA", "VENDA_PERDIDA_12M", "VALOR_VENDIDO_12M",
                 "ADI", "CV2_TAMANHO", "MEAN_SIZE_MES",
-                "CUSTO_COGS_12M", "PRECO_UNIT_12M",
+                "CUSTO_COGS_12M", "PRECO_UNIT_12M", "MESES_COM_VENDA_12M",
                 "TEVE_OUTLIER_APARADO", "OUTLIER_QTD_APARADA", "OUTLIER_MOTIVO"]
     if df_rec is not None and not df_rec.empty:
         df_rec["PRO_CODIGO"] = df_rec["PRO_CODIGO"].astype(str).str.strip()
@@ -2153,7 +2199,8 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     print(f"  - Custo unitário (FIFO camada viva) por fonte: {_cnt}")
 
     # ==========================================
-    # Curva ABC (sobre valor vendido dos últimos 12 meses, não vitalício)
+    # Curva ABC = valor vendido 12m × giro (meses com venda) — matriz combinada.
+    # CURVA_VALOR e CLASSE_GIRO ficam gravadas para auditoria.
     # ==========================================
     df_met["VALOR_VENDIDO_12M"] = pd.to_numeric(df_met["VALOR_VENDIDO_12M"], errors="coerce").fillna(0)
     df_met = df_met.sort_values("VALOR_VENDIDO_12M", ascending=False).reset_index(drop=True)
@@ -2161,17 +2208,11 @@ def calcular_metricas_e_classificar(df_sai_fifo: pd.DataFrame,
     total_valor = df_met["VALOR_VENDIDO_12M"].sum()
     df_met["PCT_ACUM_VALOR"] = (df_met["VALOR_VENDIDO_12M"].cumsum() / total_valor * 100) if total_valor > 0 else 0
 
-    def classificar_abc(pct):
-        if pct <= 70:
-            return "A"
-        elif pct <= 90:
-            return "B"
-        elif pct <= 97:
-            return "C"
-        else:
-            return "D"
-
-    df_met["CURVA_ABC"] = df_met["PCT_ACUM_VALOR"].apply(classificar_abc)
+    df_met["MESES_COM_VENDA_12M"] = pd.to_numeric(df_met.get("MESES_COM_VENDA_12M"),
+                                                  errors="coerce").fillna(0).astype(int)
+    df_met["CURVA_VALOR"] = df_met["PCT_ACUM_VALOR"].apply(curva_por_valor)
+    df_met["CLASSE_GIRO"] = df_met["MESES_COM_VENDA_12M"].apply(classe_giro)
+    df_met["CURVA_ABC"] = [curva_combinada(v, gi) for v, gi in zip(df_met["CURVA_VALOR"], df_met["CLASSE_GIRO"])]
 
     # ==========================================
     # Classe XYZ (previsibilidade da demanda pelo coeficiente de variação)
@@ -3065,6 +3106,9 @@ def salvar_metricas_postgres(df_metricas):
         'TEVE_OUTLIER_APARADO': 'teve_outlier_aparado',
         'OUTLIER_QTD_APARADA': 'outlier_qtd_aparada',
         'OUTLIER_MOTIVO': 'outlier_motivo',
+        'CURVA_VALOR': 'curva_valor',
+        'CLASSE_GIRO': 'classe_giro',
+        'MESES_COM_VENDA_12M': 'meses_com_venda_12m',
         'NIVEL_SERVICO_CUSTO': 'nivel_servico_custo',
         'Z_CUSTO': 'z_custo',
         'ESTOQUE_MIN_CUSTO': 'estoque_min_custo',
@@ -3146,7 +3190,9 @@ def salvar_metricas_postgres(df_metricas):
     # Colunas NOVAS da correção de custo FIFO. O DDL é MANUAL (sql/2026-07-29_custo_fifo.sql):
     # só são gravadas depois que o DBA aplicar o ALTER — antes disso o ETL segue
     # rodando e apenas não popula estas colunas.
-    colunas_opcionais = ['custo_cogs_12m', 'custo_fonte', 'margem_unitaria_realizada']
+    # Curva combinada (sql/2026-11-06_curva_abc_valor_giro.sql): mesma regra.
+    colunas_opcionais = ['custo_cogs_12m', 'custo_fonte', 'margem_unitaria_realizada',
+                         'curva_valor', 'classe_giro', 'meses_com_venda_12m']
     try:
         _eng = get_postgres_engine()
         with _eng.connect() as _c:
@@ -3157,7 +3203,8 @@ def salvar_metricas_postgres(df_metricas):
         _falta = [c for c in colunas_opcionais if c not in _existentes]
         table_columns = table_columns + _add
         if _falta:
-            print(f"  - AVISO: colunas ausentes na tabela (aplique sql/2026-07-29_custo_fifo.sql): {_falta}")
+            print(f"  - AVISO: colunas ausentes na tabela (aplique sql/2026-07-29_custo_fifo.sql "
+                  f"e sql/2026-11-06_curva_abc_valor_giro.sql): {_falta}")
     except Exception as e:
         print(f"  - AVISO: não foi possível checar colunas opcionais ({e}). Gravando sem elas.")
 
