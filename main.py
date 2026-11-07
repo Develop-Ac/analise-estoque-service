@@ -787,7 +787,12 @@ def grupo_chave_com_linha(descricao, marca, mapa_linha):
     Linha 2 (padrão/não classificada) usa a descrição pura — retrocompatível;
     1ª e 3ª linhas ganham sufixo legível (aparece como nome do grupo nas telas).
     """
-    desc = str(descricao or "").strip()
+    # Produto sem descrição (vendido no passado, fora do saldo) chega como NaN; str(NaN)
+    # vira "nan" e todos esses produtos caíam num grupo só, que um vínculo manual
+    # ainda unia a grupos de verdade.
+    if descricao is None or pd.isna(descricao):
+        return None
+    desc = str(descricao).strip()
     if not desc:
         return None
     linha = mapa_linha.get(str(marca or "").strip().upper(), 2) if mapa_linha else 2

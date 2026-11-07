@@ -37,3 +37,13 @@ def test_membro_sem_chave_original_fica_fora():
 def test_codigo_com_espaco():
     pro2chave = {"1": "B", "2": "A"}
     assert vs.unificar_chaves(pro2chave, [[" 1 ", "2 "]]) == {"B": "A"}
+
+
+def test_produto_sem_descricao_nao_vira_ponte_entre_vinculos():
+    # Produto sem descrição chega do pandas como NaN. Antes virava a chave "nan", e dois
+    # vínculos manuais sem relação entre si, cada um com um produto assim, viravam um grupo só.
+    import main as m
+    descricoes = {"1": "CAPA COMPASS", "2": float("nan"), "3": "MAQUINA FOX", "4": float("nan"), "5": None}
+    pro2chave = {p: k for p, d in descricoes.items() if (k := m.grupo_chave_com_linha(d, "X", {}))}
+    assert pro2chave == {"1": "CAPA COMPASS", "3": "MAQUINA FOX"}
+    assert vs.unificar_chaves(pro2chave, [["1", "2"], ["3", "4"]]) == {}
