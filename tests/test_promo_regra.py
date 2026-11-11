@@ -92,3 +92,24 @@ if __name__ == "__main__":
     for n, f in list(globals().items()):
         if n.startswith("test_"):
             f(); print("ok", n)
+
+
+def test_visao_agrupada_acao_do_grupo_preco_do_item():
+    # Sozinho: 30 un contra máximo 10, cobertura de 30 meses e saldo velho = liquidação.
+    sozinho = pr.avaliar(_item())
+    assert (sozinho["acao"], sozinho["excesso_qtd"]) == ("giro_caixa", 20)
+
+    # No grupo: 40 un contra máximo 30 e venda de 10 un/mês = 4 meses de cobertura.
+    # A ação vem do grupo (promoção leve), o excesso do grupo (10) é rateado pelo saldo
+    # (30 de 40 = 7,5) e o preço sai da tabela e do custo do próprio item.
+    grupo = dict(saldo=40, maximo=30, demanda_dia=10 / 30.0, curva="A", dias_sem_venda=5, idade_saldo_dias=100)
+    r = pr.avaliar(_item(), grupo=grupo)
+    assert (r["acao"], r["acao_subtipo"]) == ("promocao", "promocao_6")
+    assert (r["grupo_excesso_qtd"], r["grupo_cobertura_meses"], r["excesso_qtd"]) == (10, 4.0, 7.5)
+    assert r["valor_parado"] == 3000.0 and r["valor_excesso"] == 750.0
+    assert r["preco_varejo"] == round(270.0 * 0.85, 2)
+
+    # Grupo dentro do máximo: o item não tem excesso a promover, mesmo acima do próprio máximo.
+    assert pr.avaliar(_item(), grupo=dict(grupo, maximo=50))["excesso_qtd"] == 0
+    # Item sem custo continua pedindo revisão de cadastro, qualquer que seja o grupo.
+    assert pr.avaliar(_item(custo_unitario=None), grupo=grupo)["acao"] == "revisar_cadastro"

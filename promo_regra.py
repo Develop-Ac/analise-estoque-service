@@ -168,21 +168,37 @@ def precos(acao, subtipo, custo, preco1, preco2, sgr_codigo, fora_regua=False, r
     return out
 
 
-def avaliar(item, regua=None):
+def avaliar(item, regua=None, grupo=None):
     """item: dict com estoque_disponivel, estoque_max_sugerido, custo_unitario, preco_venda_1/2,
     demanda_real_dia, dias_sem_venda, curva_abc, sgr_codigo, qtd_varejo_12m, qtd_atacado_12m,
-    fora_regua. Devolve o item enriquecido (novo dict)."""
+    fora_regua. Devolve o item enriquecido (novo dict).
+
+    `grupo` (visão agrupada): dict do grupo unificado do item — saldo, maximo, demanda_dia,
+    curva, dias_sem_venda, idade_saldo_dias. A ação e o degrau de desconto saem dos números
+    do GRUPO (marcas substitutas somadas); preço, piso e valor parado continuam do produto,
+    porque a promoção do ERP é por item. O excesso do grupo é rateado pelo saldo de cada marca."""
     r = dict(item)
     saldo = _num(r.get("estoque_disponivel")) or 0.0
     mx = _num(r.get("estoque_max_sugerido")) or 0.0
     custo = _num(r.get("custo_unitario"))
     dem = _num(r.get("demanda_real_dia")) or 0.0
-    r["excesso_qtd"] = max(saldo - mx, 0.0)
     r["valor_parado"] = round(saldo * (custo or 0.0), 2)
-    r["valor_excesso"] = round(r["excesso_qtd"] * (custo or 0.0), 2)
     r["cobertura_meses"] = round(saldo / (dem * 30.0), 1) if dem > 0 else None
     r["idade_saldo_dias"] = _num(r.get("tempo_medio_saldo_atual"))
-    acao, sub = acao_sugerida(custo, r.get("dias_sem_venda"), r["cobertura_meses"], r.get("curva_abc"), r["idade_saldo_dias"])
+    if grupo:
+        g_saldo = _num(grupo.get("saldo")) or 0.0
+        g_dem = _num(grupo.get("demanda_dia")) or 0.0
+        g_exc = max(g_saldo - (_num(grupo.get("maximo")) or 0.0), 0.0)
+        r["grupo_excesso_qtd"] = g_exc
+        r["grupo_cobertura_meses"] = round(g_saldo / (g_dem * 30.0), 1) if g_dem > 0 else None
+        r["excesso_qtd"] = round(g_exc * saldo / g_saldo, 2) if g_saldo > 0 else 0.0
+        base = (grupo.get("dias_sem_venda"), r["grupo_cobertura_meses"], grupo.get("curva"),
+                _num(grupo.get("idade_saldo_dias")))
+    else:
+        r["excesso_qtd"] = max(saldo - mx, 0.0)
+        base = (r.get("dias_sem_venda"), r["cobertura_meses"], r.get("curva_abc"), r["idade_saldo_dias"])
+    r["valor_excesso"] = round(r["excesso_qtd"] * (custo or 0.0), 2)
+    acao, sub = acao_sugerida(custo, *base)
     r["acao_sugerida"], r["acao_subtipo"] = acao, sub
     r["publico"] = publico(r.get("qtd_varejo_12m"), r.get("qtd_atacado_12m"))
     r.update(precos(acao, sub, custo, r.get("preco_venda_1"), r.get("preco_venda_2"),

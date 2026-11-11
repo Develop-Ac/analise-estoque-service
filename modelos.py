@@ -142,9 +142,11 @@ class SimulationRequest(BaseModel):
 
 class PromoPlanRequest(BaseModel):
     # Lista de promoção por valor parado (docs/promocao-valor-parado.md). O excesso é
-    # sempre medido contra o máximo sugerido oficial; `days` e `grouped_view` ficaram
-    # só por compatibilidade com o cliente antigo e são ignorados.
+    # sempre medido contra o máximo sugerido oficial; `days` ficou só por compatibilidade
+    # com o cliente antigo e é ignorado.
     days: Optional[int] = None
+    # Visão agrupada: o excesso, a cobertura e a curva que decidem a ação são os do grupo
+    # unificado (marcas somadas); o preço continua por produto. Falso = cada produto sozinho.
     grouped_view: bool = False
     subgroups: Optional[List[str]] = None
     brands: Optional[List[str]] = None

@@ -4,6 +4,10 @@
 A regra (ação, público, preço) mora em promo_regra.py; aqui só se lê o com_fifo_completo,
 aplica filtros/paginação/totais e grava a troca manual e as campanhas exportadas.
 Nada é gravado no ERP — a carga da promoção continua no Celta.
+
+Duas visões (`grouped_view`): individual (cada produto contra o próprio máximo) e agrupada
+(o grupo unificado — marcas substitutas — contra o máximo, a cobertura e a curva do grupo;
+ver promo_regra.avaliar). Produto sem grupo é avaliado sozinho nas duas.
 """
 import io
 from datetime import date, datetime, timedelta
@@ -24,6 +28,27 @@ router = APIRouter()
 ORDENACOES = {"valor_parado", "valor_excesso", "cobertura_meses", "dias_sem_venda", "caixa_potencial", "pro_descricao"}
 
 
+_SNAPSHOT = "data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)"
+# Grupo unificado de verdade: mais de uma marca e consolidado calculado (grupo com venda).
+_EM_GRUPO = "(f.grupo_chave IS NOT NULL AND COALESCE(f.grupo_qtd_itens,0) > 1 AND f.grupo_estoque_max IS NOT NULL)"
+_CAMPOS_GRUPO = ("grupo_chave", "grupo_qtd_itens", "grupo_curva", "grupo_estoque_disponivel", "grupo_estoque_max",
+                 "grupo_data_max_venda", "grupo_dias_sem_venda", "grupo_idade_saldo_dias")
+_COLS_GRUPO_SQL = f""",
+               {_EM_GRUPO} AS em_grupo, f.grupo_chave, f.grupo_qtd_itens, f.grupo_curva, f.grupo_estoque_disponivel,
+               CEIL(f.grupo_estoque_max) AS grupo_estoque_max, f.grupo_demanda_dia, g.grupo_data_max_venda,
+               (CURRENT_DATE - g.grupo_data_max_venda::date) AS grupo_dias_sem_venda, g.grupo_idade_saldo_dias"""
+# Última venda do grupo = a mais recente entre TODAS as marcas (inclusive as sem saldo);
+# idade do saldo = média das marcas ponderada pelo saldo.
+_JOIN_GRUPO_SQL = f"""
+        LEFT JOIN (SELECT grupo_chave AS gk, MAX(data_max_venda) AS grupo_data_max_venda,
+                          SUM(tempo_medio_saldo_atual * estoque_disponivel)
+                              FILTER (WHERE estoque_disponivel > 0 AND tempo_medio_saldo_atual IS NOT NULL)
+                          / NULLIF(SUM(estoque_disponivel)
+                              FILTER (WHERE estoque_disponivel > 0 AND tempo_medio_saldo_atual IS NOT NULL), 0) AS grupo_idade_saldo_dias
+                   FROM com_fifo_completo WHERE {_SNAPSHOT} AND grupo_chave IS NOT NULL
+                   GROUP BY grupo_chave) g ON g.gk = f.grupo_chave"""
+
+
 def _tabela_existe(conn, nome):
     return conn.execute(text("SELECT to_regclass(:n)"), {"n": nome}).scalar() is not None
 
@@ -37,10 +62,16 @@ def _regua(conn):
 
 
 def _linhas(conn, req: PromoPlanRequest):
-    """Todas as linhas candidatas (excesso > 0 ou sem custo) já avaliadas pela regra."""
-    filters = ["f.data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)",
+    """Todas as linhas candidatas (excesso > 0 ou sem custo) já avaliadas pela regra.
+    Na visão agrupada o excesso que conta é o do grupo: entra a marca com saldo de um grupo
+    acima do máximo, mesmo dentro do próprio máximo, e sai a que está acima do próprio máximo
+    num grupo que, somado, não tem excesso."""
+    excesso_item = "f.estoque_disponivel > CEIL(COALESCE(f.estoque_max_sugerido,0))"
+    excesso = (f"(CASE WHEN {_EM_GRUPO} THEN COALESCE(f.grupo_estoque_disponivel,0) > CEIL(f.grupo_estoque_max) "
+               f"ELSE {excesso_item} END)") if req.grouped_view else excesso_item
+    filters = [f"f.{_SNAPSHOT}",
                "f.estoque_disponivel > 0",
-               "(f.estoque_disponivel > CEIL(COALESCE(f.estoque_max_sugerido,0)) OR COALESCE(f.custo_unitario,0) <= 0)"]
+               f"({excesso} OR COALESCE(f.custo_unitario,0) <= 0)"]
     params = {}
     for campo, coluna, valores in (("sg", "sgr_descricao", req.subgroups), ("br", "mar_descricao", req.brands),
                                    ("cat", "categoria_saldo_atual", req.categories)):
@@ -64,7 +95,9 @@ def _linhas(conn, req: PromoPlanRequest):
                {"(e.pro_codigo IS NOT NULL)" if tem_exc else "FALSE"} AS fora_regua,
                {"a.acao, a.preco_varejo AS preco_varejo_manual, a.preco_atacado AS preco_atacado_manual, a.observacao AS observacao_manual"
                 if tem_acao else "NULL AS acao, NULL AS preco_varejo_manual, NULL AS preco_atacado_manual, NULL AS observacao_manual"}
+               {_COLS_GRUPO_SQL if req.grouped_view else ""}
         FROM com_fifo_completo f
+        {_JOIN_GRUPO_SQL if req.grouped_view else ""}
         {"LEFT JOIN ven_regua_item_excecao e ON e.pro_codigo::text = f.pro_codigo" if tem_exc else ""}
         {"LEFT JOIN com_promo_acao a ON a.pro_codigo = f.pro_codigo" if tem_acao else ""}
         WHERE {' AND '.join(filters)}
@@ -76,14 +109,54 @@ def _linhas(conn, req: PromoPlanRequest):
         d = {k: (float(v) if isinstance(v, Decimal) else str(v) if isinstance(v, (date, datetime)) else v)
              for k, v in dict(r).items()}
         d["acao_manual"] = d.pop("acao", None)
-        out.append(avaliar(d, regua))
+        grupo = None
+        if req.grouped_view:
+            if d.pop("em_grupo"):
+                grupo = {"saldo": d["grupo_estoque_disponivel"], "maximo": d["grupo_estoque_max"],
+                         "demanda_dia": d.pop("grupo_demanda_dia"), "curva": d["grupo_curva"],
+                         "dias_sem_venda": d["grupo_dias_sem_venda"], "idade_saldo_dias": d["grupo_idade_saldo_dias"]}
+            else:   # sem grupo de verdade (uma marca só ou grupo sem venda): avaliado sozinho
+                d.pop("grupo_demanda_dia", None)
+                d.update(dict.fromkeys(_CAMPOS_GRUPO))
+        out.append(avaliar(d, regua, grupo))
 
     if req.acoes:
         out = [x for x in out if x["acao"] in req.acoes]
     if req.publicos:
         out = [x for x in out if x["publico"] in req.publicos]
-    if req.curvas:
-        out = [x for x in out if (x.get("curva_abc") or "") in req.curvas]
+    if req.curvas:   # na visão agrupada, a curva que filtra é a do grupo (como na aba Análise)
+        out = [x for x in out if (x.get("grupo_curva") or x.get("curva_abc") or "") in req.curvas]
+    return out
+
+
+def _agrupar(linhas):
+    """Visão agrupada: uma linha por grupo unificado, com as marcas em `membros`, e uma por
+    produto sem grupo. O cabeçalho leva os números do grupo e a soma dos valores das marcas."""
+    out, grupos = [], {}
+    for x in linhas:
+        gk = x.get("grupo_chave")
+        if not gk:
+            out.append(x)
+            continue
+        g = grupos.get(gk)
+        if g is None:
+            g = grupos[gk] = {
+                "is_grupo": True, "id": -x["id"], "pro_codigo": "", "pro_descricao": gk, "membros": [],
+                "sgr_descricao": x.get("sgr_descricao"), "curva_abc": x.get("grupo_curva"),
+                "estoque_disponivel": x.get("grupo_estoque_disponivel"), "estoque_max_sugerido": x.get("grupo_estoque_max"),
+                "excesso_qtd": x.get("grupo_excesso_qtd"), "cobertura_meses": x.get("grupo_cobertura_meses"),
+                "data_max_venda": x.get("grupo_data_max_venda"), "dias_sem_venda": x.get("grupo_dias_sem_venda"),
+                "idade_saldo_dias": x.get("grupo_idade_saldo_dias"), **{c: x.get(c) for c in _CAMPOS_GRUPO},
+            }
+            out.append(g)
+        g["membros"].append(x)
+    for g in grupos.values():
+        m = g["membros"]
+        m.sort(key=lambda x: -x["valor_parado"])
+        for campo in ("valor_parado", "valor_excesso", "caixa_potencial"):
+            g[campo] = round(sum(x[campo] for x in m), 2)
+        g["acoes"] = sorted({x["acao"] for x in m}, key=ACOES.index)
+        g["acao"] = max(g["acoes"], key=[x["acao"] for x in m].count)
     return out
 
 
@@ -113,7 +186,8 @@ def _totais(linhas):
 def planejar_promocao(req: PromoPlanRequest):
     conn = get_db_connection()
     try:
-        linhas = _linhas(conn, req)
+        itens = _linhas(conn, req)
+        linhas = _agrupar(itens) if req.grouped_view else itens
         chave = req.sort if req.sort in ORDENACOES else "valor_parado"
         reverso = (req.sort_dir or "desc").lower() != "asc"
         linhas.sort(key=lambda x: ((x.get(chave) is None), x.get(chave) if x.get(chave) is not None else 0), reverse=reverso)
@@ -123,13 +197,14 @@ def planejar_promocao(req: PromoPlanRequest):
         size = max(1, min(req.page_size or 100, 1000))
         page = max(1, req.page or 1)
         pagina = linhas[(page - 1) * size: page * size]
-        lotes = _get_stock_batches([x["pro_codigo"] for x in pagina]) if pagina else {}
-        for x in pagina:
+        produtos = [m for x in pagina for m in (x.get("membros") or [x])]
+        lotes = _get_stock_batches([x["pro_codigo"] for x in produtos]) if produtos else {}
+        for x in produtos:
             b = lotes.get(x["pro_codigo"], [])
             x["lotes_estoque"] = [l.model_dump() if hasattr(l, "model_dump") else l.dict() for l in b]
             x["estoque_obsoleto"] = sum(l.qtd for l in b if l.dias_em_estoque > 240)
         return {"items": pagina, "total": total, "page": page, "page_size": size,
-                "total_pages": (total + size - 1) // size, "totais": _totais(linhas)}
+                "total_pages": (total + size - 1) // size, "totais": _totais(itens)}
     except Exception as e:
         print(f"Erro promo plan: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -139,7 +214,12 @@ def planejar_promocao(req: PromoPlanRequest):
 
 COLS_EXPORT = {
     "pro_codigo": "Código", "pro_descricao": "Descrição", "mar_descricao": "Marca", "sgr_descricao": "Subgrupo",
-    "fornecedor1": "Fornecedor", "curva_abc": "Curva ABC", "categoria_saldo_atual": "Tempo em estoque",
+    "fornecedor1": "Fornecedor", "curva_abc": "Curva ABC",
+    # só na visão agrupada (na individual as chaves não existem e as colunas não saem)
+    "grupo_chave": "Grupo", "grupo_curva": "Curva do grupo", "grupo_qtd_itens": "Marcas no grupo",
+    "grupo_estoque_disponivel": "Saldo do grupo", "grupo_estoque_max": "Máximo do grupo",
+    "grupo_excesso_qtd": "Excesso do grupo (un)", "grupo_cobertura_meses": "Cobertura do grupo (meses)",
+    "categoria_saldo_atual": "Tempo em estoque",
     "estoque_disponivel": "Saldo", "estoque_max_sugerido": "Máximo sugerido", "excesso_qtd": "Excesso (un)",
     "custo_unitario": "Custo (R$)", "valor_parado": "Valor parado (R$)", "valor_excesso": "Valor em excesso (R$)",
     "cobertura_meses": "Cobertura (meses)", "idade_saldo_dias": "Idade média do saldo (dias)", "data_max_venda": "Última venda", "dias_sem_venda": "Dias sem venda",
@@ -177,7 +257,15 @@ def exportar_promocao(req: PromoPlanRequest):
         linhas = _linhas(conn, req)
         if not linhas:
             raise HTTPException(status_code=404, detail="Nenhum dado encontrado para exportação")
-        linhas.sort(key=lambda x: -x["valor_parado"])
+        if req.grouped_view:   # marcas do mesmo grupo juntas, grupos pelo valor parado somado
+            soma = {}
+            for x in linhas:
+                if x.get("grupo_chave"):
+                    soma[x["grupo_chave"]] = soma.get(x["grupo_chave"], 0.0) + x["valor_parado"]
+            linhas.sort(key=lambda x: (-soma.get(x.get("grupo_chave"), x["valor_parado"]),
+                                       x.get("grupo_chave") or "", -x["valor_parado"]))
+        else:
+            linhas.sort(key=lambda x: -x["valor_parado"])
         df = pd.DataFrame(linhas)
         df_lista = df[[c for c in COLS_EXPORT if c in df.columns]].rename(columns=COLS_EXPORT)
         for col in ("Ação", "Ação sugerida"):   # rótulo legível, igual ao da tela

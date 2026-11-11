@@ -242,3 +242,33 @@ Escopo (só visual e acessibilidade; lógica, filtros e chamadas intocados):
   + item/período da tabela.
 - Marcar na lista os itens da Onda 1 do atacado (não recebem preço de tabela 2 até dez/26) — hoje
   exclusão manual do comercial.
+
+## 8. Visão agrupada (11/11/2026)
+
+A lista tem duas visões, escolhidas na tela (`Individual | Agrupado`) e enviadas em
+`grouped_view` para `POST /promo/plan` e `POST /promo/export`.
+
+- **Individual** (padrão): como descrito acima. Cada produto contra o próprio máximo.
+- **Agrupada**: para produto de grupo unificado (`grupo_chave`, mais de uma marca e
+  consolidado calculado), quem decide é o grupo:
+  - entra na lista a marca **com saldo** de um grupo cujo saldo somado passa do máximo do
+    grupo, mesmo que ela esteja dentro do próprio máximo; sai a marca acima do próprio
+    máximo num grupo que, somado, não tem excesso;
+  - a **ação e o degrau de desconto** saem do grupo: cobertura = saldo do grupo ÷ demanda do
+    grupo, curva do grupo (valor × giro), última venda = a mais recente entre todas as
+    marcas, idade do saldo = média das marcas ponderada pelo saldo;
+  - o **preço** continua por produto (a promoção do ERP é por item): mesmo degrau, tabela,
+    custo e piso de cada marca;
+  - o **excesso do grupo** é rateado entre as marcas pelo saldo; é sobre essa parte que saem
+    o valor em excesso e o caixa potencial de cada linha;
+  - produto sem custo segue em "revisar cadastro" e a troca manual da ação segue por
+    produto, valendo nas duas visões.
+- Produto sem grupo (uma marca só, original, desvinculado ou grupo sem venda) é avaliado
+  sozinho nas duas visões.
+- `POST /promo/plan` agrupado devolve uma linha por grupo (`is_grupo`, números do grupo,
+  `acoes` e as marcas em `membros`) e uma por produto sem grupo; `total` conta linhas e
+  `totais` soma os produtos. O filtro de curva usa a curva do grupo.
+- Excel agrupado: marcas do mesmo grupo juntas e colunas Grupo, Curva do grupo, Marcas no
+  grupo, Saldo/Máximo/Excesso/Cobertura do grupo. A aba "Carga ERP" é sempre por produto.
+
+Regra em `promo_regra.avaliar(item, regua, grupo)`; teste em `tests/test_promo_regra.py`.
