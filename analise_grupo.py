@@ -194,6 +194,19 @@ def _sem_nan(v):
     return v.item() if hasattr(v, "item") else v
 
 
+def _tirar_do_consolidado(codigos):
+    """Produto que não forma grupo (descrição provisória, original, inativo) perde a chave e
+    os números do grupo no snapshot, como na rodada completa. Sem isso, quem sobrava de um
+    grupo desfeito continuava mostrando o mín/máx/curva de quando os outros ainda estavam nele."""
+    with get_db_connection() as pg:
+        trans = pg.begin()
+        sets = "".join(f", {c.lower()} = NULL" for c in _COLS_GRUPO + colunas_abertura_existentes(pg))
+        pg.execute(text(f"UPDATE com_fifo_completo SET grupo_chave = NULL{sets} "
+                        f"WHERE {_SNAPSHOT} AND pro_codigo = ANY(:c) AND grupo_chave IS NOT NULL"),
+                   {"c": sorted(codigos)})
+        trans.commit()
+
+
 # ------------------------------------------------------------------
 # Entrada
 # ------------------------------------------------------------------
@@ -229,7 +242,9 @@ def analisar_grupo(pro_codigos):
         alvos = {chave_final[c] for c in codigos if c in chave_final}
         fora = sorted(codigos - set(chave_final))
         if fora:
-            avisos.append(f"Sem grupo (original, desvinculado, inativo ou sem descrição): {', '.join(fora)}")
+            _tirar_do_consolidado(fora)
+            avisos.append("Sem grupo (original, desvinculado, inativo ou descrição provisória), "
+                          f"planejado sozinho: {', '.join(fora)}")
         if not alvos:
             return {"status": "success", "grupos": [], "avisos": avisos}
 

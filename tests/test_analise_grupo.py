@@ -108,3 +108,35 @@ def test_colunas_grupo_gravaveis_toleram_sql_pendente():
     assert ag.colunas_grupo_gravaveis({"grupo_curva"}) == ag._COLS_GRUPO
     todas = ag.colunas_grupo_gravaveis({"grupo_curva_valor", "grupo_classe_giro", "grupo_meses_com_venda_12m"})
     assert todas == ag._COLS_GRUPO + ag._COLS_GRUPO_ABERTURA
+
+
+def test_tirar_do_consolidado_limpa_chave_e_numeros_do_grupo(monkeypatch):
+    # Quem sobra de um grupo desfeito e não forma grupo (descrição provisória "AAA") não pode
+    # continuar com a chave, o mín/máx e a curva de quando os outros produtos estavam nele.
+    executados = []
+
+    class _Pg:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def begin(self):
+            return self
+
+        def commit(self):
+            pass
+
+        def execute(self, sql, params=None):
+            executados.append((str(sql), params))
+            return [("grupo_curva_valor",)]  # information_schema: só uma coluna de abertura existe
+
+    monkeypatch.setattr(ag, "get_db_connection", lambda: _Pg())
+    ag._tirar_do_consolidado(["52590", "51865"])
+    sql, params = executados[-1]
+    for trecho in ("grupo_chave = NULL", "grupo_curva = NULL", "grupo_estoque_min = NULL",
+                   "grupo_estoque_max = NULL", "grupo_curva_valor = NULL"):
+        assert trecho in sql
+    assert "grupo_classe_giro" not in sql  # coluna ainda não criada não entra no UPDATE
+    assert params == {"c": ["51865", "52590"]}
