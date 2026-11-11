@@ -269,9 +269,7 @@ def analisar_grupo(pro_codigos):
         mapa_compras=main.carregar_mapa_compras_fornecedor(),
         mapa_linha=mapa_linha, custo_por_produto=custo, data_max_por_produto=data_max,
         remap_chaves=remap, valores_base=base)
-    if g is None or g.empty:
-        avisos.append("Grupo sem venda na janela: nada a consolidar.")
-        return {"status": "success", "grupos": [], "avisos": avisos}
+    linhas = {r["GRUPO"]: r for _, r in g.iterrows()} if g is not None and not g.empty else {}
 
     resumo = []
     with get_db_connection() as pg:
@@ -280,10 +278,13 @@ def analisar_grupo(pro_codigos):
         trans = pg.begin()
         cols = _COLS_GRUPO + colunas_abertura_existentes(pg)
         sets = ", ".join(f"{c.lower()} = :{c.lower()}" for c in cols)
-        for _, r in g[g["GRUPO"].isin(alvos)].iterrows():
-            gk = r["GRUPO"]
+        for gk in sorted(alvos):
+            # Grupo sem venda na janela não tem consolidado (como na rodada completa): as
+            # colunas do grupo ficam vazias em vez de guardar o mín/máx/curva de quando um
+            # produto que já saiu (desvinculado) ainda somava a venda dele.
+            r = linhas.get(gk)
             cods_g = [p for p in membros if chave_final[p] == gk]
-            params = {c.lower(): _sem_nan(r.get(c)) for c in cols}
+            params = {c.lower(): (_sem_nan(r.get(c)) if r is not None else None) for c in cols}
             params.update({"gk": gk, "cods": cods_g, "antigas": antigas_por_grupo[gk], "avulsos": avulsos})
             # Linhas do snapshot com chave antiga e fora do cadastro ativo vão junto:
             # senão sobrariam como um grupo fantasma com números velhos. Desvinculado nunca.
@@ -292,6 +293,9 @@ def analisar_grupo(pro_codigos):
                 f"WHERE {_SNAPSHOT} AND (pro_codigo = ANY(:cods) OR grupo_chave = ANY(:antigas)) "
                 f"AND NOT (pro_codigo = ANY(:avulsos))"),
                 params)
+            if r is None:
+                avisos.append(f"{gk}: sem venda na janela; mínimo, máximo e curva do grupo ficaram vazios.")
+                continue
             resumo.append({"grupo_chave": gk, "qtd_itens": params["grupo_qtd_itens"],
                            "curva": params["grupo_curva"], "estoque_min": params["grupo_estoque_min"],
                            "estoque_max": params["grupo_estoque_max"], "membros": cods_g})

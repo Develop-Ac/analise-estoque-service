@@ -781,6 +781,13 @@ def carregar_marca_linha():
     return out
 
 
+def descricao_provisoria(descricao):
+    """Cadastro ainda sem nome no ERP: a descrição é um caractere só repetido ("AAA", "AAAA").
+    Produtos assim não são o mesmo produto e não podem formar grupo por descrição."""
+    d = str(descricao or "").replace(" ", "")
+    return bool(d) and len(set(d)) == 1
+
+
 def grupo_chave_com_linha(descricao, marca, mapa_linha):
     """
     Chave do grupo de substitutos = descrição + LINHA da marca.
@@ -793,7 +800,9 @@ def grupo_chave_com_linha(descricao, marca, mapa_linha):
     if descricao is None or pd.isna(descricao):
         return None
     desc = str(descricao).strip()
-    if not desc:
+    # Descrição provisória ("AAA") agrupava cadastros sem relação e, por um vínculo
+    # manual, ainda arrastava produtos de verdade para o grupo "AAA".
+    if not desc or descricao_provisoria(desc):
         return None
     linha = mapa_linha.get(str(marca or "").strip().upper(), 2) if mapa_linha else 2
     if linha == 2:
@@ -3760,7 +3769,8 @@ def agrupar_similares_automaticamente():
                     conn.commit() # Commit parcial para não perder tudo se cair
                 
                 descricao = row[0]
-                if not descricao: continue
+                # Descrição provisória não vincula: o vínculo sobreviveria à troca do nome.
+                if not descricao or descricao_provisoria(descricao): continue
                 
                 # Buscar produtos com essa descricao
                 sql_prods = text("SELECT pro_codigo FROM com_fifo_completo WHERE pro_descricao = :desc")

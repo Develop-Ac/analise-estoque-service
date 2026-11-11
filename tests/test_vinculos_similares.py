@@ -47,3 +47,15 @@ def test_produto_sem_descricao_nao_vira_ponte_entre_vinculos():
     pro2chave = {p: k for p, d in descricoes.items() if (k := m.grupo_chave_com_linha(d, "X", {}))}
     assert pro2chave == {"1": "CAPA COMPASS", "3": "MAQUINA FOX"}
     assert vs.unificar_chaves(pro2chave, [["1", "2"], ["3", "4"]]) == {}
+
+
+def test_descricao_provisoria_nao_forma_grupo_nem_ponte():
+    # Cadastro provisório do ERP ("AAA", "AAAA") não é o mesmo produto: sem chave, não
+    # agrupa entre si nem liga dois vínculos manuais (caso real: grupo "AAA" com 17 itens).
+    import main as m
+    assert [m.descricao_provisoria(d) for d in ("AAA", "AAAA", " A A ", "MOUSE", "", None)] == \
+        [True, True, True, False, False, False]
+    descricoes = {"1": "CAPA CORSA", "2": "AAAA", "3": "FAROL S-10", "4": "AAAA", "5": "AAA"}
+    pro2chave = {p: k for p, d in descricoes.items() if (k := m.grupo_chave_com_linha(d, "X", {}))}
+    assert pro2chave == {"1": "CAPA CORSA", "3": "FAROL S-10"}
+    assert vs.unificar_chaves(pro2chave, [["1", "2"], ["3", "4", "5"]]) == {}

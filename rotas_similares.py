@@ -76,7 +76,8 @@ def desvincular_produtos(req: GroupRequest):
     'avulso' em com_relacionamento_itens (a análise os planeja sozinhos e o
     auto-agrupamento não os junta de novo) até serem vinculados outra vez.
     No snapshot atual saem do grupo na hora; `restantes` = quem ficou no(s)
-    grupo(s), para a tela oferecer a análise do grupo (POST /similar/analise-grupo).
+    grupo(s): a tela roda em seguida a análise do grupo (POST /similar/analise-grupo),
+    que refaz mínimo, máximo e curva sem a venda de quem saiu.
     """
     from sqlalchemy import text
     from vinculos_similares import AVULSO, group_id_avulso
