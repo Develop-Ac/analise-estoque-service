@@ -21,14 +21,19 @@ else:
 
 
 def _erp_api_consulta(recurso, corpo, permitir_truncado=False):
-    """POST /erp/<recurso>/consulta na erp-firebird-api. Levanta exceção em
+    """POST /erp/<recurso>/consulta na erp-firebird-api (consulta genérica)."""
+    return _erp_api_post(f"{recurso}/consulta", corpo, permitir_truncado)
+
+
+def _erp_api_post(caminho, corpo, permitir_truncado=False):
+    """POST /erp/<caminho> na erp-firebird-api. Levanta exceção em
     qualquer falha (rede, HTTP != 2xx, resposta truncada) — quem chama decide
     o fallback. permitir_truncado=True é para paginação por watermark, onde a
     página cheia (linhas == limite) é o caso normal, não um corte."""
     import json as _json
     import urllib.request as _urlreq
     req = _urlreq.Request(
-        f"{ERP_API_URL}/erp/{recurso}/consulta",
+        f"{ERP_API_URL}/erp/{caminho}",
         data=_json.dumps(corpo).encode('utf-8'),
         headers={
             'content-type': 'application/json',
@@ -44,7 +49,7 @@ def _erp_api_consulta(recurso, corpo, permitir_truncado=False):
     meta = payload.get('meta') or {}
     if meta.get('truncado') and not permitir_truncado:
         raise RuntimeError(
-            f"consulta {recurso} truncada em {meta.get('linhas')} linhas — resultado incompleto"
+            f"consulta {caminho} truncada em {meta.get('linhas')} linhas — resultado incompleto"
         )
     return payload.get('dados') or []
 

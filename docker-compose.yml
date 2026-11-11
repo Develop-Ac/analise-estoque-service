@@ -31,6 +31,8 @@ services:
       - ERP_API_URL=${ERP_API_URL:-}
       - ERP_API_TOKEN=${ERP_API_TOKEN:-}
       - ERP_API_TIMEOUT_MS=${ERP_API_TIMEOUT_MS:-15000}
+      # Só a rota /analise/nota exige (igual ao ANALISE_ESTOQUE_SERVICE_TOKEN da intranet). VAZIO = essa rota recusa tudo.
+      - APP_TOKEN=${APP_TOKEN:-}
     restart: unless-stopped
     volumes:
       - ./data:/app/data
