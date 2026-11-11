@@ -330,6 +330,38 @@ def montar_analise(valor_nota, analisaveis, nao_analisados, rodada, saldos, lanc
     }
 
 
+def montar_nao_comprados(sugestao, pros_da_nota, fornecedor, aviso=None):
+    """Bloco `nao_comprados`: o que a sugestão de compra manda comprar HOJE do fornecedor da nota
+    (estoque no ponto de pedido ou abaixo) e não veio nesta nota.
+
+    `sugestao` = resposta de /compras/sugestao filtrada pelo fornecedor; `pros_da_nota` = produtos
+    da nota e os membros dos grupos deles — grupo que veio na nota, por qualquer marca, não entra.
+    Zerados primeiro, depois o maior valor a comprar."""
+    pros = {str(p).strip() for p in pros_da_nota}
+    itens, minimo = [], None
+    for f in sugestao.get("fornecedores") or []:
+        minimo = minimo or f.get("pedido_minimo_valor")
+        for it in f["itens"]:
+            codigos = {str(it["pro_codigo"])} | {str(m["pro_codigo"]) for m in it.get("membros") or []}
+            if codigos & pros or not it["qtd_sugerida"]:
+                continue
+            itens.append({
+                "tipo": it["tipo"], "pro_codigo": it["pro_codigo"], "rotulo": it["pro_descricao"],
+                "marcas": it.get("marcas") or [], "curva": it.get("curva_abc"),
+                "zerado": it["estoque_atual"] <= 0, "estoque": it["estoque_atual"],
+                "em_transito": it["em_transito"], "minimo": it["ponto_pedido"], "maximo": it["maximo"],
+                "cobertura_dias": it.get("cobertura_dias"),
+                "comprar_qtd": it["qtd_sugerida"], "comprar_valor": it.get("valor_estimado"),
+            })
+    itens.sort(key=lambda x: (not x["zerado"], -(x["comprar_valor"] or 0)))
+    return {
+        "fornecedor": fornecedor, "pedido_minimo_valor": minimo, "itens": itens,
+        "zerados": sum(1 for i in itens if i["zerado"]),
+        "valor_total": round(sum(i["comprar_valor"] or 0 for i in itens), 2),
+        "aviso": aviso,
+    }
+
+
 # Cuiabá é UTC−4 fixo (sem horário de verão); evita depender de tzdata na imagem slim.
 _CUIABA = datetime.timezone(datetime.timedelta(hours=-4))
 AVISO_SEM_VENCIMENTO = "nota sem vencimentos no XML"

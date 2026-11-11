@@ -19,7 +19,9 @@ from sqlalchemy import text
 import analise_nota as an
 from analise_grupo import _SNAPSHOT, _in, _lit, _openquery
 from erp_api import ERP_API_MAX_EM, ERP_API_URL, _erp_api_consulta, _erp_api_post, get_realtime_stocks
+from fornecedor_info import _expandir_fornecedores, get_compras_historico
 from infra_db import get_db_connection, get_sql_connection
+from sugestao_compra import _gerar_sugestao_compra
 
 router = APIRouter()
 
@@ -278,6 +280,38 @@ def _rodada(pro_codigos):
     return rodada, data
 
 
+def _nomes_fornecedor(cnpj):
+    """Razões sociais do emitente no cadastro da EMPRESA 3 — é desse cadastro que sai o nome
+    gravado no histórico de compra, por onde a sugestão de compra filtra o fornecedor."""
+    if not cnpj or not cnpj.isdigit():
+        return []
+    linhas = _api_ou_oq(
+        "nome do fornecedor",
+        lambda: _erp_api_consulta("fornecedores", {
+            "empresa": 3, "campos": ["FOR_NOME"], "limite": 10,
+            "filtros": [{"campo": "CNPJ_DIGITOS", "op": "igual", "valor": cnpj}]}),
+        # CPF_CNPJ é gravado com máscara.
+        lambda: _oq("SELECT for_nome FROM fornecedores WHERE empresa = 3 AND "
+                    f"REPLACE(REPLACE(REPLACE(cpf_cnpj, '.', ''), '/', ''), '-', '') = {_lit(cnpj)}"))
+    return [str(r["FOR_NOME"]).strip() for r in linhas if r.get("FOR_NOME")]
+
+
+def _nao_comprados(cab, pros_da_nota):
+    """Sugestão de compra de hoje do fornecedor da nota (e relacionados), sem o que veio na nota.
+    É um bloco de apoio: falha aqui não derruba a análise, o bloco sai vazio com aviso."""
+    try:
+        conhecidos = {n.strip().upper() for forns in get_compras_historico().values() for n, _ in forns}
+        nome = next((n for n in _nomes_fornecedor(cab["cnpj"]) + [(cab["emitente"] or "").strip()]
+                     if any(m in conhecidos for m in _expandir_fornecedores([n]))), None)
+        if not nome:
+            return an.montar_nao_comprados({}, pros_da_nota, None,
+                                           "Fornecedor sem histórico de compra na Análise de Estoque.")
+        return an.montar_nao_comprados(_gerar_sugestao_compra(fornecedor=nome), pros_da_nota, nome)
+    except Exception as e:
+        print(f"Erro ao montar os itens não comprados do fornecedor: {e}")
+        return an.montar_nao_comprados({}, pros_da_nota, None, "Não foi possível montar esta lista agora.")
+
+
 def _so_quem_ve_notas(x_app_token: str | None = Header(None), x_user_id: str | None = Header(None)):
     """A resposta traz títulos da nota e o contas a pagar da empresa: só pelo proxy da intranet
     (x-app-token igual ao APP_TOKEN; vazio = tudo recusado) e para quem visualiza /fiscal/nfe."""
@@ -335,4 +369,5 @@ def analise_nota(chave: str):
         **an.montar_analise(cab["valor_total"], analisaveis, nao_analisados, rodada, saldos, lancada,
                             vencimentos, base, base_prazo, comprometido, hoje,
                             CUSTO_CAIXA_TAXA_MES, CUSTO_CAIXA_DIAS_TETO),
+        "nao_comprados": _nao_comprados(cab, membros),
     }

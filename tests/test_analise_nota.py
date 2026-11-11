@@ -380,3 +380,29 @@ def test_cprod_com_zeros_a_esquerda_casa():
     assert an.norm_cprod(" 000ab 12 ") == "AB12" and an.norm_cprod("000") == "0" and an.norm_cprod(None) == ""
     ok, _ = _resolver([_xml_item(cprod="0000ABC")], vinc={"ABC": 30})
     assert ok[0]["pro_codigo"] == "30"
+
+
+# ---------------------------------------------------------------- não comprados do fornecedor
+def _sug(pro, qtd=5, valor=50.0, estoque=0, membros=()):
+    return {"tipo": "grupo" if membros else "individual", "pro_codigo": pro, "pro_descricao": f"P{pro}",
+            "curva_abc": "A", "estoque_atual": estoque, "em_transito": 0, "ponto_pedido": 3, "maximo": 8,
+            "qtd_sugerida": qtd, "valor_estimado": valor, "membros": [{"pro_codigo": m} for m in membros]}
+
+
+def test_nao_comprados_tira_o_que_veio_na_nota_e_ordena():
+    sug = {"fornecedores": [{"pedido_minimo_valor": 1000.0, "itens": [
+        _sug("10"),                                   # veio na nota
+        _sug("20", membros=("21", "11")),             # grupo com membro que veio na nota
+        _sug("30", valor=80.0, estoque=2),            # abaixo do mínimo
+        _sug("40", valor=20.0),                       # zerado
+        _sug("50", qtd=0),                            # já coberto pelo que está em trânsito
+    ]}]}
+    r = an.montar_nao_comprados(sug, ["10", "11"], "FORN")
+    assert [i["pro_codigo"] for i in r["itens"]] == ["40", "30"]   # zerado primeiro
+    assert (r["zerados"], r["valor_total"], r["pedido_minimo_valor"]) == (1, 100.0, 1000.0)
+    assert r["fornecedor"] == "FORN" and r["aviso"] is None
+
+
+def test_nao_comprados_sem_sugestao_sai_vazio_com_aviso():
+    r = an.montar_nao_comprados({}, ["10"], None, "aviso")
+    assert (r["itens"], r["valor_total"], r["aviso"]) == ([], 0, "aviso")
