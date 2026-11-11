@@ -80,6 +80,19 @@ def test_curva_posicionada_contra_a_base():
     assert _grupo(valores_base=[1e7] * 50)["GRUPO_CURVA"].iloc[0] == "B"
 
 
+def test_abertura_da_curva_do_grupo():
+    # A curva do grupo sai com a abertura (valor, giro, meses) e é a combinação dela.
+    valor = float(main.calcular_demanda_recente_e_variabilidade(
+        pd.concat([_vendas("1", 8, 50.0), _vendas("2", 4, 50.0)]).assign(PRO_CODIGO="G"),
+        pd.DataFrame(), HOJE)["VALOR_VENDIDO_12M"].iloc[0])
+    for base in (None, [valor / 4] * 4, [1e7] * 50):
+        r = _grupo(valores_base=base).iloc[0]
+        assert r["GRUPO_CLASSE_GIRO"] == main.classe_giro(r["GRUPO_MESES_COM_VENDA_12M"])
+        assert r["GRUPO_CURVA"] == main.curva_combinada(r["GRUPO_CURVA_VALOR"], r["GRUPO_CLASSE_GIRO"])
+        if base is None:
+            assert (r["GRUPO_CURVA_VALOR"], r["GRUPO_CLASSE_GIRO"]) == ("D", "A")
+
+
 def test_desvinculado_sai_do_grupo_da_propria_descricao():
     sp = pd.DataFrame({"PRO_CODIGO": ["1", "2", "3"], "PRO_DESCRICAO": ["PASTILHA X"] * 3,
                        "MAR_DESCRICAO": ["COBREQ", "FRASLE", "SYL"], "SGR_CODIGO": [10] * 3,
@@ -89,3 +102,9 @@ def test_desvinculado_sai_do_grupo_da_propria_descricao():
     g = main.calcular_grupos_descricao(sai, pd.DataFrame(), sp, HOJE, {}, avulsos={"3"})
     assert int(g["GRUPO_QTD_ITENS"].iloc[0]) == 2
     assert float(g["GRUPO_ESTOQUE_DISPONIVEL"].iloc[0]) == 8.0
+
+
+def test_colunas_grupo_gravaveis_toleram_sql_pendente():
+    assert ag.colunas_grupo_gravaveis({"grupo_curva"}) == ag._COLS_GRUPO
+    todas = ag.colunas_grupo_gravaveis({"grupo_curva_valor", "grupo_classe_giro", "grupo_meses_com_venda_12m"})
+    assert todas == ag._COLS_GRUPO + ag._COLS_GRUPO_ABERTURA

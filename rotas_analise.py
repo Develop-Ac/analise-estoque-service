@@ -199,6 +199,34 @@ def comparacao_nivel_servico_custo():
 # Chave que mantém os itens de um grupo de similares juntos na listagem.
 _CHAVE_GRUPO = "CASE WHEN group_id IS NOT NULL AND group_id <> '' THEN group_id ELSE pro_codigo END"
 
+# Linha pertence a grupo unificado (2+ marcas com curva consolidada).
+_EM_GRUPO_UNIFICADO = "COALESCE(grupo_chave,'') <> '' AND COALESCE(grupo_qtd_itens,0) > 1"
+
+
+def _curva_expr(grouped_view: bool) -> str:
+    """Curva efetiva: na visão agrupada, a curva do grupo unificado quando houver; senão a do item."""
+    if not grouped_view:
+        return "curva_abc"
+    return f"(CASE WHEN {_EM_GRUPO_UNIFICADO} AND grupo_curva IS NOT NULL THEN grupo_curva ELSE curva_abc END)"
+
+
+def _filtro_curva(curve: Optional[str], grouped_view: bool):
+    """Filtro de curva (lista 'A,B') sobre a curva efetiva -> (sql, params) ou None."""
+    curves = [c.strip().upper() for c in (curve or "").split(",") if c.strip()]
+    if not curves:
+        return None
+    params = {f"curve_{i}": c for i, c in enumerate(curves)}
+    keys = ", ".join(f":{k}" for k in params)
+    return f"{_curva_expr(grouped_view)} IN ({keys})", params
+
+
+# Colunas de abertura da curva do grupo; NULL quando a tabela ainda não as tem.
+_COLS_ABERTURA_GRUPO = ("grupo_curva_valor", "grupo_classe_giro", "grupo_meses_com_venda_12m")
+
+
+def _select_abertura_grupo(existentes) -> str:
+    return ", ".join(c if c in existentes else f"NULL AS {c}" for c in _COLS_ABERTURA_GRUPO)
+
 # Colunas ordenáveis pela tela (nome público -> expressão SQL). Lista fechada: nada do cliente entra no SQL.
 _SORT_COLS = {
     "produto": "pro_descricao",
@@ -215,10 +243,10 @@ def _order_by(sort: Optional[str], sort_dir: str, grouped_view: bool) -> str:
     (ordem histórica). Com `sort`: na visão agrupada o grupo inteiro é posicionado pelo seu
     extremo (MAX no desc, MIN no asc) para os similares não se separarem; na individual a
     ordem é estrita pela coluna."""
-    expr = _SORT_COLS.get(sort or "")
+    expr = _curva_expr(grouped_view) if sort == "curva" else _SORT_COLS.get(sort or "")
     if expr is None:
         return f"""
-                MIN(curva_abc) OVER (PARTITION BY {_CHAVE_GRUPO}) ASC,
+                MIN({_curva_expr(grouped_view)}) OVER (PARTITION BY {_CHAVE_GRUPO}) ASC,
                 MIN(pro_descricao) OVER (PARTITION BY {_CHAVE_GRUPO}) ASC,
                 pro_descricao ASC"""
     d = "DESC" if (sort_dir or "").lower() == "desc" else "ASC"
@@ -320,12 +348,13 @@ def listar_analise(
             END)
         """
         
-        grp_ref_dias_expr = """
+        _cv = _curva_expr(grouped_view)
+        grp_ref_dias_expr = f"""
             (CASE 
                 WHEN MAX(sgr_codigo) = 154 THEN 
-                    (CASE WHEN MIN(curva_abc) = 'A' THEN 120.0 WHEN MIN(curva_abc) = 'B' THEN 180.0 ELSE 240.0 END)
+                    (CASE WHEN MIN({_cv}) = 'A' THEN 120.0 WHEN MIN({_cv}) = 'B' THEN 180.0 ELSE 240.0 END)
                 ELSE 
-                    (CASE WHEN MIN(curva_abc) = 'A' THEN 60.0 WHEN MIN(curva_abc) = 'B' THEN 90.0 ELSE 120.0 END)
+                    (CASE WHEN MIN({_cv}) = 'A' THEN 60.0 WHEN MIN({_cv}) = 'B' THEN 90.0 ELSE 120.0 END)
             END)
         """
 
@@ -385,13 +414,10 @@ def listar_analise(
                 # Regular Individual Filter
                 filters.append(build_status_sql_cond("estoque_disponivel", i_min_expr, i_max_expr, filter_status_list))
 
-        if curve:
-            curves = [c.strip().upper() for c in curve.split(",") if c.strip()]
-            if curves:
-                curve_params = {f"curve_{i}": c for i, c in enumerate(curves)}
-                params.update(curve_params)
-                keys = ", ".join([f":{k}" for k in curve_params.keys()])
-                filters.append(f"curva_abc IN ({keys})")
+        fc = _filtro_curva(curve, grouped_view)
+        if fc:
+            filters.append(fc[0])
+            params.update(fc[1])
 
         if trend:
             # Trend -> tendencia_label
@@ -481,6 +507,9 @@ def listar_analise(
             print(f"AVISO: totais capital/CME do filtro indisponíveis: {e}")
         
         # Query Dados
+        existentes = {r[0] for r in conn.execute(text(
+            "SELECT column_name FROM information_schema.columns WHERE table_name='com_fifo_completo'"
+        ))}
         data_sql = text(f"""
             SELECT 
                 id, pro_codigo, pro_descricao, pro_referencia, sgr_codigo, sgr_descricao, mar_descricao, fornecedor1,
@@ -505,7 +534,7 @@ def listar_analise(
                 mean_size_mes, cv2_tamanho,
                 grupo_chave, grupo_estoque_min, grupo_estoque_max, grupo_qtd_itens, grupo_estoque_disponivel, grupo_demanda_dia,
                 grupo_estoque_seguranca, grupo_curva, grupo_metodo, grupo_fator_sazonal,
-                grupo_mean_size, grupo_cv2,
+                grupo_mean_size, grupo_cv2, {_select_abertura_grupo(existentes)},
                 custo_unitario, margem_unitaria, margem_pct,
                 nivel_servico_custo, z_custo, estoque_min_custo, estoque_max_custo, estoque_seg_custo,
                 grupo_nivel_servico_custo, grupo_estoque_min_custo, grupo_estoque_max_custo, grupo_margem_pct,
@@ -751,6 +780,7 @@ def exportar_analise(
     match_type: str = "contains",
     kpi: Optional[str] = None,
     fornecedor: Optional[str] = None,
+    grouped_view: bool = False,
 ):
     try:
         conn = get_db_connection()
@@ -760,6 +790,8 @@ def exportar_analise(
     try:
         where_clauses = ["1=1"]
         params = {}
+        # Curva do grupo unificado; vazia para item avulso.
+        curva_grupo_expr = f"CASE WHEN {_EM_GRUPO_UNIFICADO} THEN grupo_curva END"
 
         # Drill-down dos KPIs do painel (mesmas condições do listar_analise)
         _KPI_FILTERS = {
@@ -821,14 +853,11 @@ def exportar_analise(
         if critical:
              where_clauses.append("estoque_disponivel < estoque_min_sugerido")
 
-        if curve:
-            curves = [c.strip().upper() for c in curve.split(",") if c.strip()]
-            if curves:
-                curve_params = {f"curve_{i}": c for i, c in enumerate(curves)}
-                params.update(curve_params)
-                keys = ", ".join([f":{k}" for k in curve_params.keys()])
-                where_clauses.append(f"curva_abc IN ({keys})")
-        
+        fc = _filtro_curva(curve, grouped_view)
+        if fc:
+            where_clauses.append(fc[0])
+            params.update(fc[1])
+
         if trend:
             # Trend -> tendencia_label (match logic from listar_analise)
             trends = [t.strip() for t in trend.split(",") if t.strip()]
@@ -874,8 +903,9 @@ def exportar_analise(
                 estoque_min_sugerido, estoque_max_sugerido, 
                 curva_abc, tipo_planejamento, sgr_codigo, alerta_tendencia_alta,
                 demanda_media_dia_ajustada, fornecedor1, qtd_vendida,
-                group_id, grp_estoque_disponivel, grp_estoque_min_sugerido, grp_estoque_max_sugerido
-             """
+                group_id, grp_estoque_disponivel, grp_estoque_min_sugerido, grp_estoque_max_sugerido,
+                {curva_grupo} as curva_grupo
+             """.format(curva_grupo=curva_grupo_expr)
         else:
              # Modo Padrão: Traz colunas formatadas para relatorio de analise
              query_columns = """
@@ -883,6 +913,7 @@ def exportar_analise(
                 pro_descricao as "Descrição",
                 mar_descricao as "Marca",
                 curva_abc as "Curva",
+                {curva_grupo} as "Curva do grupo",
                 estoque_disponivel as "Estoque",
                 demanda_media_dia_ajustada as "Média/Dia",
                 tendencia_label as "Tendência",
@@ -910,16 +941,14 @@ def exportar_analise(
                 ROUND(COALESCE(estoque_disponivel,0) * COALESCE(custo_unitario,0), 2) as "Valor em Estoque (R$)",
                 ROUND(COALESCE(estoque_disponivel,0) * COALESCE(custo_unitario,0)
                       * {hold_rate} * GREATEST(COALESCE(tempo_medio_saldo_atual,0),0) / 365.0, 2) as "CME Acum. (R$)"
-             """.format(hold_rate=float(os.getenv("HOLDING_RATE_ANUAL") or 0.25))
+             """.format(hold_rate=float(os.getenv("HOLDING_RATE_ANUAL") or 0.25),
+                        curva_grupo=curva_grupo_expr)
 
         export_sql = text(f"""
             SELECT {query_columns}
             FROM com_fifo_completo 
             WHERE {where_clause}
-            ORDER BY 
-                MIN(curva_abc) OVER (PARTITION BY CASE WHEN group_id IS NOT NULL AND group_id <> '' THEN group_id ELSE pro_codigo END) ASC,
-                MIN(pro_descricao) OVER (PARTITION BY CASE WHEN group_id IS NOT NULL AND group_id <> '' THEN group_id ELSE pro_codigo END) ASC,
-                pro_descricao ASC
+            ORDER BY {_order_by(None, "asc", grouped_view)}
         """)
         
         import pandas as pd
@@ -1006,6 +1035,7 @@ def exportar_analise(
                 'pro_codigo': 'Código',
                 'pro_descricao': 'Descrição',
                 'curva_abc': 'Curva',
+                'curva_grupo': 'Curva do grupo',
                 'tipo_planejamento': 'Planejamento',
                 'estoque_disponivel': 'Estoque Atual',
                 'estoque_min_sugerido': 'Min Original',

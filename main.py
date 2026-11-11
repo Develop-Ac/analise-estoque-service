@@ -1940,8 +1940,13 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
     else:
         tot = g["VALOR_VENDIDO_12M"].sum()
         g["_PCT"] = (g["VALOR_VENDIDO_12M"].cumsum() / tot * 100) if tot > 0 else 0
-    g["GRUPO_CURVA"] = [curva_combinada(curva_por_valor(p), classe_giro(mv))
-                        for p, mv in zip(g["_PCT"], g["MESES_COM_VENDA_12M"])]
+    # Abertura da curva do grupo (valor, giro, meses) gravada para auditoria, como no item.
+    g["GRUPO_CURVA_VALOR"] = [curva_por_valor(p) for p in g["_PCT"]]
+    g["GRUPO_MESES_COM_VENDA_12M"] = pd.to_numeric(g["MESES_COM_VENDA_12M"],
+                                                   errors="coerce").fillna(0).astype(int)
+    g["GRUPO_CLASSE_GIRO"] = g["GRUPO_MESES_COM_VENDA_12M"].apply(classe_giro)
+    g["GRUPO_CURVA"] = [curva_combinada(v, gi)
+                        for v, gi in zip(g["GRUPO_CURVA_VALOR"], g["GRUPO_CLASSE_GIRO"])]
     g["GRUPO_PADRAO"] = g.apply(lambda r: _classificar_padrao(r["DEM_DIA_REAL"], r.get("ADI"), r.get("CV2_TAMANHO")), axis=1)
 
     # Fornecedor primário do GRUPO = de quem o grupo (todas as marcas) mais
@@ -2007,7 +2012,7 @@ def calcular_grupos_descricao(df_sai_fifo, df_vp, df_saldo_produto, hoje, indice
             "GRUPO_ESTOQUE_MIN", "GRUPO_ESTOQUE_MAX", "GRUPO_ESTOQUE_SEGURANCA",
             "GRUPO_MEAN_SIZE", "GRUPO_CV2", "GRUPO_LEAD_TIME_DIAS",
             "GRUPO_NIVEL_SERVICO_CUSTO", "GRUPO_ESTOQUE_MIN_CUSTO", "GRUPO_ESTOQUE_MAX_CUSTO",
-            "GRUPO_MARGEM_PCT"]
+            "GRUPO_MARGEM_PCT", "GRUPO_CURVA_VALOR", "GRUPO_CLASSE_GIRO", "GRUPO_MESES_COM_VENDA_12M"]
     return g[cols]
 
 
@@ -3180,6 +3185,9 @@ def salvar_metricas_postgres(df_metricas):
         'GRUPO_DEMANDA_DIA': 'grupo_demanda_dia',
         'GRUPO_FATOR_SAZONAL': 'grupo_fator_sazonal',
         'GRUPO_CURVA': 'grupo_curva',
+        'GRUPO_CURVA_VALOR': 'grupo_curva_valor',
+        'GRUPO_CLASSE_GIRO': 'grupo_classe_giro',
+        'GRUPO_MESES_COM_VENDA_12M': 'grupo_meses_com_venda_12m',
         'GRUPO_PADRAO': 'grupo_padrao',
         'GRUPO_METODO': 'grupo_metodo',
         'GRUPO_ESTOQUE_MIN': 'grupo_estoque_min',
@@ -3237,8 +3245,10 @@ def salvar_metricas_postgres(df_metricas):
     # só são gravadas depois que o DBA aplicar o ALTER — antes disso o ETL segue
     # rodando e apenas não popula estas colunas.
     # Curva combinada (sql/2026-11-06_curva_abc_valor_giro.sql): mesma regra.
+    # Abertura da curva do grupo (sql/2026-11-10_grupo_curva_valor_giro.sql): mesma regra.
     colunas_opcionais = ['custo_cogs_12m', 'custo_fonte', 'margem_unitaria_realizada',
-                         'curva_valor', 'classe_giro', 'meses_com_venda_12m']
+                         'curva_valor', 'classe_giro', 'meses_com_venda_12m',
+                         'grupo_curva_valor', 'grupo_classe_giro', 'grupo_meses_com_venda_12m']
     try:
         _eng = get_postgres_engine()
         with _eng.connect() as _c:
@@ -3250,7 +3260,8 @@ def salvar_metricas_postgres(df_metricas):
         table_columns = table_columns + _add
         if _falta:
             print(f"  - AVISO: colunas ausentes na tabela (aplique sql/2026-07-29_custo_fifo.sql "
-                  f"e sql/2026-11-06_curva_abc_valor_giro.sql): {_falta}")
+                  f", sql/2026-11-06_curva_abc_valor_giro.sql "
+                  f"e sql/2026-11-10_grupo_curva_valor_giro.sql): {_falta}")
     except Exception as e:
         print(f"  - AVISO: não foi possível checar colunas opcionais ({e}). Gravando sem elas.")
 

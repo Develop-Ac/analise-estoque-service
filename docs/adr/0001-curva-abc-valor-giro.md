@@ -30,5 +30,9 @@ Meses com venda é o critério FSN por % de períodos.
   só muda a faixa piso/teto e a prioridade da sugestão. Muitos itens mudam de faixa
   na 1ª rodada (simulação nov/25–out/26: dos A antigos, 1.015 ficam A e 356 descem;
   433 B sobem para A) — o mín/máx desses itens muda e `teve_alteracao_analise` acende.
-- Vale para `grupo_curva` (giro do grupo = meses em que alguma marca vendeu).
+- Vale para `grupo_curva` (giro do grupo = meses em que alguma marca vendeu). A abertura
+  do grupo é gravada em `grupo_curva_valor`, `grupo_classe_giro` e
+  `grupo_meses_com_venda_12m` (`sql/2026-11-10_grupo_curva_valor_giro.sql`), e a análise
+  de estoque usa a curva do grupo na visão agrupada (filtro, ordenação, dias de
+  referência da simulação e export).
 - `backtest.py` usa a mesma regra.

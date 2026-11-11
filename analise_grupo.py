@@ -34,6 +34,20 @@ _COLS_GRUPO = ["GRUPO_QTD_ITENS", "GRUPO_ESTOQUE_DISPONIVEL", "GRUPO_DEMANDA_DIA
                "GRUPO_MEAN_SIZE", "GRUPO_CV2", "GRUPO_LEAD_TIME_DIAS",
                "GRUPO_NIVEL_SERVICO_CUSTO", "GRUPO_ESTOQUE_MIN_CUSTO", "GRUPO_ESTOQUE_MAX_CUSTO",
                "GRUPO_MARGEM_PCT"]
+# Abertura da curva do grupo (valor x giro): opcionais, só gravadas se o SQL já criou as colunas
+_COLS_GRUPO_ABERTURA = ["GRUPO_CURVA_VALOR", "GRUPO_CLASSE_GIRO", "GRUPO_MESES_COM_VENDA_12M"]
+
+
+def colunas_grupo_gravaveis(existentes):
+    """_COLS_GRUPO + as de abertura presentes em `existentes` (nomes em minúsculas)."""
+    return _COLS_GRUPO + [c for c in _COLS_GRUPO_ABERTURA if c.lower() in existentes]
+
+
+def colunas_abertura_existentes(conn):
+    """Colunas de abertura que existem em com_fifo_completo (maiúsculas)."""
+    existentes = {r[0] for r in conn.execute(text(
+        "SELECT column_name FROM information_schema.columns WHERE table_name='com_fifo_completo'"))}
+    return colunas_grupo_gravaveis(existentes)[len(_COLS_GRUPO):]
 
 
 # ------------------------------------------------------------------
@@ -259,14 +273,17 @@ def analisar_grupo(pro_codigos):
         avisos.append("Grupo sem venda na janela: nada a consolidar.")
         return {"status": "success", "grupos": [], "avisos": avisos}
 
-    sets = ", ".join(f"{c.lower()} = :{c.lower()}" for c in _COLS_GRUPO)
     resumo = []
     with get_db_connection() as pg:
+        # begin() antes de qualquer execute: no SQLAlchemy 2.0 o primeiro execute já
+        # abre a transação (autobegin) e um begin() depois dele levanta erro.
         trans = pg.begin()
+        cols = _COLS_GRUPO + colunas_abertura_existentes(pg)
+        sets = ", ".join(f"{c.lower()} = :{c.lower()}" for c in cols)
         for _, r in g[g["GRUPO"].isin(alvos)].iterrows():
             gk = r["GRUPO"]
             cods_g = [p for p in membros if chave_final[p] == gk]
-            params = {c.lower(): _sem_nan(r.get(c)) for c in _COLS_GRUPO}
+            params = {c.lower(): _sem_nan(r.get(c)) for c in cols}
             params.update({"gk": gk, "cods": cods_g, "antigas": antigas_por_grupo[gk], "avulsos": avulsos})
             # Linhas do snapshot com chave antiga e fora do cadastro ativo vão junto:
             # senão sobrariam como um grupo fantasma com números velhos. Desvinculado nunca.

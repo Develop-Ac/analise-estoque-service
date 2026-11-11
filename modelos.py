@@ -85,6 +85,9 @@ class AnaliseItem(BaseModel):
     grupo_demanda_dia: Optional[float] = None
     grupo_estoque_seguranca: Optional[int] = None
     grupo_curva: Optional[str] = None
+    grupo_curva_valor: Optional[str] = None
+    grupo_classe_giro: Optional[str] = None
+    grupo_meses_com_venda_12m: Optional[int] = None
     grupo_metodo: Optional[str] = None
     grupo_fator_sazonal: Optional[float] = None
     # Nível de serviço econômico (razão crítica / newsvendor) — modo sombra

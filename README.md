@@ -114,7 +114,9 @@ subestima a procura). Cada apontamento de venda perdida tem **teto por evento**
 
   Motivo: só por valor bastavam ~R$ 2 mil/ano para ser A — peça cara que vende
   1×/ano virava A e item barato de giro mensal ficava C/D. Vale também para
-  `grupo_curva` (giro = meses em que alguma marca do grupo vendeu). Define a
+  `grupo_curva` (giro = meses em que alguma marca do grupo vendeu; abertura em
+  `grupo_curva_valor`, `grupo_classe_giro`, `grupo_meses_com_venda_12m`, DDL manual
+  `sql/2026-11-10_grupo_curva_valor_giro.sql`). Define a
   **faixa (piso/teto) do nível de serviço** — o custo escolhe o ponto dentro dela
   (§2.3) — e a prioridade da sugestão de compra.
 - **Classe XYZ** — pelo coeficiente de variação (CV) da demanda mensal:
@@ -251,7 +253,7 @@ mantém as 2 últimas execuções). Colunas por grupo:
 | Tendência/Sazonal | `fator_tendencia`, `tendencia_label`, `alerta_tendencia_alta`, `fator_sazonal` |
 | Mín/Máx (item) | `estoque_min_base/max_base`, `estoque_min_ajustado/max_ajustado`, **`estoque_min_sugerido`/`estoque_max_sugerido`**, `estoque_seguranca`, `nivel_servico_z`, `lead_time_dias`, `tipo_planejamento` |
 | Nível econômico (auditoria) | `custo_unitario`, `margem_unitaria`, `margem_pct`, `nivel_servico_custo`, `z_custo`, `estoque_min_custo/max_custo/seg_custo` (e os `grupo_*_custo`) |
-| **Grupo** | `grupo_chave`, `grupo_qtd_itens`, `grupo_estoque_disponivel`, `grupo_demanda_dia`, `grupo_fator_sazonal`, `grupo_curva`, `grupo_padrao`, `grupo_metodo`, **`grupo_estoque_min`/`grupo_estoque_max`**, `grupo_estoque_seguranca` |
+| **Grupo** | `grupo_chave`, `grupo_qtd_itens`, `grupo_estoque_disponivel`, `grupo_demanda_dia`, `grupo_fator_sazonal`, `grupo_curva`, `grupo_curva_valor`, `grupo_classe_giro`, `grupo_meses_com_venda_12m` (DDL manual `sql/2026-11-10_grupo_curva_valor_giro.sql`), `grupo_padrao`, `grupo_metodo`, **`grupo_estoque_min`/`grupo_estoque_max`**, `grupo_estoque_seguranca` |
 | Flags | `sob_encomenda`, `teve_alteracao_analise`, `dados_alteracao_json`, `data_processamento` |
 | FIFO saldo | `tempo_medio_saldo_atual`, `categoria_saldo_atual` |
 

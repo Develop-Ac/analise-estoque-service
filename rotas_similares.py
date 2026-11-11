@@ -101,6 +101,8 @@ def desvincular_produtos(req: GroupRequest):
             """), {"g": group_id_avulso(code), "c": code, "o": AVULSO})
 
         # 2. Sai do grupo consolidado no snapshot atual (planejado pelo mín/máx do próprio item)
+        from analise_grupo import colunas_abertura_existentes
+        abertura = "".join(f", {c.lower()} = NULL" for c in colunas_abertura_existentes(conn))
         conn.execute(text(f"""
             UPDATE com_fifo_completo
             SET grupo_chave = NULL, grupo_qtd_itens = NULL, grupo_estoque_disponivel = NULL,
@@ -108,7 +110,7 @@ def desvincular_produtos(req: GroupRequest):
                 grupo_padrao = NULL, grupo_metodo = NULL, grupo_estoque_min = NULL,
                 grupo_estoque_max = NULL, grupo_estoque_seguranca = NULL, grupo_mean_size = NULL,
                 grupo_cv2 = NULL, grupo_lead_time_dias = NULL, grupo_nivel_servico_custo = NULL,
-                grupo_estoque_min_custo = NULL, grupo_estoque_max_custo = NULL, grupo_margem_pct = NULL
+                grupo_estoque_min_custo = NULL, grupo_estoque_max_custo = NULL, grupo_margem_pct = NULL{abertura}
             WHERE {snapshot} AND pro_codigo = ANY(:c)
         """), {"c": codes})
 
