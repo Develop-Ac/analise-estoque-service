@@ -402,7 +402,7 @@ def test_nao_comprados_tira_o_que_veio_na_nota_e_ordena():
     ]}]}
     r = an.montar_nao_comprados(sug, ["10", "11"], "FORN")
     assert [i["pro_codigo"] for i in r["itens"]] == ["40", "30"]   # zerado primeiro
-    # Compra só até o mínimo (3), não até o máximo (8).
+    # Compra só até o mínimo (3), o "Comprar min" da Sugestão, não até o máximo (8).
     assert [(i["comprar_qtd"], i["comprar_valor"]) for i in r["itens"]] == [(3, 30.0), (1, 10.0)]
     assert (r["zerados"], r["valor_total"], r["pedido_minimo_valor"]) == (1, 40.0, 1000.0)
     assert r["fornecedor"] == "FORN" and r["aviso"] is None
