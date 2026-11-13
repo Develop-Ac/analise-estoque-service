@@ -5,6 +5,7 @@ Lê o XML da NF-e de entrada (cabeçalho, itens com o desembolso de cada um e du
 e fecha o desembolso dos itens com o total da nota (vNF).
 """
 import datetime
+import math
 import xml.etree.ElementTree as ET
 
 _NS = "{http://www.portalfiscal.inf.br/nfe}"
@@ -341,6 +342,9 @@ def montar_nao_comprados(sugestao, pros_da_nota, fornecedor, aviso=None):
 
     `sugestao` = resposta de /compras/sugestao filtrada pelo fornecedor; `pros_da_nota` = produtos
     da nota e os membros dos grupos deles — grupo que veio na nota, por qualquer marca, não entra.
+    A quantidade a comprar aqui repõe só até o MÍNIMO (ponto de pedido), descontado o que está em
+    trânsito — não até o máximo, como na tela Sugestão: é o necessário para não faltar, que é o
+    que cabe comparar com o excesso da compra. Quem já alcança o mínimo fica fora.
     Zerados primeiro, depois o maior valor a comprar."""
     pros = {str(p).strip() for p in pros_da_nota}
     itens, minimo = [], None
@@ -348,15 +352,19 @@ def montar_nao_comprados(sugestao, pros_da_nota, fornecedor, aviso=None):
         minimo = minimo or f.get("pedido_minimo_valor")
         for it in f["itens"]:
             codigos = {str(it["pro_codigo"])} | {str(m["pro_codigo"]) for m in it.get("membros") or []}
-            if codigos & pros or not it["qtd_sugerida"]:
+            falta = float(it["ponto_pedido"] or 0) - max(float(it["estoque_atual"] or 0), 0.0) \
+                - float(it["em_transito"] or 0)
+            qtd = max(math.ceil(falta), 0)
+            if codigos & pros or not qtd:
                 continue
+            custo = it.get("custo_unitario")
             itens.append({
                 "tipo": it["tipo"], "pro_codigo": it["pro_codigo"], "rotulo": it["pro_descricao"],
                 "marcas": it.get("marcas") or [], "curva": it.get("curva_abc"),
                 "zerado": it["estoque_atual"] <= 0, "estoque": it["estoque_atual"],
                 "em_transito": it["em_transito"], "minimo": it["ponto_pedido"], "maximo": it["maximo"],
                 "cobertura_dias": it.get("cobertura_dias"),
-                "comprar_qtd": it["qtd_sugerida"], "comprar_valor": it.get("valor_estimado"),
+                "comprar_qtd": qtd, "comprar_valor": round(qtd * custo, 2) if custo else None,
             })
     itens.sort(key=lambda x: (not x["zerado"], -(x["comprar_valor"] or 0)))
     return {
