@@ -82,18 +82,16 @@ def ratear_desembolso(itens, valor_total):
 
     A diferença (desconto/acréscimo só no total, arredondamento) é distribuída proporcional
     ao desembolso de cada item; o resíduo de centavo vai no item de maior valor.
-    Altera e devolve `itens`; a soma final em centavos é exatamente o vNF.
+    Altera e devolve `itens`; a soma final em centavos é exatamente o vNF. Sem nenhum item com
+    valor não há base de rateio: os itens ficam zerados (o total não vira valor de mercadoria).
     """
     if not itens:
         return itens
     centavos = [round(i["desembolso"] * 100) for i in itens]
     alvo = round(valor_total * 100)
     base = sum(centavos)
-    if base != alvo:
-        if base:
-            centavos = [c + (alvo - base) * c // base for c in centavos]
-        else:
-            centavos = [0] * len(itens)
+    if base and base != alvo:
+        centavos = [c + (alvo - base) * c // base for c in centavos]
         maior = max(range(len(itens)), key=lambda k: centavos[k])
         centavos[maior] += alvo - sum(centavos)
     for item, c in zip(itens, centavos):
@@ -176,12 +174,15 @@ def _f(v):
     return float(v) if v is not None else None
 
 
-def montar_unidades(itens, rodada, saldos, lancada):
+def montar_unidades(itens, rodada, saldos, lancada, a_caminho=None):
     """Agrupa os itens analisáveis por unidade de análise e calcula estoque, cobertura e excesso.
 
     Unidade = o grupo (`grupo_chave` com mais de um membro na rodada) ou o produto sozinho.
     `rodada` traz todos os membros dos grupos; o saldo da unidade soma todos eles (saldo
     negativo de um produto conta zero). Nota lançada já está no saldo: antes = saldo − qtd.
+    `a_caminho` = {pro_codigo: qtd} de outros pedidos em aberto (análise do pedido): somado
+    aos membros, entra no estoque antes e depois da compra e sai em `a_caminho` na unidade;
+    None (nota) deixa a conta e a saída sem esse campo.
     Devolve as unidades ordenadas pelo valor do excesso gerado (maior primeiro), sem custo de caixa.
     """
     unidades = {}
@@ -213,7 +214,8 @@ def montar_unidades(itens, rodada, saldos, lancada):
             membros = [u["chave"]]
         agora = sum(max(float(saldos.get(p) or 0), 0.0) for p in membros)
         qtd = u["qtd"]
-        antes, depois = (max(agora - qtd, 0.0), agora) if lancada else (agora, agora + qtd)
+        caminho = sum(float(a_caminho.get(p) or 0) for p in membros) if a_caminho is not None else 0.0
+        antes, depois = (max(agora - qtd, 0.0), agora) if lancada else (agora + caminho, agora + caminho + qtd)
         venda = u["venda_dia"] or 0.0
         maximo = u["maximo"]
         selos = []
@@ -230,7 +232,7 @@ def montar_unidades(itens, rodada, saldos, lancada):
             return round(estoque / venda, 1) if venda > 0 else None
 
         custo_un = u["desembolso"] / qtd if qtd else 0.0
-        saida.append({
+        unidade = {
             "tipo": u["tipo"], "chave": u["chave"], "rotulo": u["rotulo"], "produtos": u["produtos"],
             "qtd_nota": round(qtd, 4), "valor_nota": round(u["desembolso"], 2),
             "estoque_antes": round(antes, 4), "estoque_depois": round(depois, 4),
@@ -239,7 +241,10 @@ def montar_unidades(itens, rodada, saldos, lancada):
             "excesso_existente": round(existente, 4), "excesso_gerado_qtd": round(gerado, 4),
             "excesso_gerado_valor": round(gerado * custo_un, 2),
             "selos": selos, "avisos": u["avisos"],
-        })
+        }
+        if a_caminho is not None:
+            unidade["a_caminho"] = round(caminho, 4)
+        saida.append(unidade)
     saida.sort(key=lambda x: x["excesso_gerado_valor"], reverse=True)
     return saida
 

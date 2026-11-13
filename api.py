@@ -36,6 +36,7 @@ import rotas_compras
 import rotas_produto
 import rotas_sistema
 import rotas_nota
+import rotas_pedido
 
 app.include_router(rotas_analise.router)
 app.include_router(rotas_promo.router)
@@ -45,6 +46,7 @@ app.include_router(rotas_compras.router)
 app.include_router(rotas_produto.router)
 app.include_router(rotas_sistema.router)
 app.include_router(rotas_nota.router)
+app.include_router(rotas_pedido.router)
 
 def background_scheduler():
     global BACKGROUND_Running

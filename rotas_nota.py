@@ -296,12 +296,13 @@ def _nomes_fornecedor(cnpj):
     return [str(r["FOR_NOME"]).strip() for r in linhas if r.get("FOR_NOME")]
 
 
-def _nao_comprados(cab, pros_da_nota):
-    """Sugestão de compra de hoje do fornecedor da nota (e relacionados), sem o que veio na nota.
+def _nao_comprados(nomes, pros_da_nota):
+    """Sugestão de compra de hoje do fornecedor (e relacionados), sem os produtos informados.
+    `nomes` = nomes candidatos do fornecedor; vale o primeiro com histórico de compra.
     É um bloco de apoio: falha aqui não derruba a análise, o bloco sai vazio com aviso."""
     try:
         conhecidos = {n.strip().upper() for forns in get_compras_historico().values() for n, _ in forns}
-        nome = next((n for n in _nomes_fornecedor(cab["cnpj"]) + [(cab["emitente"] or "").strip()]
+        nome = next((n for n in nomes
                      if any(m in conhecidos for m in _expandir_fornecedores([n]))), None)
         if not nome:
             return an.montar_nao_comprados({}, pros_da_nota, None,
@@ -312,19 +313,25 @@ def _nao_comprados(cab, pros_da_nota):
         return an.montar_nao_comprados({}, pros_da_nota, None, "Não foi possível montar esta lista agora.")
 
 
-def _so_quem_ve_notas(x_app_token: str | None = Header(None), x_user_id: str | None = Header(None)):
-    """A resposta traz títulos da nota e o contas a pagar da empresa: só pelo proxy da intranet
-    (x-app-token igual ao APP_TOKEN; vazio = tudo recusado) e para quem visualiza /fiscal/nfe."""
-    esperado = os.getenv("APP_TOKEN") or ""
-    if not esperado or not x_app_token or not hmac.compare_digest(x_app_token, esperado):
-        raise HTTPException(status_code=403, detail="Esta rota só responde pela intranet.")
-    if not x_user_id:
-        raise HTTPException(status_code=401, detail="Usuário não identificado.")
-    with get_db_connection() as pg:
-        pode = pg.execute(text("SELECT 1 FROM sis_permissoes WHERE usuario_id = :u AND tela = '/fiscal/nfe' "
-                               "AND visualizar LIMIT 1"), {"u": x_user_id}).scalar()
-    if not pode:
-        raise HTTPException(status_code=403, detail="Sem permissão para ver notas fiscais.")
+def _exigir_tela(tela, recusa):
+    """Dependência de acesso: só pelo proxy da intranet (x-app-token igual ao APP_TOKEN; vazio =
+    tudo recusado) e para quem visualiza `tela` em sis_permissoes; senão 403 com `recusa`."""
+    def dep(x_app_token: str | None = Header(None), x_user_id: str | None = Header(None)):
+        esperado = os.getenv("APP_TOKEN") or ""
+        if not esperado or not x_app_token or not hmac.compare_digest(x_app_token, esperado):
+            raise HTTPException(status_code=403, detail="Esta rota só responde pela intranet.")
+        if not x_user_id:
+            raise HTTPException(status_code=401, detail="Usuário não identificado.")
+        with get_db_connection() as pg:
+            pode = pg.execute(text("SELECT 1 FROM sis_permissoes WHERE usuario_id = :u AND tela = :t "
+                                   "AND visualizar LIMIT 1"), {"u": x_user_id, "t": tela}).scalar()
+        if not pode:
+            raise HTTPException(status_code=403, detail=recusa)
+    return dep
+
+
+# A resposta traz títulos da nota e o contas a pagar da empresa: só para quem visualiza /fiscal/nfe.
+_so_quem_ve_notas = _exigir_tela("/fiscal/nfe", "Sem permissão para ver notas fiscais.")
 
 
 @router.get("/analise/nota/{chave}", dependencies=[Depends(_so_quem_ve_notas)])
@@ -369,5 +376,6 @@ def analise_nota(chave: str):
         **an.montar_analise(cab["valor_total"], analisaveis, nao_analisados, rodada, saldos, lancada,
                             vencimentos, base, base_prazo, comprometido, hoje,
                             CUSTO_CAIXA_TAXA_MES, CUSTO_CAIXA_DIAS_TETO),
-        "nao_comprados": _nao_comprados(cab, membros),
+        "nao_comprados": _nao_comprados(_nomes_fornecedor(cab["cnpj"]) + [(cab["emitente"] or "").strip()],
+                                        membros),
     }
