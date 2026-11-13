@@ -46,6 +46,20 @@ def test_filtro_curva_efetiva():
     assert ra._filtro_curva(" , ", True) is None
 
 
+def test_filtro_busca():
+    like = "(pro_codigo LIKE :search OR pro_descricao ILIKE :search_desc)"
+    assert ra._filtro_busca("x", "exact", None) == (
+        ["(pro_codigo = :search OR pro_descricao = :search_desc)"], {"search": "x", "search_desc": "x"})
+    assert ra._filtro_busca("x", "starts_with", None) == ([like], {"search": "x%", "search_desc": "x%"})
+    assert ra._filtro_busca("x", "contains", None) == ([like], {"search": "%x%", "search_desc": "%x%"})
+    assert ra._filtro_busca(None, "contains", " 123, ,456 ") == (
+        ["pro_codigo IN (:cod_0, :cod_1)"], {"cod_0": "123", "cod_1": "456"})
+    cl, pr = ra._filtro_busca("x", "outro", "9", prefixo="f.")
+    assert cl == ["(f.pro_codigo LIKE :search OR f.pro_descricao ILIKE :search_desc)", "f.pro_codigo IN (:cod_0)"]
+    assert pr == {"search": "%x%", "search_desc": "%x%", "cod_0": "9"}
+    assert ra._filtro_busca(None, "contains", None) == ([], {})
+
+
 def test_select_abertura_grupo():
     assert ra._select_abertura_grupo(set()) == (
         "NULL AS grupo_curva_valor, NULL AS grupo_classe_giro, NULL AS grupo_meses_com_venda_12m")

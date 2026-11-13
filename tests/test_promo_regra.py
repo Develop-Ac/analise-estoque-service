@@ -113,3 +113,29 @@ def test_visao_agrupada_acao_do_grupo_preco_do_item():
     assert pr.avaliar(_item(), grupo=dict(grupo, maximo=50))["excesso_qtd"] == 0
     # Item sem custo continua pedindo revisão de cadastro, qualquer que seja o grupo.
     assert pr.avaliar(_item(custo_unitario=None), grupo=grupo)["acao"] == "revisar_cadastro"
+
+
+def test_parado_240_e_quantidade_a_vender():
+    # Parado maior que o excesso: vende o parado inteiro; valor parado no custo da base.
+    r = pr.avaliar(_item(estoque_disponivel=8, estoque_max_sugerido=3, base_qtd=10, base_custo=90))
+    assert (r["excesso_qtd"], r["parado_qtd"], r["vender_qtd"]) == (5, 8, 8)
+    assert (r["valor_parado_240"], r["valor_vender"]) == (720.0, 800.0)
+    # Excesso maior que o parado: vende o excesso.
+    r = pr.avaliar(_item(estoque_disponivel=15, estoque_max_sugerido=3, base_qtd=10, base_custo=90))
+    assert (r["excesso_qtd"], r["parado_qtd"], r["vender_qtd"]) == (12, 10, 12)
+
+
+def test_fora_da_base_nao_muda_nada():
+    r = pr.avaliar(_item())
+    assert r["na_base"] is False and r["parado_qtd"] == 0
+    assert r["vender_qtd"] == r["excesso_qtd"] and r["valor_vender"] == r["valor_excesso"]
+    assert r["acao"] == "giro_caixa" and r["caixa_potencial"] == round(r["excesso_qtd"] * r["preco_varejo"], 2)
+
+
+def test_na_base_nao_muda_acao():
+    # Dentro do máximo e ainda vendendo (cobertura 8 meses, saldo de 300 d): a base não vira liquidação.
+    kw = dict(estoque_disponivel=8, estoque_max_sugerido=10, tempo_medio_saldo_atual=300)
+    fora, dentro = pr.avaliar(_item(**kw)), pr.avaliar(_item(base_qtd=8, base_custo=90, **kw))
+    assert dentro["acao_sugerida"] in ("promocao", "vender_sem_repor")
+    assert dentro["acao_sugerida"] == fora["acao_sugerida"]
+    assert dentro["vender_qtd"] == 8 and fora["vender_qtd"] == 0

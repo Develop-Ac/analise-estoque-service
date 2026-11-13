@@ -148,6 +148,9 @@ sozinho, então a escada do varejo começa em 15% e termina em 50%.
   `valor_parado`, `valor_excesso`, `itens`, `meses_para_zerar` (Σ valor ÷ Σ demanda mensal × custo),
   `caixa_potencial` (Σ excesso × preço do público), `por_acao` (itens e valor).
   Remover a segunda definição duplicada da rota (a 2ª é morta).
+  Filtros do body (12/11/2026): `so_parado`, `search` + `match_type` (`contains` |
+  `starts_with` | `exact`), `pro_codigos` ("123, 456") e `fornecedores: []` — ver seção 9.
+  `sort` aceita também `valor_vender`.
 - `POST /promo/export`: aba **Promoção** com os campos da tela + ação + público + preços + motivo;
   aba **Carga ERP** só dos itens com preço: `PRO_CODIGO`, `PROM_VALOR` (tabela 1 ou vazio),
   `PROM_VALOR2` (tabela 2 ou vazio), `DATA_INICIAL` (hoje), `DATA_FINAL` (hoje + 30).
@@ -272,3 +275,32 @@ A lista tem duas visões, escolhidas na tela (`Individual | Agrupado`) e enviada
   grupo, Saldo/Máximo/Excesso/Cobertura do grupo. A aba "Carga ERP" é sempre por produto.
 
 Regra em `promo_regra.avaliar(item, regua, grupo)`; teste em `tests/test_promo_regra.py`.
+
+## 9. Saldo parado há mais de 240 dias e busca (12/11/2026)
+
+- **Base do parado**: tabela `fin_plano_parado_base` (Postgres da intranet, criada pelo
+  financeiro-service). Uma linha por produto com a quantidade e o custo unitário do saldo
+  parado há mais de 240 dias na rodada de 11/11/2026. É congelada: não muda com as rodadas
+  seguintes. Junta com `com_fifo_completo` pelo código (`b.pro_codigo::text = f.pro_codigo`).
+- **Quem entra na lista**: além dos itens com excesso ou sem custo, todo produto da base com
+  saldo, mesmo dentro do máximo (nas duas visões).
+- **Quantidade a vender** = `max(excesso, min(base, saldo))`: o parado é a quantidade da base
+  limitada ao saldo de hoje; o caixa potencial passa a usar a quantidade a vender.
+- **Ação e preço não mudam**: seguem a regra de giro das seções 2 e 3 (e o grupo, na visão
+  agrupada). A base só define quem entra e quanto conta.
+- **Campos novos por linha**: `na_base`, `parado_qtd`, `valor_parado_240` (parado × custo da
+  base), `vender_qtd`, `valor_vender` (a vender × custo de hoje). `excesso_qtd` e
+  `valor_excesso` continuam sendo só o excesso sobre o máximo. Na visão agrupada o cabeçalho
+  do grupo soma `valor_vender`, `valor_parado_240` e `vender_qtd`, e `na_base` = alguma marca.
+- **Totais novos**: `valor_vender` e `parado_240: {itens, valor}`; `bonus_liquidacao` usa a
+  quantidade a vender.
+- **Filtros novos do body** (`/promo/plan` e `/promo/export`):
+  - `so_parado: true` — só itens da base;
+  - `search` + `match_type` e `pro_codigos` — mesma busca da aba Análise
+    (`rotas_analise._filtro_busca`);
+  - `fornecedores: []` — expandidos para os relacionados (matriz/filiais) com
+    `_expandir_fornecedores` e comparados com `COALESCE(NULLIF(fornecedor_principal,''), fornecedor1)`,
+    como no `/analise`.
+  Na visão agrupada o grupo sai só com as marcas que casaram com o filtro.
+- **Excel**: colunas "Parado +240 d (qtd)" e "A vender (qtd)" depois de "Excesso (un)".
+- **Sem a tabela** (ou vazia): lista, totais e Excel iguais aos de antes; `parado_240` zerado.

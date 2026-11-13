@@ -220,6 +220,27 @@ def _filtro_curva(curve: Optional[str], grouped_view: bool):
     return f"{_curva_expr(grouped_view)} IN ({keys})", params
 
 
+def _filtro_busca(search: Optional[str], match_type: str, pro_codigos: Optional[str], prefixo: str = ""):
+    """Busca de produto (texto por código/descrição e lista 'a, b' de códigos) -> (clausulas, params).
+    `prefixo` qualifica as colunas (ex.: 'f.') quando a consulta tem alias."""
+    p = prefixo
+    clausulas, params = [], {}
+    if search:
+        if match_type == "exact":
+            clausulas.append(f"({p}pro_codigo = :search OR {p}pro_descricao = :search_desc)")
+            termo = search
+        else:
+            clausulas.append(f"({p}pro_codigo LIKE :search OR {p}pro_descricao ILIKE :search_desc)")
+            termo = f"{search}%" if match_type == "starts_with" else f"%{search}%"
+        params["search"] = params["search_desc"] = termo
+    codigos = [c.strip() for c in (pro_codigos or "").split(",") if c.strip()]
+    if codigos:
+        cods = {f"cod_{i}": c for i, c in enumerate(codigos)}
+        params.update(cods)
+        clausulas.append(f"{p}pro_codigo IN ({', '.join(f':{k}' for k in cods)})")
+    return clausulas, params
+
+
 # Colunas de abertura da curva do grupo; NULL quando a tabela ainda não as tem.
 _COLS_ABERTURA_GRUPO = ("grupo_curva_valor", "grupo_classe_giro", "grupo_meses_com_venda_12m")
 
@@ -428,29 +449,9 @@ def listar_analise(
                  keys = ", ".join([f":{k}" for k in trend_params.keys()])
                  filters.append(f"tendencia_label IN ({keys})")
 
-        if search:
-            if match_type == "exact":
-                filters.append("(pro_codigo = :search OR pro_descricao = :search_desc)")
-                params["search"] = search
-                params["search_desc"] = search
-            elif match_type == "starts_with":
-                filters.append("(pro_codigo LIKE :search OR pro_descricao ILIKE :search_desc)")
-                params["search"] = f"{search}%"
-                params["search_desc"] = f"{search}%"
-            else: # contains (default)
-                filters.append("(pro_codigo LIKE :search OR pro_descricao ILIKE :search_desc)")
-                params["search"] = f"%{search}%"
-                params["search_desc"] = f"%{search}%"
-
-        if pro_codigos:
-             # Separa os códigos por vírgula
-             codigos_list = [c.strip() for c in pro_codigos.split(",") if c.strip()]
-             if codigos_list:
-                 # Cria parametros dinamicos para o IN (:cod0, :cod1, ...)
-                 cod_params = {f"cod_{i}": c for i, c in enumerate(codigos_list)}
-                 params.update(cod_params)
-                 keys = ", ".join([f":{k}" for k in cod_params.keys()])
-                 filters.append(f"pro_codigo IN ({keys})")
+        cl, pr = _filtro_busca(search, match_type, pro_codigos)
+        filters.extend(cl)
+        params.update(pr)
 
         if marca:
             filters.append("mar_descricao ILIKE :marca")
@@ -814,27 +815,9 @@ def exportar_analise(
                 keys = ", ".join(f":{k}" for k in fkeys)
                 where_clauses.append(f"UPPER(TRIM({FORN_EXPR})) IN ({keys})")
 
-        if search:
-            if match_type == "exact":
-                where_clauses.append("(pro_codigo = :search OR pro_descricao = :search_desc)")
-                params["search"] = search
-                params["search_desc"] = search
-            elif match_type == "starts_with":
-                where_clauses.append("(pro_codigo LIKE :search OR pro_descricao ILIKE :search_desc)")
-                params["search"] = f"{search}%"
-                params["search_desc"] = f"{search}%"
-            else: # contains
-                where_clauses.append("(pro_codigo LIKE :search OR pro_descricao ILIKE :search_desc)")
-                params["search"] = f"%{search}%"
-                params["search_desc"] = f"%{search}%"
-
-        if pro_codigos:
-             codigos_list = [c.strip() for c in pro_codigos.split(",") if c.strip()]
-             if codigos_list:
-                 cod_params = {f"cod_{i}": c for i, c in enumerate(codigos_list)}
-                 params.update(cod_params)
-                 keys = ", ".join([f":{k}" for k in cod_params.keys()])
-                 where_clauses.append(f"pro_codigo IN ({keys})")
+        cl, pr = _filtro_busca(search, match_type, pro_codigos)
+        where_clauses.extend(cl)
+        params.update(pr)
 
         if marca:
             where_clauses.append("mar_descricao ILIKE :marca")

@@ -154,6 +154,11 @@ class PromoPlanRequest(BaseModel):
     acoes: Optional[List[str]] = None      # revisar_cadastro | giro_caixa | vender_sem_repor | promocao
     publicos: Optional[List[str]] = None   # atacado | varejo | ambos
     curvas: Optional[List[str]] = None
+    so_parado: bool = False                # só itens da base do parado há mais de 240 dias
+    search: Optional[str] = None           # código ou descrição (mesma busca do GET /analise)
+    match_type: str = "contains"           # contains | starts_with | exact
+    pro_codigos: Optional[str] = None      # lista "123, 456" de códigos
+    fornecedores: Optional[List[str]] = None  # expandidos para os fornecedores relacionados
     page: int = 1
     page_size: int = 100
     sort: Optional[str] = "valor_parado"

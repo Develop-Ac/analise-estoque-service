@@ -171,7 +171,13 @@ def precos(acao, subtipo, custo, preco1, preco2, sgr_codigo, fora_regua=False, r
 def avaliar(item, regua=None, grupo=None):
     """item: dict com estoque_disponivel, estoque_max_sugerido, custo_unitario, preco_venda_1/2,
     demanda_real_dia, dias_sem_venda, curva_abc, sgr_codigo, qtd_varejo_12m, qtd_atacado_12m,
-    fora_regua. Devolve o item enriquecido (novo dict).
+    fora_regua, base_qtd e base_custo (saldo e custo congelados na base do parado há 240 d;
+    ausentes = item fora da base). Devolve o item enriquecido (novo dict).
+
+    Parado e quantidade a vender: na_base, parado_qtd (base_qtd limitada ao saldo de hoje),
+    valor_parado_240 (parado × custo da base), vender_qtd (o maior entre excesso e parado) e
+    valor_vender (vender_qtd × custo de hoje). excesso_qtd/valor_excesso seguem sendo só o
+    excesso sobre o máximo; o caixa potencial usa vender_qtd.
 
     `grupo` (visão agrupada): dict do grupo unificado do item — saldo, maximo, demanda_dia,
     curva, dias_sem_venda, idade_saldo_dias. A ação e o degrau de desconto saem dos números
@@ -198,6 +204,13 @@ def avaliar(item, regua=None, grupo=None):
         r["excesso_qtd"] = max(saldo - mx, 0.0)
         base = (r.get("dias_sem_venda"), r["cobertura_meses"], r.get("curva_abc"), r["idade_saldo_dias"])
     r["valor_excesso"] = round(r["excesso_qtd"] * (custo or 0.0), 2)
+    # parado há 240 d: saldo congelado na base, limitado ao saldo de hoje (o que já vendeu sai)
+    base_qtd, base_custo = _num(r.get("base_qtd")), _num(r.get("base_custo"))
+    r["na_base"] = base_qtd is not None
+    r["parado_qtd"] = min(base_qtd, saldo) if r["na_base"] else 0.0
+    r["valor_parado_240"] = round(r["parado_qtd"] * (base_custo or 0.0), 2)   # custo congelado da base
+    r["vender_qtd"] = max(r["excesso_qtd"], r["parado_qtd"])
+    r["valor_vender"] = round(r["vender_qtd"] * (custo or 0.0), 2)            # custo de hoje
     acao, sub = acao_sugerida(custo, *base)
     r["acao_sugerida"], r["acao_subtipo"] = acao, sub
     r["publico"] = publico(r.get("qtd_varejo_12m"), r.get("qtd_atacado_12m"))
@@ -211,7 +224,7 @@ def avaliar(item, regua=None, grupo=None):
         r["preco_varejo"] = _num(r["preco_varejo_manual"]); r["motivo_varejo"] = "manual"
     if manual and _num(r.get("preco_atacado_manual")):
         r["preco_atacado"] = _num(r["preco_atacado_manual"]); r["motivo_atacado"] = "manual"
-    # caixa potencial = excesso vendido ao preço do público do item
+    # caixa potencial = quantidade a vender (excesso ou parado, o maior) ao preço do público do item
     pv, pa = r.get("preco_varejo"), r.get("preco_atacado")
     if r["publico"] == "atacado":
         ref = pa
@@ -219,5 +232,5 @@ def avaliar(item, regua=None, grupo=None):
         ref = pv
     else:
         ref = (pv + pa) / 2 if pv and pa else (pv or pa)
-    r["caixa_potencial"] = round(r["excesso_qtd"] * ref, 2) if ref else 0.0
+    r["caixa_potencial"] = round(r["vender_qtd"] * ref, 2) if ref else 0.0
     return r

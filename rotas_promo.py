@@ -18,14 +18,17 @@ from fastapi import APIRouter, HTTPException
 from fastapi.responses import StreamingResponse
 from sqlalchemy import text
 
+from config import FORN_EXPR
 from estoque_rt import _get_stock_batches
+from fornecedor_info import _expandir_fornecedores
 from infra_db import get_db_connection
 from modelos import PromoAcaoRequest, PromoPlanRequest
 from promo_regra import ACOES, REGUA_PADRAO, VALIDADE_DIAS, avaliar
+from rotas_analise import _filtro_busca
 
 router = APIRouter()
 
-ORDENACOES = {"valor_parado", "valor_excesso", "cobertura_meses", "dias_sem_venda", "caixa_potencial", "pro_descricao"}
+ORDENACOES = {"valor_parado", "valor_excesso", "cobertura_meses", "dias_sem_venda", "caixa_potencial", "pro_descricao", "valor_vender"}
 
 
 _SNAPSHOT = "data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)"
@@ -62,16 +65,18 @@ def _regua(conn):
 
 
 def _linhas(conn, req: PromoPlanRequest):
-    """Todas as linhas candidatas (excesso > 0 ou sem custo) já avaliadas pela regra.
+    """Todas as linhas candidatas (excesso > 0, sem custo ou na base do parado há 240 d —
+    fin_plano_parado_base, quando existe) já avaliadas pela regra.
     Na visão agrupada o excesso que conta é o do grupo: entra a marca com saldo de um grupo
     acima do máximo, mesmo dentro do próprio máximo, e sai a que está acima do próprio máximo
     num grupo que, somado, não tem excesso."""
     excesso_item = "f.estoque_disponivel > CEIL(COALESCE(f.estoque_max_sugerido,0))"
     excesso = (f"(CASE WHEN {_EM_GRUPO} THEN COALESCE(f.grupo_estoque_disponivel,0) > CEIL(f.grupo_estoque_max) "
                f"ELSE {excesso_item} END)") if req.grouped_view else excesso_item
+    tem_base = _tabela_existe(conn, "fin_plano_parado_base")
     filters = [f"f.{_SNAPSHOT}",
                "f.estoque_disponivel > 0",
-               f"({excesso} OR COALESCE(f.custo_unitario,0) <= 0)"]
+               f"({excesso} OR COALESCE(f.custo_unitario,0) <= 0{' OR b.pro_codigo IS NOT NULL' if tem_base else ''})"]
     params = {}
     for campo, coluna, valores in (("sg", "sgr_descricao", req.subgroups), ("br", "mar_descricao", req.brands),
                                    ("cat", "categoria_saldo_atual", req.categories)):
@@ -80,6 +85,17 @@ def _linhas(conn, req: PromoPlanRequest):
             keys = [f"{campo}_{i}" for i in range(len(vals))]
             params.update(zip(keys, vals))
             filters.append(f"f.{coluna} IN ({','.join(':' + k for k in keys)})")
+    cl, pr = _filtro_busca(req.search, req.match_type, req.pro_codigos, "f.")
+    filters.extend(cl)
+    params.update(pr)
+    # Fornecedor com os relacionados (matriz/filiais), mesma expressão do /analise
+    nomes_f = [n for n in (req.fornecedores or []) if n and n.strip()]
+    nomes_f = _expandir_fornecedores(nomes_f) if nomes_f else []
+    if nomes_f:
+        fkeys = {f"forn_{i}": n for i, n in enumerate(nomes_f)}
+        params.update(fkeys)
+        forn = FORN_EXPR.replace("fornecedor", "f.fornecedor")
+        filters.append(f"UPPER(TRIM({forn})) IN ({', '.join(':' + k for k in fkeys)})")
 
     cols = {r[0] for r in conn.execute(text(
         "SELECT column_name FROM information_schema.columns WHERE table_name='com_fifo_completo'"))}
@@ -94,12 +110,14 @@ def _linhas(conn, req: PromoPlanRequest):
                f.data_max_venda, (CURRENT_DATE - f.data_max_venda::date) AS dias_sem_venda, {canal},
                {"(e.pro_codigo IS NOT NULL)" if tem_exc else "FALSE"} AS fora_regua,
                {"a.acao, a.preco_varejo AS preco_varejo_manual, a.preco_atacado AS preco_atacado_manual, a.observacao AS observacao_manual"
-                if tem_acao else "NULL AS acao, NULL AS preco_varejo_manual, NULL AS preco_atacado_manual, NULL AS observacao_manual"}
+                if tem_acao else "NULL AS acao, NULL AS preco_varejo_manual, NULL AS preco_atacado_manual, NULL AS observacao_manual"},
+               {"b.quantidade AS base_qtd, b.custo_unitario AS base_custo" if tem_base else "NULL AS base_qtd, NULL AS base_custo"}
                {_COLS_GRUPO_SQL if req.grouped_view else ""}
         FROM com_fifo_completo f
         {_JOIN_GRUPO_SQL if req.grouped_view else ""}
         {"LEFT JOIN ven_regua_item_excecao e ON e.pro_codigo::text = f.pro_codigo" if tem_exc else ""}
         {"LEFT JOIN com_promo_acao a ON a.pro_codigo = f.pro_codigo" if tem_acao else ""}
+        {"LEFT JOIN fin_plano_parado_base b ON b.pro_codigo::text = f.pro_codigo" if tem_base else ""}
         WHERE {' AND '.join(filters)}
     """
     regua = _regua(conn)
@@ -120,6 +138,8 @@ def _linhas(conn, req: PromoPlanRequest):
                 d.update(dict.fromkeys(_CAMPOS_GRUPO))
         out.append(avaliar(d, regua, grupo))
 
+    if req.so_parado:
+        out = [x for x in out if x["na_base"]]
     if req.acoes:
         out = [x for x in out if x["acao"] in req.acoes]
     if req.publicos:
@@ -153,8 +173,9 @@ def _agrupar(linhas):
     for g in grupos.values():
         m = g["membros"]
         m.sort(key=lambda x: -x["valor_parado"])
-        for campo in ("valor_parado", "valor_excesso", "caixa_potencial"):
+        for campo in ("valor_parado", "valor_excesso", "caixa_potencial", "valor_vender", "valor_parado_240", "vender_qtd"):
             g[campo] = round(sum(x[campo] for x in m), 2)
+        g["na_base"] = any(x["na_base"] for x in m)
         g["acoes"] = sorted({x["acao"] for x in m}, key=ACOES.index)
         g["acao"] = max(g["acoes"], key=[x["acao"] for x in m].count)
     return out
@@ -175,8 +196,11 @@ def _totais(linhas):
         "valor_parado": round(valor, 2),
         "valor_excesso": round(sum(x["valor_excesso"] for x in linhas), 2),
         "caixa_potencial": round(sum(x["caixa_potencial"] for x in linhas), 2),
+        "valor_vender": round(sum(x["valor_vender"] for x in linhas), 2),
+        "parado_240": {"itens": sum(1 for x in linhas if x["na_base"]),
+                       "valor": round(sum(x["valor_parado_240"] for x in linhas), 2)},
         "meses_para_zerar": round(valor / custo_dem_mes, 1) if custo_dem_mes > 0 else None,
-        "bonus_liquidacao": round(sum(x["excesso_qtd"] * (x.get("bonus_liquidacao_unit") or 0)
+        "bonus_liquidacao": round(sum(x["vender_qtd"] * (x.get("bonus_liquidacao_unit") or 0)
                                       for x in linhas if x["acao"] == "giro_caixa" and x["publico"] != "varejo"), 2),
         "por_acao": {k: {kk: (round(vv, 2) if isinstance(vv, float) else vv) for kk, vv in v.items()} for k, v in por_acao.items()},
     }
@@ -221,6 +245,7 @@ COLS_EXPORT = {
     "grupo_excesso_qtd": "Excesso do grupo (un)", "grupo_cobertura_meses": "Cobertura do grupo (meses)",
     "categoria_saldo_atual": "Tempo em estoque",
     "estoque_disponivel": "Saldo", "estoque_max_sugerido": "Máximo sugerido", "excesso_qtd": "Excesso (un)",
+    "parado_qtd": "Parado +240 d (qtd)", "vender_qtd": "A vender (qtd)",
     "custo_unitario": "Custo (R$)", "valor_parado": "Valor parado (R$)", "valor_excesso": "Valor em excesso (R$)",
     "cobertura_meses": "Cobertura (meses)", "idade_saldo_dias": "Idade média do saldo (dias)", "data_max_venda": "Última venda", "dias_sem_venda": "Dias sem venda",
     "publico": "Público", "acao": "Ação", "acao_sugerida": "Ação sugerida", "acao_manual": "Ação manual?",
