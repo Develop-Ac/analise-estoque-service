@@ -155,6 +155,10 @@ sozinho, então a escada do varejo começa em 15% e termina em 50%.
   aba **Carga ERP** só dos itens com preço: `PRO_CODIGO`, `PROM_VALOR` (tabela 1 ou vazio),
   `PROM_VALOR2` (tabela 2 ou vazio), `DATA_INICIAL` (hoje), `DATA_FINAL` (hoje + 30).
 - `PUT|DELETE /promo/acao/{pro_codigo}`.
+- Lote semanal e itens pequenos (17/11/2026), ver seção 10: `GET /promo/lote[?semana=]`,
+  `POST /promo/lote/recusar`, `POST /promo/lote/desfazer-recusa`,
+  `GET /promo/lote/acompanhamento?semanas=12`, `GET /promo/pequenos?por=familia|marca` e o
+  filtro `pequeno_valor` em `POST /promo/plan`.
 Teste mínimo: `tests/test_promo_regra.py` com 5 itens sintéticos cobrindo cada ação e os pisos
 (`assert` puro, sem banco): ação por precedência, preço varejo ≥ atacado, atacado nulo quando
 piso ≥ tabela, vender sem repor sem desconto.
@@ -304,3 +308,88 @@ Regra em `promo_regra.avaliar(item, regua, grupo)`; teste em `tests/test_promo_r
   Na visão agrupada o grupo sai só com as marcas que casaram com o filtro.
 - **Excel**: colunas "Parado +240 d (qtd)" e "A vender (qtd)" depois de "Excesso (un)".
 - **Sem a tabela** (ou vazia): lista, totais e Excel iguais aos de antes; `parado_240` zerado.
+
+## 10. Lote semanal, itens pequenos e acompanhamento (17/11/2026)
+
+Em vez de olhar a lista inteira, o comprador recebe toda semana um lote curto de sugestões
+para virar grupo de ofertas, e um ranking dos itens de pequeno valor por família ou marca.
+
+- **Quem concorre ao lote**: produto (não o cabeçalho do grupo), avaliado na visão
+  agrupada (`grouped_view=True`), com ação `promocao` ou `giro_caixa` (liquidação), preço de
+  atacado calculado, `vender_qtd > 0`, público que não é só balcão (`publico <> 'varejo'`),
+  `valor_vender` de R$ 300 ou mais, que não está em oferta aberta (item de
+  `ven_oferta_item` com `status <> 'ENCERRADO'`) e não foi recusado nas últimas 4 semanas.
+- **Ordem**: do maior custo a vender (`valor_vender`) para o menor; empate pelo código.
+- **Teto por família**: no máximo `tamanho // divisor` itens do mesmo subgrupo
+  (`sgr_descricao`), 50 // 3 = 16. Passando do teto, o item é pulado e entra o próximo.
+- **Recusa**: fica fora quem tem recusa num lote com `semana >= semana nova − 4 semanas`.
+  Conta pela semana do lote, não pelo relógio: recusado na semana S, fica fora de S+7 a S+28
+  e volta a concorrer em S+35. Item sugerido e não decidido volta a concorrer na semana
+  seguinte.
+- **Quando o lote nasce**: na primeira chamada de `GET /promo/lote` da semana (segunda a
+  domingo, Cuiabá), sobre a análise mais recente. É gravado em `com_promo_lote` e não muda
+  durante a semana; a recusa não recompõe o lote (o item fica na lista como "recusado").
+  Duas aberturas ao mesmo tempo são serializadas por `pg_advisory_xact_lock`.
+- **"Virou oferta"**: é lido, não gravado. O produto do lote que tem item de oferta com
+  `inicio` dentro da semana do lote (`inicio >= semana AND inicio < semana + 7`) passa a
+  "em_oferta", com o nome do grupo; prevalece sobre "recusado". Vários itens de oferta do
+  mesmo produto na semana: soma o vendido e fica o grupo do item mais recente.
+- **Vendido**: quantidade e valor das linhas de orçamento `FECHADO` com aquele item de
+  oferta (`oferta_item_id`), fora as vendidas fora da promoção (`fora_promocao`), a mesma
+  regra do vendas-service. Enquanto a fonte da promoção for o Celta, as ofertas da intranet
+  não chegam ao orçamento e o vendido fica em zero. Sem as tabelas de oferta, vendido 0.
+- **Itens pequenos**: os mesmos critérios do lote com `valor_vender` abaixo de R$ 300. Não
+  são gravados: o acompanhamento deles é o resultado do próprio grupo de ofertas.
+
+### Rotas
+
+- `GET /promo/lote[?semana=AAAA-MM-DD]` → `{ semana, corrente, itens: [...] }`, itens por
+  `posicao`, cada um com `pro_codigo`, `pro_descricao`, `posicao`, `acao`, `sgr_descricao`,
+  `mar_descricao`, `vender_qtd`, `valor_vender`, `preco_atacado`, `situacao`
+  (`sugerido` | `recusado` | `em_oferta`), `recusado_em`, `recusado_por`, `recusa_motivo`,
+  `oferta_id`, `oferta_nome`, `vendido_qtd`, `vendido_valor`. Sem `semana` = semana corrente
+  (monta e grava na primeira chamada); com `semana` = só leitura daquele lote. Data inválida
+  → 400; sem a tabela `com_promo_lote` → 503 citando o SQL.
+- `POST /promo/lote/recusar` body `{ itens: ["123"], motivo, usuario }` →
+  `{ ok: true, itens: n }`. Só na semana corrente.
+- `POST /promo/lote/desfazer-recusa` body `{ itens: ["123"] }` → `{ ok: true, itens: n }`.
+  Só na semana corrente.
+- `GET /promo/lote/acompanhamento?semanas=12` (1 a 52) → lista, semana mais recente
+  primeiro, com `semana`, `sugeridos`, `recusados`, `em_oferta`, `valor_vender`,
+  `vendido_qtd`, `vendido_valor`. Sem a tabela → lista vazia.
+- `GET /promo/pequenos?por=familia|marca` → `{ por, total: { itens, valor_vender },
+  linhas: [{ nome, itens, valor_vender }] }`, do maior custo a vender para o menor; nome
+  nulo sai `null`. Outro valor de `por` → 400.
+- `POST /promo/plan` com `pequeno_valor: true`: só os itens pequenos, na visão agrupada mas
+  em lista plana (sem cabeçalho de grupo), com os demais filtros e os totais sobre a lista
+  filtrada. Sem o campo, a rota não muda.
+
+### Parâmetros (variáveis de ambiente, em `promo_regra.py`)
+
+| Variável | Padrão | Uso |
+|---|---|---|
+| `PROMO_LOTE_TAMANHO` | 50 | itens no lote semanal |
+| `PROMO_LOTE_FAMILIA_DIVISOR` | 3 | teto por família = tamanho ÷ divisor (inteiro) |
+| `PROMO_PEQUENO_VALOR` | 300 | custo a vender mínimo do lote; abaixo disso é item pequeno |
+| `PROMO_RECUSA_SEMANAS` | 4 | semanas fora da sugestão depois da recusa |
+
+### Tabela e SQL
+
+`com_promo_lote` (Postgres da intranet): uma linha por produto e semana (`semana` = segunda
+em Cuiabá, `UNIQUE (semana, pro_codigo)`), com posição, ação, família, marca, quantidade e
+custo a vender, preço de atacado e a recusa (`recusado_em`, `recusado_por`,
+`recusa_motivo`). DDL manual em `sql/2026-11-17_promo_lote_semanal.sql`, a aplicar **antes
+do deploy**: sem ela o lote responde 503, e `/promo/pequenos` e `/promo/plan` com
+`pequeno_valor` falham.
+
+### Correção da carga do canal (balcão × atacado)
+
+`main.carregar_dados_do_banco` fechava a conexão antes de `_anexar_canal_12m`, então a
+leitura do canal sempre falhava e as colunas `QTD_VAREJO_12M`/`QTD_ATACADO_12M` ficavam
+nulas (todos tratados como "vende nos dois"). Agora a conexão fecha depois da leitura, e
+uma falha nela sai no log como `ERRO` (a análise segue sem o canal). As colunas só são
+preenchidas na análise seguinte: rodar a análise uma vez depois do deploy.
+
+Regra em `promo_regra` (`montar_lote`, `pequenos`, `corte_recusa`, `segunda`); rotas em
+`rotas_promo.py`; testes em `tests/test_promo_regra.py`, `tests/test_promo_lote.py` e
+`tests/test_canal_12m.py`.

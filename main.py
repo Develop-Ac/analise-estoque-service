@@ -1052,10 +1052,11 @@ def carregar_dados_do_banco(corte=None):
     else:
         print("DEBUG: SGR_DESCRICAO não encontrada no DataFrame!")
 
-    conn.close()
     # Canal por item (12 m): define o PÚBLICO da lista de promoção. Anexado ao saldo
     # para seguir o mesmo merge que já leva preços e fornecedores até o com_fifo_completo.
+    # Usa a mesma conexão, por isso vem antes do close.
     df_saldo_produto = _anexar_canal_12m(df_saldo_produto, conn)
+    conn.close()
 
     return df_saidas, df_ent, df_dev, df_saldo_produto, df_vp
 
@@ -1063,7 +1064,8 @@ def carregar_dados_do_banco(corte=None):
 def _anexar_canal_12m(df_saldo_produto, conn):
     """Unidades vendidas nos últimos 12 meses por canal (balcão × atacado), lidas da
     vw_analise_vendas do BI — mesmo SQL Server do linked server, sem OPENQUERY.
-    Falha aqui não derruba o job: colunas ficam nulas e a lista trata como 'ambos'."""
+    Recebe a conexão ainda aberta. Falha aqui não derruba o job: loga ERRO, as colunas
+    ficam nulas e a lista trata como 'ambos'."""
     # Data em yyyymmdd: o locale português do SRVSQLWIN inverte 'yyyy-mm-dd' (vira yyyy-dd-mm).
     ini = (pd.Timestamp.today().normalize() - pd.DateOffset(months=12)).strftime("%Y%m%d")
     bi = os.getenv("BI_DATABASE", "BI")
@@ -1079,7 +1081,7 @@ def _anexar_canal_12m(df_saldo_produto, conn):
         df = pd.read_sql(sql, conn)
         print(f"  - Canal 12m (BI): {len(df)} produtos com venda")
     except Exception as e:
-        print(f"  - AVISO: canal 12m do BI indisponível ({e}). Público da promoção ficará 'ambos'.")
+        print(f"  - ERRO: canal 12m do BI indisponível ({e}). Público da promoção ficará 'ambos'.")
         df = pd.DataFrame(columns=["PRO_CODIGO", "QTD_ATACADO_12M", "QTD_VAREJO_12M"])
     df["PRO_CODIGO"] = df["PRO_CODIGO"].astype(str).str.strip()
     df_saldo_produto["PRO_CODIGO"] = df_saldo_produto["PRO_CODIGO"].astype(str).str.strip()

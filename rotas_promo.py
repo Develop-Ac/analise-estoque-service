@@ -1,5 +1,13 @@
 # -*- coding: utf-8 -*-
-"""Lista de promoção por valor parado: /promo/plan, /promo/export, /promo/acao/{pro_codigo}.
+"""Lista de promoção por valor parado: /promo/plan, /promo/export, /promo/acao/{pro_codigo},
+e o lote semanal de sugestões de oferta do atacado: /promo/lote, /promo/lote/recusar,
+/promo/lote/desfazer-recusa e /promo/lote/acompanhamento; e os itens pequenos (abaixo do mínimo do
+lote): /promo/pequenos (ranking por família ou marca) e /promo/plan com `pequeno_valor`.
+
+Lote semanal (com_promo_lote): montado e gravado na primeira abertura da semana (segunda-feira,
+fuso de Cuiabá) a partir da visão agrupada, sem os produtos já numa oferta não encerrada nem os
+recusados nas últimas semanas (promo_regra.montar_lote / corte_recusa). Depois de gravado não é
+recomposto: a recusa só marca o item.
 
 A regra (ação, público, preço) mora em promo_regra.py; aqui só se lê o com_fifo_completo,
 aplica filtros/paginação/totais e grava a troca manual e as campanhas exportadas.
@@ -12,6 +20,7 @@ ver promo_regra.avaliar). Produto sem grupo é avaliado sozinho nas duas.
 import io
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from typing import Optional
 
 import pandas as pd
 from fastapi import APIRouter, HTTPException
@@ -22,8 +31,9 @@ from config import FORN_EXPR
 from estoque_rt import _get_stock_batches
 from fornecedor_info import _expandir_fornecedores
 from infra_db import get_db_connection
-from modelos import PromoAcaoRequest, PromoPlanRequest
-from promo_regra import ACOES, REGUA_PADRAO, VALIDADE_DIAS, avaliar
+from analise_nota import hoje_cuiaba
+from modelos import PromoAcaoRequest, PromoLoteRecusaRequest, PromoPlanRequest
+from promo_regra import ACOES, REGUA_PADRAO, VALIDADE_DIAS, avaliar, corte_recusa, montar_lote, pequenos, segunda
 from rotas_analise import _filtro_busca
 
 router = APIRouter()
@@ -210,8 +220,13 @@ def _totais(linhas):
 def planejar_promocao(req: PromoPlanRequest):
     conn = get_db_connection()
     try:
-        itens = _linhas(conn, req)
-        linhas = _agrupar(itens) if req.grouped_view else itens
+        if req.pequeno_valor:   # lista plana dos pequenos, avaliados na visão agrupada
+            req.grouped_view = True
+            itens = pequenos(_linhas(conn, req), _fora_da_sugestao(conn, segunda(hoje_cuiaba())))
+            linhas = itens
+        else:
+            itens = _linhas(conn, req)
+            linhas = _agrupar(itens) if req.grouped_view else itens
         chave = req.sort if req.sort in ORDENACOES else "valor_parado"
         reverso = (req.sort_dir or "desc").lower() != "asc"
         linhas.sort(key=lambda x: ((x.get(chave) is None), x.get(chave) if x.get(chave) is not None else 0), reverse=reverso)
@@ -361,3 +376,192 @@ def limpar_acao(pro_codigo: str):
         return {"ok": True, "pro_codigo": pro_codigo}
     finally:
         conn.close()
+
+
+_SEM_LOTE = "Tabela com_promo_lote não existe (aplicar sql/2026-11-17_promo_lote_semanal.sql)"
+_COLS_LOTE = ("pro_codigo", "pro_descricao", "posicao", "acao", "sgr_descricao", "mar_descricao",
+              "vender_qtd", "valor_vender", "preco_atacado")
+
+
+def _fora_da_sugestao(conn, semana):
+    """Produtos que não entram no lote: já numa oferta não encerrada (ven_oferta_item, do
+    vendas-service, quando existe) ou recusados num lote desde corte_recusa(semana)."""
+    fora = set()
+    if _tabela_existe(conn, "ven_oferta_item"):
+        fora |= {r[0] for r in conn.execute(text(
+            "SELECT DISTINCT pro_codigo::text FROM ven_oferta_item WHERE status <> 'ENCERRADO'"))}
+    fora |= {r[0] for r in conn.execute(text(
+        "SELECT DISTINCT pro_codigo FROM com_promo_lote WHERE recusado_em IS NOT NULL AND semana >= :corte"),
+        {"corte": corte_recusa(semana)})}
+    return fora
+
+
+@router.get("/promo/pequenos")
+def ranking_pequenos(por: str = "familia"):
+    """Itens pequenos (mesma seleção do /promo/plan com pequeno_valor) somados por família
+    (sgr_descricao) ou marca (mar_descricao), do maior custo a vender para o menor."""
+    if por not in ("familia", "marca"):
+        raise HTTPException(status_code=400, detail="por deve ser familia ou marca")
+    campo = "sgr_descricao" if por == "familia" else "mar_descricao"
+    conn = get_db_connection()
+    try:
+        itens = pequenos(_linhas(conn, PromoPlanRequest(grouped_view=True)),
+                         _fora_da_sugestao(conn, segunda(hoje_cuiaba())))
+    finally:
+        conn.close()
+    grupos = {}
+    for x in itens:
+        g = grupos.setdefault(x.get(campo), {"nome": x.get(campo), "itens": 0, "valor_vender": 0.0})
+        g["itens"] += 1
+        g["valor_vender"] += x["valor_vender"]
+    linhas = sorted(({**g, "valor_vender": round(g["valor_vender"], 2)} for g in grupos.values()),
+                    key=lambda g: -g["valor_vender"])
+    return {"por": por, "total": {"itens": len(itens), "valor_vender": round(sum(x["valor_vender"] for x in itens), 2)},
+            "linhas": linhas}
+
+
+def _garantir_lote(conn, semana):
+    """Monta e grava o lote da semana se ainda não existe. A trava consultiva serializa duas
+    primeiras aberturas simultâneas; o ON CONFLICT garante um item por produto na semana."""
+    conn.execute(text("SELECT pg_advisory_xact_lock(hashtext('com_promo_lote'))"))
+    if conn.execute(text("SELECT 1 FROM com_promo_lote WHERE semana = :s LIMIT 1"), {"s": semana}).scalar():
+        conn.commit()   # solta a trava (é de transação)
+        return
+    lote = montar_lote(_linhas(conn, PromoPlanRequest(grouped_view=True)), _fora_da_sugestao(conn, semana))
+    sql = text("""
+        INSERT INTO com_promo_lote (semana, posicao, pro_codigo, pro_descricao, acao, sgr_descricao, mar_descricao,
+                                    vender_qtd, valor_vender, preco_atacado)
+        VALUES (:semana, :posicao, :pro_codigo, :pro_descricao, :acao, :sgr_descricao, :mar_descricao,
+                :vender_qtd, :valor_vender, :preco_atacado)
+        ON CONFLICT (semana, pro_codigo) DO NOTHING""")
+    for r in lote:
+        conn.execute(sql, {"semana": semana, **{c: r.get(c) for c in _COLS_LOTE}})
+    conn.commit()
+
+
+def _ofertas_do_lote(conn, semana_ini, semana_fim):
+    """Itens do lote que viraram oferta: (semana, pro_codigo) -> grupo e vendido.
+
+    ven_oferta_item não guarda data de criação; o vendas-service grava inicio = dia da inclusão,
+    então o vínculo é o item de oferta do produto com inicio dentro da semana do lote (assim o
+    mesmo item não conta em várias semanas). Vendido = linhas de orçamento FECHADO que levaram o
+    preço da oferta (fora_promocao = false), a mesma regra das unidades vendidas do vendas-service.
+    Vários itens do mesmo produto na semana: soma o vendido e fica o grupo do item de maior id.
+    Sem as tabelas das ofertas devolve {}."""
+    if not (_tabela_existe(conn, "ven_oferta_item") and _tabela_existe(conn, "ven_oferta")):
+        return {}
+    tem_venda = conn.execute(text(
+        "SELECT 1 FROM information_schema.columns "
+        "WHERE table_name = 'ven_orcamento_item' AND column_name = 'oferta_item_id'")).scalar()
+    venda = """LEFT JOIN (SELECT oi.oferta_item_id, SUM(oi.quantidade) AS qtd, SUM(oi.total) AS valor
+                   FROM ven_orcamento_item oi JOIN ven_orcamento oc ON oc.id = oi.orcamento_id
+                   WHERE oi.oferta_item_id IS NOT NULL AND oi.fora_promocao = FALSE AND oc.status = 'FECHADO'
+                   GROUP BY oi.oferta_item_id) v ON v.oferta_item_id = i.id""" if tem_venda else ""
+    vend = "COALESCE(v.qtd, 0), COALESCE(v.valor, 0)" if tem_venda else "0, 0"
+    rows = conn.execute(text(f"""
+        SELECT l.semana, l.pro_codigo, i.id, o.id, o.nome, {vend}
+        FROM com_promo_lote l
+        JOIN ven_oferta_item i ON i.pro_codigo::text = l.pro_codigo
+                              AND i.inicio >= l.semana AND i.inicio < l.semana + 7
+        JOIN ven_oferta o ON o.id = i.oferta_id
+        {venda}
+        WHERE l.semana BETWEEN :ini AND :fim
+        ORDER BY i.id"""), {"ini": semana_ini, "fim": semana_fim})
+    saida = {}
+    for semana, pro, _item, oferta_id, oferta_nome, qtd, valor in rows:
+        k = (str(semana), pro)
+        ant = saida.get(k, {"vendido_qtd": 0.0, "vendido_valor": 0.0})
+        saida[k] = {"oferta_id": oferta_id, "oferta_nome": oferta_nome,
+                    "vendido_qtd": ant["vendido_qtd"] + float(qtd or 0),
+                    "vendido_valor": ant["vendido_valor"] + float(valor or 0)}
+    return saida
+
+
+@router.get("/promo/lote")
+def lote_semanal(semana: Optional[str] = None):
+    corrente = segunda(hoje_cuiaba())
+    try:
+        alvo = segunda(date.fromisoformat(semana)) if semana else corrente
+    except ValueError:
+        raise HTTPException(status_code=400, detail="semana deve ser uma data AAAA-MM-DD")
+    conn = get_db_connection()
+    try:
+        if not _tabela_existe(conn, "com_promo_lote"):
+            raise HTTPException(status_code=503, detail=_SEM_LOTE)
+        if alvo == corrente:
+            _garantir_lote(conn, alvo)
+        ofertas = _ofertas_do_lote(conn, alvo, alvo)
+        rows = conn.execute(text(f"""
+            SELECT {', '.join(_COLS_LOTE)}, recusado_em, recusado_por, recusa_motivo
+            FROM com_promo_lote WHERE semana = :s ORDER BY posicao"""), {"s": alvo}).mappings()
+        itens = []
+        for r in rows:
+            d = {k: (float(v) if isinstance(v, Decimal) else str(v) if isinstance(v, (date, datetime)) else v)
+                 for k, v in dict(r).items()}
+            of = ofertas.get((str(alvo), d["pro_codigo"]))
+            d.update(situacao="em_oferta" if of else "recusado" if d["recusado_em"] else "sugerido",
+                     **(of or {"oferta_id": None, "oferta_nome": None, "vendido_qtd": 0, "vendido_valor": 0}))
+            itens.append(d)
+        return {"semana": str(alvo), "corrente": alvo == corrente, "itens": itens}
+    finally:
+        conn.close()
+
+
+@router.get("/promo/lote/acompanhamento")
+def acompanhamento_lote(semanas: int = 12):
+    """Por semana (das últimas `semanas` com lote, mais recente primeiro): itens sugeridos,
+    recusados (sem os que viraram oferta, como a situação do GET /promo/lote), em oferta,
+    custo a vender sugerido e o vendido pelas ofertas."""
+    semanas = max(1, min(52, semanas))
+    conn = get_db_connection()
+    try:
+        if not _tabela_existe(conn, "com_promo_lote"):
+            return []
+        rows = list(conn.execute(text("""
+            SELECT semana, pro_codigo, recusado_em, valor_vender FROM com_promo_lote
+            WHERE semana IN (SELECT DISTINCT semana FROM com_promo_lote ORDER BY semana DESC LIMIT :n)"""),
+            {"n": semanas}))
+        if not rows:
+            return []
+        ofertas = _ofertas_do_lote(conn, min(r[0] for r in rows), max(r[0] for r in rows))
+        por = {}
+        for semana, pro, recusado_em, valor in rows:
+            a = por.setdefault(str(semana), {"semana": str(semana), "sugeridos": 0, "recusados": 0, "em_oferta": 0,
+                                             "valor_vender": 0.0, "vendido_qtd": 0.0, "vendido_valor": 0.0})
+            a["sugeridos"] += 1
+            a["valor_vender"] += float(valor or 0)
+            of = ofertas.get((str(semana), pro))
+            if of:
+                a["em_oferta"] += 1
+                a["vendido_qtd"] += of["vendido_qtd"]
+                a["vendido_valor"] += of["vendido_valor"]
+            elif recusado_em:
+                a["recusados"] += 1
+        return sorted(por.values(), key=lambda a: a["semana"], reverse=True)
+    finally:
+        conn.close()
+
+
+def _marcar_recusa(req, motivo, usuario, recusado_em):
+    conn = get_db_connection()
+    try:
+        if not _tabela_existe(conn, "com_promo_lote"):
+            raise HTTPException(status_code=503, detail=_SEM_LOTE)
+        res = conn.execute(text(f"""
+            UPDATE com_promo_lote SET recusado_em = {recusado_em}, recusado_por = :usr, recusa_motivo = :motivo
+            WHERE semana = :s AND pro_codigo = ANY(:itens)"""),
+            {"usr": usuario, "motivo": motivo, "s": segunda(hoje_cuiaba()), "itens": list(req.itens)})
+        conn.commit()
+        return {"ok": True, "itens": res.rowcount}
+    finally:
+        conn.close()
+
+
+@router.post("/promo/lote/recusar")
+def recusar_lote(req: PromoLoteRecusaRequest):
+    return _marcar_recusa(req, req.motivo, req.usuario, "NOW()")
+
+
+@router.post("/promo/lote/desfazer-recusa")
+def desfazer_recusa_lote(req: PromoLoteRecusaRequest):
+    return _marcar_recusa(req, None, None, "NULL")

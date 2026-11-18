@@ -139,3 +139,52 @@ def test_na_base_nao_muda_acao():
     assert dentro["acao_sugerida"] in ("promocao", "vender_sem_repor")
     assert dentro["acao_sugerida"] == fora["acao_sugerida"]
     assert dentro["vender_qtd"] == 8 and fora["vender_qtd"] == 0
+
+
+# ---- lote semanal de ofertas do atacado ----
+from datetime import date, timedelta  # noqa: E402
+
+
+def _linha(codigo, valor, familia="CHAVES", **kw):
+    """Linha já avaliada (saída de avaliar) pronta para o lote."""
+    r = dict(_item(), pro_codigo=codigo, sgr_descricao=familia, acao="promocao", preco_atacado=150.0,
+             vender_qtd=1.0, valor_vender=valor, publico="atacado")
+    r.update(kw)
+    return r
+
+
+def test_lote_publico_varejo_fora():
+    linhas = [_linha("A", 1000, publico="varejo"), _linha("B", 1000, publico="ambos"), _linha("C", 100, publico="varejo")]
+    assert [r["pro_codigo"] for r in pr.montar_lote(linhas)] == ["B"]
+    assert pr.pequenos(linhas) == []
+
+
+def test_lote_teto_por_familia_e_ordem():
+    pb = [_linha("PB%02d" % i, 10000 - i, familia="PARA-BRISA") for i in range(60)]
+    outras = [_linha("O%02d" % i, 5000 - i, familia="FAM%d" % (i % 5)) for i in range(60)]
+    lote = pr.montar_lote(pb + outras)
+    assert len(lote) == 50
+    assert sum(r["sgr_descricao"] == "PARA-BRISA" for r in lote) == 16 == 50 // 3
+    assert [r["valor_vender"] for r in lote] == sorted((r["valor_vender"] for r in lote), reverse=True)
+    assert [r["posicao"] for r in lote] == list(range(1, 51))
+    assert "posicao" not in pb[0]  # devolve cópias
+
+
+def test_lote_corte_dos_pequenos():
+    linhas = [_linha("P", 299), _linha("L", 300)]
+    assert [r["pro_codigo"] for r in pr.pequenos(linhas)] == ["P"]
+    assert [r["pro_codigo"] for r in pr.montar_lote(linhas)] == ["L"]
+
+
+def test_lote_codigo_fora_nao_entra():
+    linhas = [_linha("P", 100), _linha("L", 1000)]
+    assert pr.pequenos(linhas, fora={"P", "L"}) == []
+    assert pr.montar_lote(linhas, fora={"P", "L"}) == []
+
+
+def test_corte_recusa_e_segunda():
+    s = date(2026, 11, 16)  # segunda
+    assert pr.corte_recusa(s + timedelta(days=28)) == s
+    assert pr.corte_recusa(s + timedelta(days=35)) == s + timedelta(days=7)
+    assert pr.segunda(date(2026, 11, 18)) == s  # quarta
+    assert pr.segunda(date(2026, 11, 22)) == s  # domingo

@@ -164,11 +164,21 @@ class PromoPlanRequest(BaseModel):
     sort: Optional[str] = "valor_parado"
     sort_dir: Optional[str] = "desc"
     usuario: Optional[str] = None          # quem exportou (registro da campanha)
+    # Só os itens pequenos: abaixo do valor mínimo do lote semanal (promo_regra.pequenos), com as
+    # mesmas exclusões do lote. Força a visão agrupada e devolve lista plana, sem cabeçalho de grupo.
+    pequeno_valor: bool = False
 
 class PromoAcaoRequest(BaseModel):
     acao: str
     preco_varejo: Optional[float] = None
     preco_atacado: Optional[float] = None
     observacao: Optional[str] = None
+    usuario: Optional[str] = None
+
+
+class PromoLoteRecusaRequest(BaseModel):
+    # Produtos do lote da semana corrente recusados (ou com a recusa desfeita) pelo gerente.
+    itens: List[str]
+    motivo: Optional[str] = None
     usuario: Optional[str] = None
 

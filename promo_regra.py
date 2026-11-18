@@ -25,6 +25,7 @@ régua v3 do atacado (ven_regua_atacado). Regras (spec docs/promocao-valor-parad
 Nenhum rótulo aqui cita plano futuro: o operacional vê só ações operacionais.
 """
 import os
+from datetime import timedelta
 
 CORTES = [10.01, 38.50, 69.61, 124.37, 249.86, 299.87, 395.27, 496.36, 696.37, 996.38]
 FAIXAS = ["1A", "1B", "1C", "1D", "2A", "2B", "2C", "3A", "3B", "3C", "3D"]
@@ -45,6 +46,11 @@ ESCADA_VAREJO = {"promocao_6": .15, "promocao_12": .20, "promocao_24": .30, "cob
 ESCADA_ATACADO_LIQ = {"cobertura_alta": .15, "sem_venda_12m": .25}
 SGR_PARABRISA = 154
 IDADE_LIQUIDACAO_DIAS = int(os.getenv("PROMO_IDADE_LIQUIDACAO_DIAS", "240"))  # = faixa "Obsoleto" da análise
+# Lote semanal de ofertas do atacado
+LOTE_TAMANHO = int(os.getenv("PROMO_LOTE_TAMANHO", "50"))
+LOTE_FAMILIA_DIVISOR = int(os.getenv("PROMO_LOTE_FAMILIA_DIVISOR", "3"))  # teto por família = tamanho // divisor
+PEQUENO_VALOR = float(os.getenv("PROMO_PEQUENO_VALOR", "300"))           # custo a vender abaixo disso = item pequeno
+RECUSA_SEMANAS = int(os.getenv("PROMO_RECUSA_SEMANAS", "4"))             # recusado fica fora do lote por N semanas
 
 ACOES = ("revisar_cadastro", "giro_caixa", "vender_sem_repor", "promocao")
 PUBLICOS = ("atacado", "varejo", "ambos")
@@ -234,3 +240,47 @@ def avaliar(item, regua=None, grupo=None):
         ref = (pv + pa) / 2 if pv and pa else (pv or pa)
     r["caixa_potencial"] = round(r["vender_qtd"] * ref, 2) if ref else 0.0
     return r
+
+
+def segunda(d):
+    """Segunda-feira da semana de `d` — chave da semana do lote."""
+    return d - timedelta(days=d.weekday())
+
+
+def corte_recusa(semana):
+    """Recusas de semanas >= este corte ainda tiram o produto do lote."""
+    return semana - timedelta(weeks=RECUSA_SEMANAS)
+
+
+def elegiveis_oferta(linhas, fora=()):
+    """Linhas avaliadas que podem virar oferta do atacado: promoção ou liquidação com preço
+    de atacado, algo a vender, público que não é só varejo e produto fora de `fora`."""
+    return [r for r in linhas
+            if r.get("acao") in ("promocao", "giro_caixa")
+            and r.get("preco_atacado") is not None
+            and (_num(r.get("vender_qtd")) or 0) > 0
+            and (_num(r.get("valor_vender")) or 0) > 0
+            and r.get("publico") != "varejo"
+            and r.get("pro_codigo") not in fora]
+
+
+def montar_lote(linhas, fora=(), tamanho=LOTE_TAMANHO, divisor=LOTE_FAMILIA_DIVISOR, minimo=PEQUENO_VALOR):
+    """Lote da semana: os maiores custos a vender (>= minimo), até `tamanho` produtos, com no
+    máximo tamanho // divisor por família (sgr_descricao). Devolve cópias com `posicao` 1..n."""
+    teto = tamanho // divisor
+    por_familia, lote = {}, []
+    cand = [r for r in elegiveis_oferta(linhas, fora) if r["valor_vender"] >= minimo]
+    for r in sorted(cand, key=lambda r: (-r["valor_vender"], str(r.get("pro_codigo")))):
+        if len(lote) >= tamanho:
+            break
+        fam = r.get("sgr_descricao")
+        if por_familia.get(fam, 0) >= teto:
+            continue
+        por_familia[fam] = por_familia.get(fam, 0) + 1
+        lote.append(dict(r, posicao=len(lote) + 1))
+    return lote
+
+
+def pequenos(linhas, fora=(), minimo=PEQUENO_VALOR):
+    """Elegíveis com custo a vender abaixo de `minimo` — ficam fora do lote."""
+    return [r for r in elegiveis_oferta(linhas, fora) if r["valor_vender"] < minimo]
