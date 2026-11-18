@@ -180,5 +180,5 @@ class PromoLoteRecusaRequest(BaseModel):
     # Produtos do lote da semana corrente recusados (ou com a recusa desfeita) pelo gerente.
     itens: List[str]
     motivo: Optional[str] = None
-    usuario: Optional[str] = None
+    semana: Optional[str] = None   # segunda-feira (AAAA-MM-DD) do lote exibido na tela
 

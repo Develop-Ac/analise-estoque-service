@@ -96,21 +96,25 @@ def test_semana_passada_nao_monta(conn):
 
 
 def test_recusar_e_desfazer(conn):
-    r = rp.recusar_lote(PromoLoteRecusaRequest(itens=["10", "20"], motivo="sem margem", usuario="ana"))
+    r = rp.recusar_lote(PromoLoteRecusaRequest(itens=["10", "20"], motivo="sem margem"), x_user_id=None)
     (s, p), = conn.sqls("UPDATE com_promo_lote")
     assert r == {"ok": True, "itens": 2}
     assert "recusado_em = NOW()" in s
-    assert p == {"usr": "ana", "motivo": "sem margem", "s": date(2026, 11, 16), "itens": ["10", "20"]}
+    assert p == {"usr": None, "motivo": "sem margem", "s": date(2026, 11, 16), "itens": ["10", "20"]}
 
     conn.chamadas.clear()
-    rp.desfazer_recusa_lote(PromoLoteRecusaRequest(itens=["10"], motivo="x", usuario="ana"))
+    with pytest.raises(HTTPException) as e:   # tela aberta no lote da semana passada
+        rp.recusar_lote(PromoLoteRecusaRequest(itens=["10"], semana="2026-11-09"), x_user_id=None)
+    assert e.value.status_code == 409 and not conn.sqls("UPDATE com_promo_lote")
+
+    rp.desfazer_recusa_lote(PromoLoteRecusaRequest(itens=["10"], motivo="x", semana="2026-11-16"))
     (s, p), = conn.sqls("UPDATE com_promo_lote")
     assert "recusado_em = NULL" in s
     assert p == {"usr": None, "motivo": None, "s": date(2026, 11, 16), "itens": ["10"]}
 
 
 def test_fora_da_sugestao_corte_e_oferta():
-    c = _ConnL(tabelas=())
+    c = _ConnL()
     rp._fora_da_sugestao(c, date(2026, 11, 16))
     assert not c.sqls("ven_oferta_item")
     (_, p), = c.sqls("recusado_em IS NOT NULL")
@@ -161,7 +165,7 @@ def test_item_com_vinculo_sai_em_oferta(monkeypatch):
     assert it["10"]["situacao"] == "sugerido" and it["10"]["oferta_id"] is None and it["10"]["vendido_qtd"] == 0
     (sql, p), = c.sqls("JOIN ven_oferta_item i")
     assert p == {"ini": s, "fim": s}
-    assert "i.inicio >= l.semana AND i.inicio < l.semana + 7" in sql
+    assert "i.inicio >= l.semana AND i.inicio <= l.semana + 7" in sql   # segunda seguinte: inicio em UTC
     assert "ven_orcamento_item" in sql and "oc.status = 'FECHADO'" in sql and "fora_promocao = FALSE" in sql
 
 
