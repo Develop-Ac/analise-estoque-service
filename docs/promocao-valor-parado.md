@@ -334,6 +334,10 @@ para virar grupo de ofertas, e um ranking dos itens de pequeno valor por famíli
   `inicio` dentro da semana do lote (`inicio >= semana AND inicio < semana + 7`) passa a
   "em_oferta", com o nome do grupo; prevalece sobre "recusado". Vários itens de oferta do
   mesmo produto na semana: soma o vendido e fica o grupo do item mais recente.
+  Só conta como "em_oferta" enquanto algum desses itens não estiver `ENCERRADO`: com a
+  oferta encerrada o produto volta a "sugerido" (ou "recusado") e pode entrar em outra, e a
+  resposta continua trazendo o grupo e o vendido da encerrada. O acompanhamento por semana
+  segue contando o item em `em_oferta` (virou oferta), mesmo depois de encerrada.
 - **Vendido**: quantidade e valor das linhas de orçamento `FECHADO` com aquele item de
   oferta (`oferta_item_id`), fora as vendidas fora da promoção (`fora_promocao`), a mesma
   regra do vendas-service. Enquanto a fonte da promoção for o Celta, as ofertas da intranet

@@ -126,8 +126,9 @@ def test_fora_da_sugestao_corte_e_oferta():
 
 
 class _ConnO(_ConnL):
-    """_ConnL com as ofertas: `ofertas` = linhas (semana, pro_codigo, item_id, oferta_id, nome, qtd, valor)
-    e `lote_semanas` = linhas (semana, pro_codigo, recusado_em, valor_vender) do acompanhamento."""
+    """_ConnL com as ofertas: `ofertas` = linhas (semana, pro_codigo, item_id, oferta_id, nome, qtd, valor
+    [, status]; sem status = APROVADO) e `lote_semanas` = linhas (semana, pro_codigo, recusado_em,
+    valor_vender) do acompanhamento."""
 
     def __init__(self, tabelas=("com_promo_lote", "ven_oferta_item", "ven_oferta"), ofertas=(), lote_semanas=()):
         super().__init__(tabelas, ja_tem=True)
@@ -140,7 +141,7 @@ class _ConnO(_ConnL):
             return _Res(1)
         if "JOIN ven_oferta_item i" in s:
             self.chamadas.append((s, params))
-            return _Res(linhas=sorted(self.ofertas, key=lambda r: r[2]))
+            return _Res(linhas=sorted((r if len(r) == 8 else (*r, "APROVADO") for r in self.ofertas), key=lambda r: r[2]))
         if "SELECT semana, pro_codigo, recusado_em, valor_vender" in s:
             self.chamadas.append((s, params))
             return _Res(linhas=self.lote_semanas)
@@ -167,6 +168,19 @@ def test_item_com_vinculo_sai_em_oferta(monkeypatch):
     assert p == {"ini": s, "fim": s}
     assert "i.inicio >= l.semana AND i.inicio <= l.semana + 7" in sql   # segunda seguinte: inicio em UTC
     assert "ven_orcamento_item" in sql and "oc.status = 'FECHADO'" in sql and "fora_promocao = FALSE" in sql
+
+
+def test_oferta_encerrada_libera_o_item(monkeypatch):
+    s = date(2026, 11, 16)
+    # 20: única oferta encerrada -> volta a sugerido, com o grupo e o vendido à mostra
+    # 10: uma encerrada (id maior) e outra no ar -> em oferta, pelo grupo que ainda vale
+    c = _usar(monkeypatch, _ConnO(ofertas=[(s, "20", 5, 7, "Black Friday", 2, 300.0, "ENCERRADO"),
+                                          (s, "10", 6, 8, "No ar", 1, 100.0, "APROVADO"),
+                                          (s, "10", 9, 7, "Black Friday", 4, 400.0, "ENCERRADO")]))
+    it = {x["pro_codigo"]: x for x in rp.lote_semanal()["itens"]}
+    assert it["20"]["situacao"] == "sugerido" and "ativa" not in it["20"]
+    assert (it["20"]["oferta_nome"], it["20"]["vendido_qtd"], it["20"]["vendido_valor"]) == ("Black Friday", 2, 300)
+    assert (it["10"]["situacao"], it["10"]["oferta_id"], it["10"]["oferta_nome"], it["10"]["vendido_qtd"]) == ("em_oferta", 8, "No ar", 5)
 
 
 def test_acompanhamento_numeros_exatos(monkeypatch):

@@ -453,7 +453,9 @@ def _ofertas_do_lote(conn, semana_ini, semana_fim):
     então o vínculo é o item de oferta do produto com inicio dentro da semana do lote ou na
     segunda seguinte (o dia é o do servidor, em UTC: domingo à noite em Cuiabá já cai na segunda).
     Vendido = linhas de orçamento FECHADO que levaram o preço da oferta (fora_promocao = false), a mesma regra das unidades vendidas do vendas-service.
-    Vários itens do mesmo produto na semana: soma o vendido e fica o grupo do item de maior id.
+    Vários itens do mesmo produto na semana: soma o vendido e fica o grupo do item de maior id,
+    preferindo o que ainda não foi encerrado. `ativa` = algum desses itens não está ENCERRADO;
+    oferta encerrada libera o produto para entrar em outra (o vendido dela continua contando).
     Sem as tabelas das ofertas devolve {}."""
     if not (_tabela_existe(conn, "ven_oferta_item") and _tabela_existe(conn, "ven_oferta")):
         return {}
@@ -466,7 +468,7 @@ def _ofertas_do_lote(conn, semana_ini, semana_fim):
                    GROUP BY oi.oferta_item_id) v ON v.oferta_item_id = i.id""" if tem_venda else ""
     vend = "COALESCE(v.qtd, 0), COALESCE(v.valor, 0)" if tem_venda else "0, 0"
     rows = conn.execute(text(f"""
-        SELECT l.semana, l.pro_codigo, i.id, o.id, o.nome, {vend}
+        SELECT l.semana, l.pro_codigo, i.id, o.id, o.nome, {vend}, i.status
         FROM com_promo_lote l
         JOIN ven_oferta_item i ON i.pro_codigo::text = l.pro_codigo
                               AND i.inicio >= l.semana AND i.inicio <= l.semana + 7
@@ -475,12 +477,16 @@ def _ofertas_do_lote(conn, semana_ini, semana_fim):
         WHERE l.semana BETWEEN :ini AND :fim
         ORDER BY i.id"""), {"ini": semana_ini, "fim": semana_fim})
     saida = {}
-    for semana, pro, _item, oferta_id, oferta_nome, qtd, valor in rows:
+    for semana, pro, _item, oferta_id, oferta_nome, qtd, valor, status in rows:
         k = (str(semana), pro)
-        ant = saida.get(k, {"vendido_qtd": 0.0, "vendido_valor": 0.0})
+        ant = saida.get(k, {"vendido_qtd": 0.0, "vendido_valor": 0.0, "ativa": False})
+        ativo = status != "ENCERRADO"
+        if ant["ativa"] and not ativo:   # o grupo mostrado é o da oferta que ainda vale
+            oferta_id, oferta_nome = ant["oferta_id"], ant["oferta_nome"]
         saida[k] = {"oferta_id": oferta_id, "oferta_nome": oferta_nome,
                     "vendido_qtd": ant["vendido_qtd"] + float(qtd or 0),
-                    "vendido_valor": ant["vendido_valor"] + float(valor or 0)}
+                    "vendido_valor": ant["vendido_valor"] + float(valor or 0),
+                    "ativa": ant["ativa"] or ativo}
     return saida
 
 
@@ -505,9 +511,10 @@ def lote_semanal(semana: Optional[str] = None):
         for r in rows:
             d = {k: (float(v) if isinstance(v, Decimal) else str(v) if isinstance(v, (date, datetime)) else v)
                  for k, v in dict(r).items()}
-            of = ofertas.get((str(alvo), d["pro_codigo"]))
-            d.update(situacao="em_oferta" if of else "recusado" if d["recusado_em"] else "sugerido",
-                     **(of or {"oferta_id": None, "oferta_nome": None, "vendido_qtd": 0, "vendido_valor": 0}))
+            of = dict(ofertas.get((str(alvo), d["pro_codigo"])) or {"oferta_id": None, "oferta_nome": None, "vendido_qtd": 0, "vendido_valor": 0})
+            # oferta encerrada: o item volta a sugerido (ou recusado) e pode ir para outra; grupo e vendido ficam à mostra
+            ativa = of.pop("ativa", False)
+            d.update(situacao="em_oferta" if ativa else "recusado" if d["recusado_em"] else "sugerido", **of)
             itens.append(d)
         return {"semana": str(alvo), "corrente": alvo == corrente, "itens": itens}
     finally:
@@ -517,8 +524,8 @@ def lote_semanal(semana: Optional[str] = None):
 @router.get("/promo/lote/acompanhamento")
 def acompanhamento_lote(semanas: int = 12):
     """Por semana (das últimas `semanas` com lote, mais recente primeiro): itens sugeridos,
-    recusados (sem os que viraram oferta, como a situação do GET /promo/lote), em oferta,
-    custo a vender sugerido e o vendido pelas ofertas."""
+    recusados (sem os que viraram oferta), em oferta (os que viraram oferta, mesmo que ela já
+    tenha sido encerrada), custo a vender sugerido e o vendido pelas ofertas."""
     semanas = max(1, min(52, semanas))
     conn = get_db_connection()
     try:
