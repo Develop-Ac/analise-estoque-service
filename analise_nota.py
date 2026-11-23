@@ -175,6 +175,13 @@ def _f(v):
     return float(v) if v is not None else None
 
 
+def excesso(antes, depois, qtd, maximo):
+    """(existente, gerado): o que já passava do máximo antes da compra e o que a compra acrescenta
+    acima dele (nunca mais que a própria quantidade comprada)."""
+    existente = max(antes - maximo, 0.0)
+    return existente, min(max(depois - maximo, 0.0) - existente, qtd)
+
+
 def montar_unidades(itens, rodada, saldos, lancada, a_caminho=None):
     """Agrupa os itens analisáveis por unidade de análise e calcula estoque, cobertura e excesso.
 
@@ -224,8 +231,7 @@ def montar_unidades(itens, rodada, saldos, lancada, a_caminho=None):
             existente = gerado = 0.0
             selos.append("sob_encomenda" if u["sob_encomenda"] else "produto_novo")
         else:
-            existente = max(antes - maximo, 0.0)
-            gerado = min(max(depois - maximo, 0.0) - existente, qtd)
+            existente, gerado = excesso(antes, depois, qtd, maximo)
         if venda <= 0:
             selos.append("sem_giro")
 

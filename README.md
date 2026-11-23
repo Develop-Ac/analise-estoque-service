@@ -278,6 +278,10 @@ Auxiliares:
 | `SQL_DRIVER` / `TDS_VERSION` | `{FreeTDS}` / `7.4` | driver ODBC e versão TDS |
 | `INTERVALO_DIAS` | `7` | intervalo do job |
 | `EMAIL_*` | — | SMTP do relatório (server/port/sender/password/receiver) |
+| `FOTO_ROTINA` | `1` | `0` desliga, nesta instância, a rotina que grava as fotos da análise de compra (cotação, pedido, nota) |
+| `FOTO_INTERVALO_S` | `600` | intervalo entre as passadas da rotina de fotos (s) |
+| `FOTO_JANELA_DIAS` | `30` | documentos criados nos últimos N dias entram na rotina de fotos |
+| `FOTO_LOTE_MAX` | `20` | máximo de análises refeitas por passada (conta análise feita, não foto gravada) |
 
 ### Parâmetros do modelo
 | Variável | Padrão | Descrição |
@@ -348,6 +352,7 @@ Base FastAPI (docs interativas em `/docs`). Principais rotas:
 | POST | `/similar/group` · DELETE `/similar/ungroup` | montar/desfazer grupos de similares |
 | POST | `/similar/recalc` · `/similar/auto-group` | recalcular/auto-agrupar grupos |
 | POST | `/promo/plan` · `/promo/export` | itens com excesso para promoção/giro |
+| GET | `/analise/cotacao/{numero}` | análise de compra da cotação (valores estimados pelo custo da rodada) com o histórico das fotos; `?foto=<id>` devolve uma versão guardada |
 | GET | `/health` | healthcheck |
 | GET | `/sistema/job` | estado do job semanal (execução em curso com etapa atual, última execução com etapas/duração/produtos/alterações, histórico, próxima execução) — alimenta a tela Sistema→ETL da intranet |
 | POST | `/sistema/job/rodar` | dispara a análise agora, em thread (409 se já estiver rodando) |

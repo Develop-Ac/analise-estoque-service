@@ -60,11 +60,12 @@ def separar_itens(itens, cadastro):
     return ok, fora
 
 
-def somar_a_caminho(linhas, pedido_id):
-    """{pro_codigo: qtd} dos pedidos em aberto, sem as linhas do próprio pedido."""
+def somar_a_caminho(linhas, pedido_id=None, cotacao=None):
+    """{pro_codigo: qtd} dos pedidos em aberto, sem as linhas do próprio pedido e, quando
+    `cotacao` vem, sem as dos pedidos dessa cotação (linhas com `pedido_cotacao`)."""
     soma = {}
     for ln in linhas:
-        if ln["pedido_id"] == pedido_id:
+        if ln["pedido_id"] == pedido_id or (cotacao is not None and ln.get("pedido_cotacao") == cotacao):
             continue
         pro = str(ln["pro_codigo"]).strip()
         soma[pro] = soma.get(pro, 0.0) + _n(ln["qtd"])

@@ -5,13 +5,17 @@ Lê o pedido e os itens da intranet (com_pedido / com_pedido_itens), o nome do f
 no cadastro da EMPRESA 3 (erp-firebird-api, OPENQUERY como plano B), o que já está a
 caminho nos outros pedidos em aberto e o saldo de agora. As contas moram em
 analise_pedido.py; aqui só se lê e se monta a resposta. Pedido não tem vencimento:
-sem fluxo a pagar. Nada é gravado.
+sem fluxo a pagar. Pedido fora dos status analisáveis (entregue, cancelado) não tem situação
+de hoje: só o histórico. Cada abertura grava a foto da análise (se mudou) e quem viu
+(foto_compra.responder); `?foto=` devolve uma versão guardada.
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import text
 
+import analise_foto as af
 import analise_nota as an
 import analise_pedido as ap
+import foto_compra as fc
 from erp_api import _erp_api_consulta, get_realtime_stocks
 from infra_db import get_db_connection
 from rotas_nota import (CUSTO_CAIXA_DIAS_TETO, CUSTO_CAIXA_TAXA_MES, _api_ou_oq, _cadastro, _exigir_tela,
@@ -22,10 +26,10 @@ router = APIRouter()
 
 
 def _pedido(id):
-    """(cabeçalho, itens) do pedido. Inexistente -> 404; encomenda ou status fora da análise -> 409."""
+    """(cabeçalho, itens) do pedido. Inexistente -> 404; encomenda -> 409."""
     with get_db_connection() as pg:
         cab = pg.execute(text("SELECT id, pedido_cotacao, for_codigo, status, COALESCE(origem, 'cotacao') AS origem, "
-                              "frete, ipi_no_valor FROM com_pedido WHERE id = :id"), {"id": id}).mappings().first()
+                              "frete, ipi_no_valor, created_at FROM com_pedido WHERE id = :id"), {"id": id}).mappings().first()
         if not cab:
             raise HTTPException(status_code=404, detail="Pedido não encontrado.")
         itens = [dict(r) for r in pg.execute(text(
@@ -34,8 +38,6 @@ def _pedido(id):
     cab = dict(cab)
     if cab["origem"] == "encomenda":
         raise HTTPException(status_code=409, detail="Pedido de encomenda não passa pela análise de compra.")
-    if cab["status"] not in ap.STATUS_ANALISAVEIS:
-        raise HTTPException(status_code=409, detail=f"Pedido com status '{cab['status']}' não pode ser analisado.")
     return cab, itens
 
 
@@ -53,28 +55,35 @@ def _nome_fornecedor(for_codigo):
 
 
 def _a_caminho(membros):
-    """Linhas {pedido_id, pro_codigo, qtd} dos pedidos em aberto com os membros, na mesma regra
+    """Linhas {pedido_id, pedido_cotacao, pro_codigo, qtd} dos pedidos em aberto com os membros, na mesma regra
     da Sugestão de Compra (status em aberto, sem itens 'nao_atendido')."""
     if not membros:
         return []
     with get_db_connection() as pg:
         return [dict(r) for r in pg.execute(text(f"""
-            SELECT p.id AS pedido_id, i.pro_codigo::text AS pro_codigo, SUM(i.quantidade) AS qtd
+            SELECT p.id AS pedido_id, p.pedido_cotacao, i.pro_codigo::text AS pro_codigo, SUM(i.quantidade) AS qtd
             FROM com_pedido p
             JOIN com_pedido_itens i ON i.pedido_id = p.id
             WHERE p.status IN ({_sql_in_list(PEDIDO_STATUS_EM_ABERTO)})
               AND COALESCE(i.status_item, '') <> 'nao_atendido'
               AND i.pro_codigo::text = ANY(:membros)
-            GROUP BY p.id, i.pro_codigo::text
+            GROUP BY p.id, p.pedido_cotacao, i.pro_codigo::text
         """), {"membros": membros}).mappings()]
 
 
-@router.get("/analise/pedido/{id}",
-            dependencies=[Depends(_exigir_tela("/compras/cotacao/pedido", "Sem permissão para ver pedidos de compra."))])
-def analise_pedido(id: str):
-    """Análise de compra do pedido: unidades (grupo/produto) com estoque, a caminho, cobertura e
-    excesso, custo de caixa sem prazo, não analisados e não comprados do fornecedor. Só leitura."""
-    cab, linhas = _pedido(id.strip())
+def _produtos(linhas):
+    return {str(i["pro_codigo"]).strip() for i in linhas}
+
+
+def calcular(id):
+    """Cálculo do pedido no formato comum das análises (conteudo, sem_hoje, assinatura, criado_em,
+    rodada, produtos, numero). Status fora da análise: sem conteúdo e sem leitura do ERP."""
+    cab, linhas = _pedido(id)
+    calc = {"conteudo": None, "sem_hoje": None, "assinatura": af.assinatura_pedido(cab, linhas),
+            "criado_em": cab["created_at"], "rodada": None, "produtos": _produtos(linhas),
+            "numero": cab["pedido_cotacao"]}
+    if cab["status"] not in ap.STATUS_ANALISAVEIS:
+        return {**calc, "sem_hoje": fc.SEM_HOJE}
     itens = ap.valorar_itens(linhas, cab["frete"], cab["ipi_no_valor"])
     pros = {i["pro_codigo"] for i in itens}
     cadastro = _cadastro(pros)
@@ -93,7 +102,7 @@ def analise_pedido(id: str):
     # Fornecedor informado sem nome no cadastro = ERP fora: a lista não pôde ser montada.
     nao_comprados = (_nao_comprados([nome] if nome else [], membros) if nome or cab["for_codigo"] is None else
                      an.montar_nao_comprados({}, membros, None, "Não foi possível montar esta lista agora."))
-    return {
+    conteudo = {
         "pedido": {
             "id": cab["id"], "numero": cab["pedido_cotacao"], "for_codigo": cab["for_codigo"],
             "fornecedor": nome, "status": cab["status"], "valor_total": analise.pop("valor_total"),
@@ -102,3 +111,16 @@ def analise_pedido(id: str):
         **analise,
         "nao_comprados": nao_comprados,
     }
+    return {**calc, "conteudo": conteudo, "rodada": data_rodada}
+
+
+@router.get("/analise/pedido/{id}",
+            dependencies=[Depends(_exigir_tela("/compras/cotacao/pedido", "Sem permissão para ver pedidos de compra."))])
+def analise_pedido(id: str, foto: int | None = None, x_user_id: str | None = Header(None)):
+    """Análise de compra do pedido (unidades com estoque, a caminho, cobertura e excesso, custo de
+    caixa sem prazo, não analisados e não comprados do fornecedor) mais o histórico das fotos.
+    Com `foto`, devolve só aquela versão guardada."""
+    id = id.strip()
+    if foto is not None:
+        return fc.responder_foto("pedido", id, foto, _produtos(_pedido(id)[1]))
+    return fc.responder("pedido", id, calcular(id), x_user_id)

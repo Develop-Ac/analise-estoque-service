@@ -4,7 +4,9 @@
 Lê o XML completo da intranet (com_nfe_conciliacao), a entrada da nota na
 EMPRESA 3 (erp-firebird-api, OPENQUERY como plano B) e o contas a pagar
 (só OPENQUERY — a tabela não existe na erp-firebird-api). As contas moram em
-analise_nota.py; aqui só se lê e se monta a resposta. Nada é gravado.
+analise_nota.py; aqui se lê e se monta a análise. A rota grava a foto da análise (com o fluxo
+a pagar) e quem a viu pelo foto_compra; `_sinais_notas` dá à rotina de fotos os sinais baratos
+para decidir se a análise da nota precisa ser refeita.
 """
 import base64
 import datetime
@@ -16,7 +18,9 @@ from decimal import Decimal
 from fastapi import APIRouter, Depends, Header, HTTPException
 from sqlalchemy import text
 
+import analise_foto as af
 import analise_nota as an
+import foto_compra as fc
 from analise_grupo import _SNAPSHOT, _in, _lit, _openquery
 from erp_api import ERP_API_MAX_EM, ERP_API_URL, _erp_api_consulta, _erp_api_post, get_realtime_stocks
 from fornecedor_info import _expandir_fornecedores, get_compras_historico
@@ -54,21 +58,22 @@ def _oq(inner):
 
 
 def _nota_pg(chave):
-    """NF-e lida (an.ler_xml) do XML completo guardado na intranet (o OPENQUERY corta o XML).
-    Sem XML, ou conteúdo que não é uma NF-e completa: 404."""
+    """NF-e lida (an.ler_xml) do XML completo guardado na intranet (o OPENQUERY corta o XML),
+    com `criado_em` = quando a nota entrou na conciliação. Sem XML, ou conteúdo que não é uma
+    NF-e completa: 404."""
     if len(chave) != 44 or not chave.isdigit():
         raise HTTPException(status_code=404, detail="Nota sem XML completo.")
     with get_db_connection() as pg:
-        xml = pg.execute(text("SELECT xml_completo FROM com_nfe_conciliacao WHERE chave_nfe = :chave"),
-                         {"chave": chave}).scalar()
-    xml = str(xml or "").strip()
+        linha = pg.execute(text("SELECT xml_completo, created_at FROM com_nfe_conciliacao WHERE chave_nfe = :chave"),
+                           {"chave": chave}).first()
+    xml = str((linha[0] if linha else None) or "").strip()
     if not xml:
         raise HTTPException(status_code=404, detail="Nota sem XML completo.")
     # A conciliação guarda o docZip da distribuição (gzip em base64); XML puro passa direto.
     try:
         if not xml.startswith("<"):
             xml = gzip.decompress(base64.b64decode(xml)).decode("utf-8")
-        return an.ler_xml(xml)
+        return {**an.ler_xml(xml), "criado_em": linha[1]}
     except (ValueError, OSError, EOFError):
         # base64/gzip inválido (binascii.Error, BadGzipFile, EOFError), XML malformado ou resumo resNFe.
         raise HTTPException(status_code=404, detail="Nota sem XML completo.")
@@ -267,7 +272,7 @@ def _rodada(pro_codigos):
         sel = ("SELECT pro_codigo::text AS pro_codigo, pro_descricao AS descricao, grupo_chave, grupo_qtd_itens, "
                "CEIL(grupo_estoque_max) AS grupo_estoque_max, grupo_demanda_dia, "
                "CEIL(estoque_max_sugerido) AS estoque_max_sugerido, "
-               f"{opt('demanda_real_dia')}, {opt('sob_encomenda')}, data_processamento "
+               f"{opt('demanda_real_dia')}, {opt('sob_encomenda')}, {opt('custo_unitario')}, data_processamento "
                f"FROM com_fifo_completo WHERE {_SNAPSHOT} AND ")
         linhas = [dict(r._mapping) for r in pg.execute(text(sel + "pro_codigo::text = ANY(:pros)"), {"pros": pros})]
         chaves = sorted({r["grupo_chave"] for r in linhas if r["grupo_chave"] and (r["grupo_qtd_itens"] or 0) > 1})
@@ -334,11 +339,36 @@ def _exigir_tela(tela, recusa):
 _so_quem_ve_notas = _exigir_tela("/fiscal/nfe", "Sem permissão para ver notas fiscais.")
 
 
-@router.get("/analise/nota/{chave}", dependencies=[Depends(_so_quem_ve_notas)])
-def analise_nota(chave: str):
-    """Análise de compra da NF-e de entrada: unidades (grupo/produto) com estoque, cobertura e
-    excesso, custo de caixa, não analisados e fluxo a pagar. Só leitura."""
-    chave = chave.strip()
+def _sinais_notas(chaves):
+    """{chave: "<itens identificados>:<itens vinculados>:<lançada 0|1>"}: muda quando a nota pode
+    ter outra análise, sem refazê-la. A entrada vem em lote da erp-firebird-api (empresa 3);
+    sem ela, ou com erro, devolve {} e a rotina deixa as notas para a próxima passada."""
+    chaves = sorted({str(c).strip() for c in chaves})
+    if not chaves or not ERP_API_URL:
+        return {}
+    try:
+        lancadas = set()
+        for i in range(0, len(chaves), 200):  # máximo do POST nf-entrada/por-chaves
+            linhas = _erp_api_post("nf-entrada/por-chaves", {"chaves": chaves[i:i + 200], "empresa": 3})
+            lancadas |= {str(r.get("CHAVE_NFE") or "").strip() for r in linhas if r.get("NFE") is not None}
+        with get_db_connection() as pg:
+            conc = dict(pg.execute(text(
+                "SELECT chave_nfe, COUNT(*) FROM com_nfe_conciliacao_item "
+                "WHERE chave_nfe = ANY(:c) AND pro_codigo IS NOT NULL GROUP BY chave_nfe"), {"c": chaves}).all())
+            vinc = dict(pg.execute(text(
+                "SELECT v.chave_nfe, COUNT(*) FROM com_pedido_nfe_vinculo_item i "
+                "JOIN com_pedido_nfe_vinculo v ON v.id = i.vinculo_id "
+                "WHERE v.chave_nfe = ANY(:c) AND v.confirmado AND NOT v.rejeitado AND i.tipo = 'vinculado' "
+                "GROUP BY v.chave_nfe"), {"c": chaves}).all())
+    except Exception as e:
+        print(f"Erro ao ler os sinais das notas: {e}")
+        return {}
+    return {c: f"{conc.get(c, 0)}:{vinc.get(c, 0)}:{int(c in lancadas)}" for c in chaves}
+
+
+def calcular(chave):
+    """Cálculo da nota no formato comum das análises (conteudo, sem_hoje, assinatura, criado_em,
+    rodada, produtos, numero). O conteúdo é a análise inteira, com o fluxo a pagar."""
     xml = _nota_pg(chave)
     cab = xml["cabecalho"]
     hoje = an.hoje_cuiaba()
@@ -366,7 +396,7 @@ def analise_nota(chave: str):
         print(f"Erro ao ler o saldo dos produtos da nota: {e}")
         raise HTTPException(status_code=502, detail="Não foi possível ler o saldo de estoque do ERP agora.")
 
-    return {
+    conteudo = {
         "nota": {
             "chave": chave, "numero": cab["numero"], "emitente": cab["emitente"], "cnpj_emitente": cab["cnpj"],
             "emissao": cab["emissao"], "valor_total": cab["valor_total"],
@@ -379,3 +409,17 @@ def analise_nota(chave: str):
         "nao_comprados": _nao_comprados(_nomes_fornecedor(cab["cnpj"]) + [(cab["emitente"] or "").strip()],
                                         membros),
     }
+    return {"conteudo": conteudo, "sem_hoje": None, "assinatura": af.assinatura_nota(analisaveis, lancada),
+            "criado_em": xml["criado_em"], "rodada": data_rodada,
+            "produtos": af.produtos_do_conteudo(conteudo), "numero": cab["numero"]}
+
+
+@router.get("/analise/nota/{chave}", dependencies=[Depends(_so_quem_ve_notas)])
+def analise_nota(chave: str, foto: int | None = None, x_user_id: str | None = Header(None)):
+    """Análise de compra da NF-e de entrada (unidades com estoque, cobertura e excesso, custo de
+    caixa, não analisados, fluxo a pagar e não comprados) mais o histórico das fotos.
+    Com `foto`, devolve só aquela versão guardada."""
+    chave = chave.strip()
+    if foto is not None:
+        return fc.responder_foto("nota", chave, foto)
+    return fc.responder("nota", chave, calcular(chave), x_user_id)

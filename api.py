@@ -37,6 +37,7 @@ import rotas_produto
 import rotas_sistema
 import rotas_nota
 import rotas_pedido
+import rotas_cotacao
 
 app.include_router(rotas_analise.router)
 app.include_router(rotas_promo.router)
@@ -47,6 +48,7 @@ app.include_router(rotas_produto.router)
 app.include_router(rotas_sistema.router)
 app.include_router(rotas_nota.router)
 app.include_router(rotas_pedido.router)
+app.include_router(rotas_cotacao.router)
 
 def background_scheduler():
     global BACKGROUND_Running
@@ -158,4 +160,9 @@ def startup_event():
     # Inicia a thread de background
     thread = threading.Thread(target=background_scheduler, daemon=True)
     thread.start()
+
+    # Rotina de fotos da análise de compra (a cada 10 min); FOTO_ROTINA=0 desliga nesta instância.
+    if os.getenv("FOTO_ROTINA") != "0":
+        import rotina_fotos
+        threading.Thread(target=rotina_fotos.laco, daemon=True).start()
 
