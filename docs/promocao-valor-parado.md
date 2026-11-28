@@ -206,10 +206,13 @@ A lista deixa de ser modal e vira a **terceira aba** da página: `Painel | Anál
 
 - Ordenação por coluna em `GET /analise` (16/09/2026): `sort` ∈ produto | curva | estoque | capital |
   tendencia | sugestao e `sort_dir` asc|desc, lista fechada em `_SORT_COLS` (`rotas_analise.py`).
-  Na visão agrupada o grupo inteiro é posicionado pelo seu extremo (window MAX/MIN por
-  `group_id`) para os similares não se separarem; na individual a ordem é estrita. Sem `sort`
+  Na visão agrupada o grupo inteiro é posicionado pelo seu extremo (window MAX/MIN pelo
+  grupo da tela: `grupo_chave` quando em grupo unificado, senão o próprio produto) para os
+  similares não se separarem; na individual a ordem é estrita. Sem `sort`
   vale a ordem histórica (curva do grupo, nome). No front, clique no cabeçalho: 1º desc (asc em
   Produto/ABC), 2º inverte, 3º volta ao padrão; `aria-sort` no `Th`.
+- Na visão agrupada, filtro que casa com um produto de grupo unificado traz o grupo inteiro (lista,
+  contagem, totais capital/CME e export); a individual não muda.
 - Rótulo da ação `giro_caixa` na tela e no Excel: **Liquidação** (o código interno não muda).
 - Critério único de grupo no front (`emGrupo`): `grupo_chave` com `grupo_qtd_itens > 1` — o mesmo
   que monta os cabeçalhos. O `group_id` antigo (com_relacionamento_itens) só marca "relacionado";

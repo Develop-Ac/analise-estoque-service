@@ -18,7 +18,9 @@ def test_visao_individual_inalterada():
     assert ra._order_by(None, "asc", False) == f"""
                 MIN(curva_abc) OVER (PARTITION BY {G}) ASC,
                 MIN(pro_descricao) OVER (PARTITION BY {G}) ASC,
-                pro_descricao ASC"""
+                {G} ASC,
+                pro_descricao ASC,
+                pro_codigo ASC"""
     assert ra._order_by("curva", "asc", False) == "curva_abc ASC NULLS LAST, pro_descricao ASC"
 
 

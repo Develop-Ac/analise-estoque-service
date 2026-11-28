@@ -15,6 +15,7 @@ from fornecedor_info import _expandir_fornecedores, get_fornecedor_parametros, g
 from sugestao_compra import montar_memoria_calculo, _dias_ciclo, _Z_POR_CURVA
 from estoque_rt import _get_stock_batches
 from config import FORN_EXPR
+from analise_grupo import _SNAPSHOT
 
 router = APIRouter()
 
@@ -31,16 +32,8 @@ def simular_analise_grupo(req: SimulationRequest):
         conn = get_db_connection()
         
         # Buscar dados dos produtos
-        fmt_codes = [f"'{c.strip()}'" for c in req.pro_codigos]
-        clause_in = ",".join(fmt_codes)
-        
-        # Query Dados Básicos
-        # Reutilizando colunas padrão
-        sql = text(f"""
-            SELECT * FROM com_fifo_completo WHERE pro_codigo IN ({clause_in})
-        """)
-        
-        rows = conn.execute(sql).mappings().all()
+        sql = text("SELECT * FROM com_fifo_completo WHERE pro_codigo = ANY(:c)")
+        rows = conn.execute(sql, {"c": [c.strip() for c in req.pro_codigos]}).mappings().all()
         items = [dict(r) for r in rows]
         
         if not items:
@@ -202,6 +195,9 @@ _CHAVE_GRUPO = "CASE WHEN group_id IS NOT NULL AND group_id <> '' THEN group_id 
 # Linha pertence a grupo unificado (2+ marcas com curva consolidada).
 _EM_GRUPO_UNIFICADO = "COALESCE(grupo_chave,'') <> '' AND COALESCE(grupo_qtd_itens,0) > 1"
 
+# Chave que mantém junto o grupo unificado que a tela monta (item avulso fica sozinho).
+_CHAVE_GRUPO_TELA = f"CASE WHEN {_EM_GRUPO_UNIFICADO} THEN grupo_chave ELSE pro_codigo END"
+
 
 def _curva_expr(grouped_view: bool) -> str:
     """Curva efetiva: na visão agrupada, a curva do grupo unificado quando houver; senão a do item."""
@@ -241,6 +237,20 @@ def _filtro_busca(search: Optional[str], match_type: str, pro_codigos: Optional[
     return clausulas, params
 
 
+def _where_listagem(filtros: list, grouped_view: bool) -> str:
+    """WHERE da listagem e do export. Na visão agrupada, produto de grupo unificado que casa
+    com os filtros traz o grupo inteiro; na individual (ou sem filtro além do snapshot) o texto
+    é o de sempre. Recebe a lista como as rotas montam (snapshot e o "1=1" do export dentro).
+    Os parâmetros nomeados são reaproveitados na subconsulta; nada do cliente é concatenado."""
+    proprios = [f for f in filtros if f not in (_SNAPSHOT, "1=1")]
+    if not grouped_view or not proprios:
+        return " AND ".join(filtros) if filtros else "1=1"
+    casa = " AND ".join(proprios)
+    return (f"{_SNAPSHOT} AND (({casa}) OR ({_EM_GRUPO_UNIFICADO} AND grupo_chave IN ("
+            f"SELECT grupo_chave FROM com_fifo_completo "
+            f"WHERE {_SNAPSHOT} AND ({casa}) AND {_EM_GRUPO_UNIFICADO})))")
+
+
 # Colunas de abertura da curva do grupo; NULL quando a tabela ainda não as tem.
 _COLS_ABERTURA_GRUPO = ("grupo_curva_valor", "grupo_classe_giro", "grupo_meses_com_venda_12m")
 
@@ -263,23 +273,28 @@ def _order_by(sort: Optional[str], sort_dir: str, grouped_view: bool) -> str:
     """ORDER BY da listagem. Sem `sort`: melhor curva do grupo, nome do grupo, nome do item
     (ordem histórica). Com `sort`: na visão agrupada o grupo inteiro é posicionado pelo seu
     extremo (MAX no desc, MIN no asc) para os similares não se separarem; na individual a
-    ordem é estrita pela coluna."""
+    ordem é estrita pela coluna. Na visão agrupada a partição é o grupo unificado da tela;
+    na individual, o grupo de similares (group_id)."""
+    chave = _CHAVE_GRUPO_TELA if grouped_view else _CHAVE_GRUPO
     expr = _curva_expr(grouped_view) if sort == "curva" else _SORT_COLS.get(sort or "")
     if expr is None:
         return f"""
-                MIN({_curva_expr(grouped_view)}) OVER (PARTITION BY {_CHAVE_GRUPO}) ASC,
-                MIN(pro_descricao) OVER (PARTITION BY {_CHAVE_GRUPO}) ASC,
-                pro_descricao ASC"""
+                MIN({_curva_expr(grouped_view)}) OVER (PARTITION BY {chave}) ASC,
+                MIN(pro_descricao) OVER (PARTITION BY {chave}) ASC,
+                {chave} ASC,
+                pro_descricao ASC,
+                pro_codigo ASC"""
     d = "DESC" if (sort_dir or "").lower() == "desc" else "ASC"
     nulls = "NULLS LAST"
     if not grouped_view:
         return f"{expr} {d} {nulls}, pro_descricao ASC"
     agg = "MAX" if d == "DESC" else "MIN"
     return f"""
-                {agg}({expr}) OVER (PARTITION BY {_CHAVE_GRUPO}) {d} {nulls},
-                {_CHAVE_GRUPO} ASC,
+                {agg}({expr}) OVER (PARTITION BY {chave}) {d} {nulls},
+                {chave} ASC,
                 {expr} {d} {nulls},
-                pro_descricao ASC"""
+                pro_descricao ASC,
+                pro_codigo ASC"""
 
 
 @router.get("/analise", response_model=PaginatedResponse)
@@ -323,7 +338,7 @@ def listar_analise(
             filters.append("teve_alteracao_analise = TRUE")
 
         # FILTER: Ensure we only fetch the latest analysis snapshot
-        filters.append("data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)")
+        filters.append(_SNAPSHOT)
 
         # DRILL-DOWN dos KPIs do Painel de Estoque: mesma condição SQL dos cards
         # do dashboard Metabase — a lista soma EXATAMENTE o valor exibido no card.
@@ -471,7 +486,7 @@ def listar_analise(
                 keys = ", ".join(f":{k}" for k in cat_params)
                 filters.append(f"categoria_saldo_atual IN ({keys})")
 
-        where_clause = " AND ".join(filters) if filters else "1=1"
+        where_clause = _where_listagem(filters, grouped_view)
         
         # Query Total
         count_sql = text(f"SELECT COUNT(*) FROM com_fifo_completo WHERE {where_clause}")
@@ -827,7 +842,7 @@ def exportar_analise(
             where_clauses.append("teve_alteracao_analise = TRUE")
 
         # FILTER: Ensure we only fetch the latest analysis snapshot
-        where_clauses.append("data_processamento = (SELECT MAX(data_processamento) FROM com_fifo_completo)")
+        where_clauses.append(_SNAPSHOT)
         
         if group_id:
             where_clauses.append("group_id = :group_id")
@@ -876,7 +891,7 @@ def exportar_analise(
                 keys = ", ".join(f":{k}" for k in cat_params)
                 where_clauses.append(f"categoria_saldo_atual IN ({keys})")
 
-        where_clause = " AND ".join(where_clauses)
+        where_clause = _where_listagem(where_clauses, grouped_view)
         
         # Seleção de colunas muda baseada na cobertura
         if coverage_days > 0:

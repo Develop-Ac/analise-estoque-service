@@ -344,7 +344,7 @@ Base FastAPI (docs interativas em `/docs`). Principais rotas:
 
 | Método | Rota | Função |
 |---|---|---|
-| GET | `/analise` | lista paginada da análise (filtros: curva, padrão, status, busca, grupo, simulação por cobertura, estoque realtime) |
+| GET | `/analise` | lista paginada da análise (filtros: curva, padrão, status, busca, grupo, simulação por cobertura, estoque realtime); no visual agrupado, filtro que casa com produto de grupo unificado traz o grupo inteiro (lista, contagem, totais e export) |
 | GET | `/analise/export` | exporta a análise (Excel) |
 | POST | `/analise/simular` | simulação de grupo ad-hoc (cobertura em dias) |
 | **GET** | **`/compras/sugestao`** | **lista de compra por fornecedor (ver §7)** |
